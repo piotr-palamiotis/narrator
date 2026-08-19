@@ -142,8 +142,6 @@ class StyleOverrides(BaseModel):
 class StyleConfig(BaseModel):
     font_family: str = "assets/fonts/NotoSans-Regular.ttf"
     font_color: RgbaColor = "#FFFFFFFF"
-    min_font_px: int = Field(default=8, gt=0)
-    line_fill_ratio: float = Field(default=0.90, gt=0.0, le=1.0)
     overrides: StyleOverrides = Field(default_factory=StyleOverrides)
 
 

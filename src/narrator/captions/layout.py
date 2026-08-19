@@ -87,18 +87,15 @@ def derive_font_size_px(
     per_line_height: float,
     style: StyleConfig,
     metrics: FontMetricsProvider,
-    min_font_px: int | None = None,
     max_font_px: int = MAX_FONT_PX_CEILING,
 ) -> int:
     """Binary-search the largest integer font size whose (ascent + descent)
-    fits within `per_line_height * style.line_fill_ratio`. Clamps to
-    `min_font_px` (with the caller expected to log a warning) if even the
-    smallest allowed size doesn't fit -- degrading gracefully rather than
-    producing an unreadably tiny or crashing on an impossible layout.
+    fits within `per_line_height`. Clamps to `MIN_FONT_PX_FLOOR` if even the
+    smallest size doesn't fit -- an impossible layout (from the operator's
+    other geometry settings) degrades to a 1px font rather than crashing.
     """
-    floor = min_font_px if min_font_px is not None else style.min_font_px
-    floor = max(floor, MIN_FONT_PX_FLOOR)
-    target = per_line_height * style.line_fill_ratio
+    floor = MIN_FONT_PX_FLOOR
+    target = per_line_height
 
     if target <= 0:
         return floor
@@ -119,9 +116,8 @@ def derive_font_size_px(
                 lo = mid + 1
             else:
                 hi = mid - 1
-    # else: even the floor size doesn't fit -- clamp to floor and let the
-    # caller warn; we do not go below `floor` since that's the operator's
-    # declared minimum readable size.
+    # else: even 1px doesn't fit -- clamp to the floor rather than crash;
+    # an impossibly tight layout is the operator's other settings' fault.
 
     return best
 

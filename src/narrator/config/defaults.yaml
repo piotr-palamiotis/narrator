@@ -36,8 +36,6 @@ layout:
 style:
   font_family: "assets/fonts/NotoSans-Regular.ttf"
   font_color: "#FFFFFFFF"
-  min_font_px: 8
-  line_fill_ratio: 0.90
   overrides:
     background_band:
       enabled: true

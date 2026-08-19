@@ -73,23 +73,23 @@ def test_interline_consumes_whole_box_raises():
 
 
 def test_derive_font_size_matches_target():
-    style = StyleConfig(line_fill_ratio=0.9, min_font_px=8)
+    style = StyleConfig()
     metrics = FakeMetrics()
     size = derive_font_size_px(100.0, style, metrics)
     # The binary search must pick the LARGEST size that still fits: confirm
     # `size` fits and `size + 1` does not, rather than hardcoding a value
     # (int-truncated metrics mean the exact boundary isn't a round number).
     ascent, descent = metrics.ascent_descent(style.font_family, size)
-    assert (ascent + descent) <= 100.0 * style.line_fill_ratio
+    assert (ascent + descent) <= 100.0
     next_ascent, next_descent = metrics.ascent_descent(style.font_family, size + 1)
-    assert (next_ascent + next_descent) > 100.0 * style.line_fill_ratio
+    assert (next_ascent + next_descent) > 100.0
 
 
 def test_derive_font_size_clamps_to_floor_when_box_too_small():
-    style = StyleConfig(line_fill_ratio=0.9, min_font_px=20)
+    style = StyleConfig()
     metrics = FakeMetrics()
-    size = derive_font_size_px(1.0, style, metrics)
-    assert size == 20  # clamped to the configured floor, not shrunk below it
+    size = derive_font_size_px(0.0, style, metrics)
+    assert size == 1  # clamped to the 1px floor rather than going lower or crashing
 
 
 def test_compute_line_geometry_end_to_end():
