@@ -61,7 +61,7 @@ _CLEAR_SHORTCUT = "<Control-l>"
 _PREVIEW_FIELD_NAMES = [
     "canvas_width", "canvas_height", "canvas_bg",
     "max_lines", "margin_top", "margin_bottom", "margin_left", "margin_right",
-    "interline", "text_align",
+    "interline", "text_align", "vertical_align",
     "font_family", "font_color", "min_font_px", "line_fill_ratio",
     "band_enabled", "band_shape", "band_color", "band_radius", "band_padding",
     "shadow_enabled", "shadow_offset_x", "shadow_offset_y", "shadow_blur", "shadow_color",
@@ -228,7 +228,7 @@ class NarratorGUI:
                 margin_right_pct=self.margin_right.get(),
                 interline_pct=self.interline.get(),
                 text_align=self.text_align.get(),
-                vertical_align_within_box=self.config.layout.vertical_align_within_box,
+                vertical_align_within_box=self.vertical_align.get(),
             )
             style = StyleConfig(
                 font_family=self.font_family.get(),
@@ -299,11 +299,14 @@ class NarratorGUI:
         self.max_lines = int_field(tab, 0, "Max lines", layout.max_lines, 1, 20)
         self.interline = percent_field(tab, 1, "Interline (% of canvas height)", layout.interline_pct)
         self.text_align = dropdown_field(tab, 2, "Text align", layout.text_align.value, ["left", "center", "right"])
+        self.vertical_align = dropdown_field(
+            tab, 3, "Vertical align", layout.vertical_align_within_box.value, ["top", "center", "bottom"]
+        )
         ttk.Label(tab, text="Font size is never set directly -- it's derived from these values.", foreground="gray").grid(
-            row=3, column=0, columnspan=4, sticky="w", padx=4, pady=(8, 2)
+            row=4, column=0, columnspan=4, sticky="w", padx=4, pady=(8, 2)
         )
         ttk.Label(tab, text="Margins are set around the preview canvas above.", foreground="gray").grid(
-            row=4, column=0, columnspan=4, sticky="w", padx=4, pady=(0, 2)
+            row=5, column=0, columnspan=4, sticky="w", padx=4, pady=(0, 2)
         )
 
     def _build_style_tab(self, notebook: ttk.Notebook) -> None:
@@ -397,7 +400,7 @@ class NarratorGUI:
                 margin_right_pct=self.margin_right.get(),
                 interline_pct=self.interline.get(),
                 text_align=self.text_align.get(),
-                vertical_align_within_box=self.config.layout.vertical_align_within_box,
+                vertical_align_within_box=self.vertical_align.get(),
             ),
             style=StyleConfig(
                 font_family=self.font_family.get(),
