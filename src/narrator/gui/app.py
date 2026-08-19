@@ -115,7 +115,6 @@ class NarratorGUI:
 
         self._build_preview_pane(top)
         self._build_caption_mode_row(top)
-        self._build_basic_font_row(bottom)
 
         notebook = ttk.Notebook(bottom)
         notebook.pack(fill="both", expand=True, pady=(0, 8))
@@ -183,22 +182,6 @@ class NarratorGUI:
         bottom_frame = ttk.Frame(parent)
         bottom_frame.grid(row=2, column=1, sticky="s")
         self.margin_bottom = compact_percent_field(bottom_frame, layout.margin_bottom_pct)
-
-    def _build_basic_font_row(self, parent: ttk.Frame) -> None:
-        row = ttk.Frame(parent)
-        row.pack(fill="x", pady=(0, 8))
-        style = self.config.style
-
-        path_frame = ttk.Frame(row)
-        path_frame.pack(side="left", padx=(0, 16))
-        font_options = _list_font_files()
-        if style.font_family not in font_options:
-            font_options = sorted({*font_options, style.font_family})
-        self.font_family = font_picker_field(path_frame, 0, "Font file", style.font_family, font_options, _FONTS_DIR)
-
-        color_frame = ttk.Frame(row)
-        color_frame.pack(side="left")
-        self.font_color = rgba_color_field(color_frame, 0, "Font color (RGBA)", style.font_color)
 
     def _on_field_changed(self, *_args) -> None:
         if self._debounce_id is not None:
@@ -283,12 +266,16 @@ class NarratorGUI:
         c = self.config.canvas
         self.canvas_width = int_field(tab, 0, "Width (px)", c.width_px, 1, 8000)
         self.canvas_height = int_field(tab, 1, "Height (px)", c.height_px, 1, 8000)
-        self.canvas_bg = rgba_color_field(tab, 2, "Background color (RGBA)", c.background_color)
         ttk.Label(
             tab,
             text="Note: width/height changes restart the NDI stream (briefly interrupting it) to apply.",
             foreground="gray",
-        ).grid(row=3, column=0, columnspan=4, sticky="w", padx=4, pady=(8, 2))
+        ).grid(row=2, column=0, columnspan=4, sticky="w", padx=4, pady=(8, 2))
+        ttk.Label(
+            tab,
+            text="Background color is set on the Style tab.",
+            foreground="gray",
+        ).grid(row=3, column=0, columnspan=4, sticky="w", padx=4, pady=(0, 2))
 
     def _build_layout_tab(self, notebook: ttk.Notebook) -> None:
         tab = ttk.Frame(notebook)
@@ -310,32 +297,53 @@ class NarratorGUI:
     def _build_style_tab(self, notebook: ttk.Notebook) -> None:
         tab = ttk.Frame(notebook)
         notebook.add(tab, text="Style")
+        tab.grid_columnconfigure(0, weight=1, uniform="style_col")
+        tab.grid_columnconfigure(1, weight=1, uniform="style_col")
+
+        left = ttk.Frame(tab)
+        left.grid(row=0, column=0, sticky="new", padx=(0, 8))
+        right = ttk.Frame(tab)
+        right.grid(row=0, column=1, sticky="new")
+
         style = self.config.style
-        ttk.Label(tab, text="Font file path/color are set in the row below the preview canvas.", foreground="gray").grid(
-            row=0, column=0, columnspan=4, sticky="w", padx=4, pady=(0, 2)
-        )
+        canvas = self.config.canvas
+
+        font_group = ttk.LabelFrame(left, text="Font")
+        font_group.pack(fill="x", pady=(0, 8))
+        font_options = _list_font_files()
+        if style.font_family not in font_options:
+            font_options = sorted({*font_options, style.font_family})
+        self.font_family = font_picker_field(font_group, 0, "Font file", style.font_family, font_options, _FONTS_DIR)
+        self.font_color = rgba_color_field(font_group, 1, "Font color (RGBA)", style.font_color)
+
+        bg_group = ttk.LabelFrame(left, text="Stream background")
+        bg_group.pack(fill="x", pady=(0, 8))
+        self.canvas_bg = rgba_color_field(bg_group, 0, "Background color (RGBA)", canvas.background_color)
 
         band = style.overrides.background_band
-        ttk.Separator(tab).grid(row=1, column=0, columnspan=4, sticky="ew", pady=6)
-        self.band_enabled = checkbox_field(tab, 2, "Background band enabled", band.enabled)
-        self.band_shape = dropdown_field(tab, 3, "Band shape", band.shape.value, ["rectangle", "pill"])
-        self.band_color = rgba_color_field(tab, 4, "Band color (RGBA)", band.color)
-        self.band_radius = float_field(tab, 5, "Band corner radius (%)", band.corner_radius_pct, 0.0, 50.0, 0.5)
-        self.band_padding = float_field(tab, 6, "Band padding (% of canvas height)", band.padding_pct, 0.0, 20.0, 0.5)
+        band_group = ttk.LabelFrame(left, text="Background band")
+        band_group.pack(fill="x", pady=(0, 8))
+        self.band_enabled = checkbox_field(band_group, 0, "Background band enabled", band.enabled)
+        self.band_shape = dropdown_field(band_group, 1, "Band shape", band.shape.value, ["rectangle", "pill"])
+        self.band_color = rgba_color_field(band_group, 2, "Band color (RGBA)", band.color)
+        self.band_radius = float_field(band_group, 3, "Band corner radius (%)", band.corner_radius_pct, 0.0, 50.0, 0.5)
+        self.band_padding = float_field(band_group, 4, "Band padding (% of canvas height)", band.padding_pct, 0.0, 20.0, 0.5)
 
         shadow = style.overrides.shadow
-        ttk.Separator(tab).grid(row=7, column=0, columnspan=4, sticky="ew", pady=6)
-        self.shadow_enabled = checkbox_field(tab, 8, "Shadow enabled", shadow.enabled)
-        self.shadow_offset_x = float_field(tab, 9, "Shadow offset X (%)", shadow.offset_x_pct, -10.0, 10.0, 0.1)
-        self.shadow_offset_y = float_field(tab, 10, "Shadow offset Y (%)", shadow.offset_y_pct, -10.0, 10.0, 0.1)
-        self.shadow_blur = int_field(tab, 11, "Shadow blur (px)", shadow.blur_px, 0, 100)
-        self.shadow_color = rgba_color_field(tab, 12, "Shadow color (RGBA)", shadow.color)
+        shadow_group = ttk.LabelFrame(right, text="Shadow")
+        shadow_group.pack(fill="x", pady=(0, 8))
+        self.shadow_enabled = checkbox_field(shadow_group, 0, "Shadow enabled", shadow.enabled)
+        self.shadow_offset_x = float_field(shadow_group, 1, "Shadow offset X (%)", shadow.offset_x_pct, -10.0, 10.0, 0.1)
+        self.shadow_offset_y = float_field(shadow_group, 2, "Shadow offset Y (%)", shadow.offset_y_pct, -10.0, 10.0, 0.1)
+        self.shadow_blur = int_field(shadow_group, 3, "Shadow blur (px)", shadow.blur_px, 0, 100)
+        self.shadow_color = rgba_color_field(shadow_group, 4, "Shadow color (RGBA)", shadow.color)
 
         stroke = style.overrides.stroke
-        ttk.Separator(tab).grid(row=13, column=0, columnspan=4, sticky="ew", pady=6)
-        self.stroke_enabled = checkbox_field(tab, 14, "Stroke (outline) enabled", stroke.enabled)
-        self.stroke_width = int_field(tab, 15, "Stroke width (px)", stroke.width_px, 0, 50)
-        self.stroke_color = rgba_color_field(tab, 16, "Stroke color (RGBA)", stroke.color)
+        stroke_group = ttk.LabelFrame(right, text="Stroke")
+        stroke_group.pack(fill="x", pady=(0, 8))
+        self.stroke_enabled = checkbox_field(stroke_group, 0, "Stroke (outline) enabled", stroke.enabled)
+        self.stroke_width = int_field(stroke_group, 1, "Stroke width (px)", stroke.width_px, 0, 50)
+        self.stroke_color = rgba_color_field(stroke_group, 2, "Stroke color (RGBA)", stroke.color)
 
     def _build_audio_asr_tab(self, notebook: ttk.Notebook) -> None:
         tab = ttk.Frame(notebook)
