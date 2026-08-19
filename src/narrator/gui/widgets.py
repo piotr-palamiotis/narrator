@@ -17,6 +17,78 @@ _FONT_PICKER_BG = "#1c1c1c"
 _FONT_PICKER_FG = "#fafafa"
 
 
+def scrollable_tab(notebook: ttk.Notebook, text: str) -> ttk.Frame:
+    """Adds a notebook tab that scrolls (vertically, and horizontally once
+    content is squeezed narrower than its natural width) instead of clipping
+    silently -- tabs are built assuming a comfortable pane size, but the
+    operator can drag the preview/settings split much smaller. Returns the
+    frame to build the tab's own widgets into.
+    """
+    outer = ttk.Frame(notebook)
+    notebook.add(outer, text=text)
+    outer.grid_rowconfigure(0, weight=1)
+    outer.grid_columnconfigure(0, weight=1)
+
+    canvas = tk.Canvas(outer, highlightthickness=0, bd=0)
+    vbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+    hbar = ttk.Scrollbar(outer, orient="horizontal", command=canvas.xview)
+    canvas.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+    canvas.grid(row=0, column=0, sticky="nsew")
+    # vbar/hbar are gridded on demand by _update_scrollbars below, only for
+    # as long as the content actually overflows the canvas in that
+    # direction -- not unconditionally, so a tab that fits needs no scrollbar.
+
+    inner = ttk.Frame(canvas)
+    window = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+    def _update_scrollbars() -> None:
+        canvas.configure(scrollregion=canvas.bbox("all"))
+        if inner.winfo_reqheight() > canvas.winfo_height():
+            vbar.grid(row=0, column=1, sticky="ns")
+        else:
+            vbar.grid_remove()
+        if inner.winfo_reqwidth() > canvas.winfo_width():
+            hbar.grid(row=1, column=0, sticky="ew")
+        else:
+            hbar.grid_remove()
+
+    def _sync_inner_width(event: tk.Event) -> None:
+        # Let content stretch to fill a canvas wider than its natural size,
+        # but never squeeze it narrower than that -- going narrower is what
+        # should bring up the horizontal scrollbar instead.
+        canvas.itemconfigure(window, width=max(event.width, inner.winfo_reqwidth()))
+        _update_scrollbars()
+
+    inner.bind("<Configure>", lambda _event: _update_scrollbars())
+    canvas.bind("<Configure>", _sync_inner_width)
+
+    def _on_mousewheel(event: tk.Event) -> None:
+        if event.num == 4:
+            canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            canvas.yview_scroll(1, "units")
+        else:
+            canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+    # Scoped to while the pointer is actually over this tab's canvas --
+    # bind_all is needed because Linux delivers wheel events as
+    # Button-4/5 to whichever widget has focus, not necessarily the canvas.
+    def _bind_mousewheel(_event: object = None) -> None:
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<Button-4>", _on_mousewheel)
+        canvas.bind_all("<Button-5>", _on_mousewheel)
+
+    def _unbind_mousewheel(_event: object = None) -> None:
+        canvas.unbind_all("<MouseWheel>")
+        canvas.unbind_all("<Button-4>")
+        canvas.unbind_all("<Button-5>")
+
+    canvas.bind("<Enter>", _bind_mousewheel)
+    canvas.bind("<Leave>", _unbind_mousewheel)
+
+    return inner
+
+
 def labeled_row(parent: tk.Widget, row: int, label: str) -> None:
     ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=4, pady=2)
 

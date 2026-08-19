@@ -14,7 +14,7 @@ import logging
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import ttk
 
 import sv_ttk
 from pydantic import ValidationError
@@ -45,6 +45,7 @@ from narrator.gui.widgets import (
     int_field,
     percent_field,
     rgba_color_field,
+    scrollable_tab,
     text_field,
 )
 
@@ -114,7 +115,6 @@ class NarratorGUI:
         paned.add(bottom, weight=1)
 
         self._build_preview_pane(top)
-        self._build_caption_mode_row(top)
 
         notebook = ttk.Notebook(bottom)
         notebook.pack(fill="both", expand=True, pady=(0, 8))
@@ -127,8 +127,6 @@ class NarratorGUI:
 
         button_bar = ttk.Frame(bottom)
         button_bar.pack(fill="x")
-        ttk.Button(button_bar, text="Save", command=self._on_save).pack(side="left")
-        ttk.Button(button_bar, text="Clear captions (Ctrl+L)", command=self._on_clear).pack(side="left", padx=(6, 0))
         self.status_var = tk.StringVar(value="ASR backend: (starting...)")
         ttk.Label(button_bar, textvariable=self.status_var).pack(side="right")
 
@@ -261,8 +259,7 @@ class NarratorGUI:
         self.root.after(1000, self._poll_status)
 
     def _build_canvas_tab(self, notebook: ttk.Notebook) -> None:
-        tab = ttk.Frame(notebook)
-        notebook.add(tab, text="Canvas")
+        tab = scrollable_tab(notebook, "Canvas")
         c = self.config.canvas
         self.canvas_width = int_field(tab, 0, "Width (px)", c.width_px, 1, 8000)
         self.canvas_height = int_field(tab, 1, "Height (px)", c.height_px, 1, 8000)
@@ -278,8 +275,7 @@ class NarratorGUI:
         ).grid(row=3, column=0, columnspan=4, sticky="w", padx=4, pady=(0, 2))
 
     def _build_layout_tab(self, notebook: ttk.Notebook) -> None:
-        tab = ttk.Frame(notebook)
-        notebook.add(tab, text="Layout")
+        tab = scrollable_tab(notebook, "Layout")
         layout = self.config.layout
         self.max_lines = int_field(tab, 0, "Max lines", layout.max_lines, 1, 20)
         self.interline = percent_field(tab, 1, "Interline (% of canvas height)", layout.interline_pct)
@@ -295,8 +291,7 @@ class NarratorGUI:
         )
 
     def _build_style_tab(self, notebook: ttk.Notebook) -> None:
-        tab = ttk.Frame(notebook)
-        notebook.add(tab, text="Style")
+        tab = scrollable_tab(notebook, "Style")
         tab.grid_columnconfigure(0, weight=1, uniform="style_col")
         tab.grid_columnconfigure(1, weight=1, uniform="style_col")
 
@@ -346,28 +341,64 @@ class NarratorGUI:
         self.stroke_color = rgba_color_field(stroke_group, 2, "Stroke color (RGBA)", stroke.color)
 
     def _build_audio_asr_tab(self, notebook: ttk.Notebook) -> None:
-        tab = ttk.Frame(notebook)
-        notebook.add(tab, text="Audio / ASR")
+        tab = scrollable_tab(notebook, "Audio / ASR")
+        tab.grid_columnconfigure(0, weight=1)
+
+        mode_row = ttk.Frame(tab)
+        mode_row.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 8))
+        self.caption_mode_var = tk.StringVar(value="auto")
+        ttk.Label(mode_row, text="Mode:").pack(side="left", padx=(0, 4))
+        ttk.Radiobutton(
+            mode_row, text="Auto (speech-to-text)", variable=self.caption_mode_var, value="auto",
+            command=self._on_caption_mode_changed,
+        ).pack(side="left")
+        ttk.Radiobutton(
+            mode_row, text="Manual", variable=self.caption_mode_var, value="manual",
+            command=self._on_caption_mode_changed,
+        ).pack(side="left")
+
+        # These two frames share row 1 -- only one is ever gridded at a time
+        # (see _on_caption_mode_changed), so switching to Manual clears the
+        # auto settings out of the way and gives the entry the space instead.
+        self._auto_settings_frame = ttk.Frame(tab)
+        self._auto_settings_frame.grid(row=1, column=0, sticky="ew")
+        auto = self._auto_settings_frame
         audio = self.config.audio
         try:
             device_names = ["default"] + [d.name for d in list_input_devices()]
         except Exception:
             device_names = ["default"]
-        self.audio_device = dropdown_field(tab, 0, "Microphone", audio.device, device_names)
+        self.audio_device = dropdown_field(auto, 0, "Microphone", audio.device, device_names)
 
         asr = self.config.asr
-        ttk.Separator(tab).grid(row=1, column=0, columnspan=4, sticky="ew", pady=6)
-        self.asr_model = text_field(tab, 2, "Whisper model", asr.model, width=30)
-        self.asr_language = text_field(tab, 3, "Language (ISO code or 'auto')", asr.language, width=10)
-        self.asr_device = dropdown_field(tab, 4, "ASR device", asr.device.value, ["auto", "vulkan", "cpu"])
-        self.asr_show_partial = checkbox_field(tab, 5, "Show partial (unconfirmed) captions", asr.show_partial_captions)
-        ttk.Label(tab, text="Audio/ASR model+device changes restart the ASR worker automatically.", foreground="gray").grid(
+        ttk.Separator(auto).grid(row=1, column=0, columnspan=4, sticky="ew", pady=6)
+        self.asr_model = text_field(auto, 2, "Whisper model", asr.model, width=30)
+        self.asr_language = text_field(auto, 3, "Language (ISO code or 'auto')", asr.language, width=10)
+        self.asr_device = dropdown_field(auto, 4, "ASR device", asr.device.value, ["auto", "vulkan", "cpu"])
+        self.asr_show_partial = checkbox_field(auto, 5, "Show partial (unconfirmed) captions", asr.show_partial_captions)
+        ttk.Label(auto, text="Audio/ASR model+device changes restart the ASR worker automatically.", foreground="gray").grid(
             row=6, column=0, columnspan=4, sticky="w", padx=4, pady=(8, 2)
         )
 
+        self._manual_settings_frame = ttk.Frame(tab)
+        self._manual_settings_frame.grid(row=1, column=0, sticky="ew")
+        ttk.Label(
+            self._manual_settings_frame,
+            text="Type a caption and press Enter to send it.",
+            foreground="gray",
+        ).pack(anchor="w", padx=4, pady=(0, 6))
+        # A plain single-line Entry can't hold a newline no matter what the
+        # operator presses, so "no new line can be created" falls out for
+        # free -- Enter is bound below to submit the line instead of doing
+        # nothing (Entry's default behavior for Return).
+        self.manual_entry_var = tk.StringVar()
+        self.manual_entry = ttk.Entry(self._manual_settings_frame, textvariable=self.manual_entry_var)
+        self.manual_entry.pack(fill="x", padx=4)
+        self.manual_entry.bind("<Return>", self._on_manual_submit)
+        self._manual_settings_frame.grid_remove()
+
     def _build_ndi_tab(self, notebook: ttk.Notebook) -> None:
-        tab = ttk.Frame(notebook)
-        notebook.add(tab, text="NDI")
+        tab = scrollable_tab(notebook, "NDI")
         ndi = self.config.ndi
         self.ndi_name = text_field(tab, 0, "NDI source name", ndi.source_name, width=30)
         self.ndi_fps = float_field(tab, 1, "Frame rate (fps)", ndi.fps, 1.0, 120.0, 1.0)
@@ -456,18 +487,6 @@ class NarratorGUI:
             return
         self._persist(new_config)
 
-    def _on_save(self) -> None:
-        if self._autosave_debounce_id is not None:
-            self.root.after_cancel(self._autosave_debounce_id)
-            self._autosave_debounce_id = None
-        try:
-            new_config = self._build_config_from_form()
-        except ValidationError as exc:
-            messagebox.showerror("Invalid configuration", str(exc))
-            return
-        self._persist(new_config)
-        messagebox.showinfo("Saved", f"Configuration saved to {self.config_path}")
-
     def _on_close(self) -> None:
         """The window's X button. Hides to the tray instead of quitting when a
         tray icon is running -- see build_tray_icon/_request_quit_from_tray
@@ -536,37 +555,16 @@ class NarratorGUI:
     def _request_tray_menu(self) -> None:
         self.root.after(0, self._show_tray_menu)
 
-    def _build_caption_mode_row(self, parent: ttk.Frame) -> None:
-        row = ttk.Frame(parent)
-        row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
-
-        self.caption_mode_var = tk.StringVar(value="auto")
-        ttk.Label(row, text="Captions:").pack(side="left", padx=(0, 4))
-        ttk.Radiobutton(
-            row, text="Auto", variable=self.caption_mode_var, value="auto", command=self._on_caption_mode_changed
-        ).pack(side="left")
-        ttk.Radiobutton(
-            row, text="Manual", variable=self.caption_mode_var, value="manual", command=self._on_caption_mode_changed
-        ).pack(side="left")
-
-        # A plain single-line Entry can't hold a newline no matter what the
-        # operator presses, so "no new line can be created" falls out for
-        # free -- Enter is bound below to submit the line instead of doing
-        # nothing (Entry's default behavior for Return).
-        self.manual_entry_var = tk.StringVar()
-        self.manual_entry = ttk.Entry(row, textvariable=self.manual_entry_var)
-        self.manual_entry.bind("<Return>", self._on_manual_submit)
-        # Not gridded/packed here -- shown only in manual mode, see
-        # _on_caption_mode_changed.
-
     def _on_caption_mode_changed(self) -> None:
         mode = self.caption_mode_var.get()
         self.controller.set_caption_mode(mode)
         if mode == "manual":
-            self.manual_entry.pack(side="left", fill="x", expand=True, padx=(12, 0))
+            self._auto_settings_frame.grid_remove()
+            self._manual_settings_frame.grid()
             self.manual_entry.focus_set()
         else:
-            self.manual_entry.pack_forget()
+            self._manual_settings_frame.grid_remove()
+            self._auto_settings_frame.grid()
 
     def _on_manual_submit(self, _event: object = None) -> None:
         self.controller.submit_manual_text(self.manual_entry_var.get())
