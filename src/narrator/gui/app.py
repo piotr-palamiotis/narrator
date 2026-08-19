@@ -141,12 +141,13 @@ class NarratorGUI:
 
         self.root.bind_all(_CLEAR_SHORTCUT, self._on_clear)
 
+        self._tray_menu = self._build_tray_popup_menu()
         self._tray = None
         try:
             self._tray = start_tray_icon(
                 on_show=self._request_show_from_tray,
-                on_clear=self._request_clear_from_tray,
                 on_quit=self._request_quit_from_tray,
+                on_activate=self._request_tray_menu,
             )
         except Exception:
             logger.warning("Failed to start system tray icon; closing the window will quit Narrator", exc_info=True)
@@ -492,18 +493,43 @@ class NarratorGUI:
         self.root.lift()
         self.root.focus_force()
 
-    # The following three run on pystray's own thread (menu item callbacks),
-    # not the Tk thread -- Tkinter is not thread-safe, so every one of them
-    # must marshal back onto the Tk event loop via root.after(0, ...) rather
-    # than touching widgets directly.
+    def _build_tray_popup_menu(self) -> tk.Menu:
+        """A Tk menu standing in for a native tray context menu.
+
+        pystray's Xlib/Xorg fallback backend (used when no AppIndicator/GTK
+        bindings are importable -- see gui/tray.py) can't display its own
+        menu and only ever delivers a plain click, so a real right-click
+        context menu isn't reachable on that backend. This menu is popped up
+        from that one click instead (see `_show_tray_menu`), giving the
+        operator the same show/close options regardless of backend. Hiding
+        the window is done via the window's own close (X) button -- see
+        `_on_close` -- not from this menu.
+        """
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Show Narrator", command=self._show_window)
+        menu.add_separator()
+        menu.add_command(label="Close Narrator", command=self._shutdown)
+        return menu
+
+    def _show_tray_menu(self) -> None:
+        x, y = self.root.winfo_pointerx(), self.root.winfo_pointery()
+        try:
+            self._tray_menu.tk_popup(x, y)
+        finally:
+            self._tray_menu.grab_release()
+
+    # The following three run on pystray's own thread (menu item/activation
+    # callbacks), not the Tk thread -- Tkinter is not thread-safe, so every
+    # one of them must marshal back onto the Tk event loop via
+    # root.after(0, ...) rather than touching widgets directly.
     def _request_show_from_tray(self) -> None:
         self.root.after(0, self._show_window)
 
-    def _request_clear_from_tray(self) -> None:
-        self.root.after(0, self._on_clear)
-
     def _request_quit_from_tray(self) -> None:
         self.root.after(0, self._shutdown)
+
+    def _request_tray_menu(self) -> None:
+        self.root.after(0, self._show_tray_menu)
 
     def _build_caption_mode_row(self, parent: ttk.Frame) -> None:
         row = ttk.Frame(parent)

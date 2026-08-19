@@ -54,28 +54,46 @@ def _make_icon_image() -> Image.Image:
 
 def _build_icon(
     on_show: Callable[[], None],
-    on_clear: Callable[[], None],
     on_quit: Callable[[], None],
+    on_activate: Callable[[], None],
 ) -> pystray.Icon:
+    # The activation click (the only interaction some backends -- notably
+    # pystray's Xlib/Xorg fallback used when no AppIndicator/GTK bindings are
+    # importable -- ever deliver) is bound to a hidden default item that asks
+    # the caller to show its own popup menu instead of acting directly. It's
+    # `visible=False` so backends with a real native menu (GTK/AppIndicator)
+    # don't render a redundant blank entry alongside the visible items below,
+    # but `Menu.__call__` still finds and runs it by scanning *all* items
+    # (visible or not) for the one marked `default`, so activation keeps
+    # working the same way on every backend.
     menu = pystray.Menu(
-        pystray.MenuItem("Show Narrator", lambda icon, item: on_show(), default=True),
-        pystray.MenuItem("Clear captions", lambda icon, item: on_clear()),
+        pystray.MenuItem("", lambda icon, item: on_activate(), default=True, visible=False),
+        pystray.MenuItem("Show Narrator", lambda icon, item: on_show()),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Quit", lambda icon, item: on_quit()),
+        pystray.MenuItem("Close Narrator", lambda icon, item: on_quit()),
     )
     return pystray.Icon("narrator", _make_icon_image(), "Narrator", menu)
 
 
 def start_tray_icon(
     on_show: Callable[[], None],
-    on_clear: Callable[[], None],
     on_quit: Callable[[], None],
+    on_activate: Callable[[], None],
 ) -> pystray.Icon:
     """Builds and starts the tray icon on its own thread(s), returning it
     (call `.stop()` to tear it down later). All three callbacks are invoked
     from pystray's thread, not the Tk thread -- callers must marshal back to
     the GUI thread themselves (e.g. via `root.after(0, ...)`) before touching
     any Tkinter widget.
+
+    `on_activate` fires on plain icon activation (e.g. a left click) on
+    every backend, including pystray's Xlib/Xorg fallback, which has no
+    concept of a real menu and can't deliver right-clicks at all -- so it's
+    the one hook guaranteed to work everywhere. Callers should use it to pop
+    up their own menu (e.g. a Tk context menu) offering show/close, since
+    `on_show`/`on_quit` only get wired to visible native menu items, which
+    are reachable solely on backends that do support a real menu
+    (GTK/AppIndicator).
 
     Threads spawned during startup are forced to be daemon threads (see
     `_daemon_threads_during`) -- confirmed empirically: pystray 0.19's Xorg
@@ -88,7 +106,7 @@ def start_tray_icon(
     caller's own fallback (falling back to normal close-on-X if this raises)
     only covers construction failures, not a silently-invisible icon.
     """
-    icon = _build_icon(on_show, on_clear, on_quit)
+    icon = _build_icon(on_show, on_quit, on_activate)
     with _daemon_threads_during():
         icon.run_detached()
     return icon
