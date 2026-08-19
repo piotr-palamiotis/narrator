@@ -190,15 +190,13 @@ def _ask_opacity(parent: tk.Widget, hex_rgb: str, initial_alpha: int) -> int | N
 
 
 def rgba_color_field(parent: tk.Widget, row: int, label: str, initial: str) -> tk.StringVar:
-    """A hex-text entry (source of truth, editable directly as '#RRGGBBAA')
-    plus a swatch that doubles as its own button: clicking it opens the
+    """A swatch button that doubles as its own picker: clicking it opens the
     system color picker for RGB, then a follow-up popup to set the alpha
-    channel (Tkinter's built-in chooser has no alpha support).
+    channel (Tkinter's built-in chooser has no alpha support). The chosen
+    color is held in the returned StringVar as '#RRGGBBAA'.
     """
     labeled_row(parent, row, label)
     var = tk.StringVar(value=initial)
-    entry = ttk.Entry(parent, textvariable=var, width=10)
-    entry.grid(row=row, column=1, sticky="w", padx=4, pady=2)
 
     def _refresh_swatch(*_args) -> None:
         try:
@@ -222,7 +220,7 @@ def rgba_color_field(parent: tk.Widget, row: int, label: str, initial: str) -> t
         _refresh_swatch()
 
     swatch = tk.Button(parent, text="  ", relief="raised", bd=1, width=3, cursor="hand2", command=_pick_color)
-    swatch.grid(row=row, column=2, sticky="w", padx=4, pady=2)
+    swatch.grid(row=row, column=1, sticky="w", padx=4, pady=2)
 
     var.trace_add("write", _refresh_swatch)
     _refresh_swatch()
