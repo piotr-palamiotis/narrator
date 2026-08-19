@@ -41,6 +41,7 @@ from narrator.gui.widgets import (
     compact_percent_field,
     dropdown_field,
     float_field,
+    font_picker_field,
     int_field,
     percent_field,
     rgba_color_field,
@@ -192,7 +193,7 @@ class NarratorGUI:
         font_options = _list_font_files()
         if style.font_family not in font_options:
             font_options = sorted({*font_options, style.font_family})
-        self.font_family = dropdown_field(path_frame, 0, "Font file", style.font_family, font_options)
+        self.font_family = font_picker_field(path_frame, 0, "Font file", style.font_family, font_options, _FONTS_DIR)
 
         color_frame = ttk.Frame(row)
         color_frame.pack(side="left")

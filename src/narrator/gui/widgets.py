@@ -2,9 +2,19 @@
 from __future__ import annotations
 
 import tkinter as tk
+from pathlib import Path
 from tkinter import colorchooser, ttk
 
+from PIL import Image, ImageDraw, ImageFont, ImageTk
+
 from narrator.config.schema import parse_rgba
+
+# Fallback colors for the font picker's thumbnails, used only if the active
+# ttk theme doesn't define the style options they're normally read from
+# (gui/app.py always applies sv_ttk's dark theme, so this is just a safety
+# net -- see sv_ttk's dark.tcl "colors" array for where these came from).
+_FONT_PICKER_BG = "#1c1c1c"
+_FONT_PICKER_FG = "#fafafa"
 
 
 def labeled_row(parent: tk.Widget, row: int, label: str) -> None:
@@ -59,6 +69,60 @@ def dropdown_field(parent: tk.Widget, row: int, label: str, initial: str, option
     ttk.Combobox(parent, textvariable=var, values=options, state="readonly", width=27).grid(
         row=row, column=1, sticky="w", padx=4, pady=2
     )
+    return var
+
+
+def font_picker_field(
+    parent: tk.Widget, row: int, label: str, initial: str, options: list[str], fonts_dir: Path
+) -> tk.StringVar:
+    """A font dropdown whose entries are rendered in their own typeface --
+    just the font's name, not its file path -- instead of listed as plain
+    text, so the operator can see what a font looks like before picking it.
+
+    `options` are paths as stored in config (e.g. "assets/fonts/Foo.ttf",
+    relative to the project root); `fonts_dir` is that directory, used to
+    resolve a path to an actual file to rasterize for the preview.
+    """
+    labeled_row(parent, row, label)
+    var = tk.StringVar(value=initial)
+
+    style = ttk.Style()
+    bg = style.lookup("TEntry", "fieldbackground") or _FONT_PICKER_BG
+    fg = style.lookup("TEntry", "foreground") or _FONT_PICKER_FG
+
+    thumbs: list[ImageTk.PhotoImage] = []  # kept alive for as long as the menu/button are
+
+    def _resolve(path: str) -> Path | None:
+        candidate = Path(path)
+        if candidate.is_file():
+            return candidate
+        candidate = fonts_dir / candidate.name
+        return candidate if candidate.is_file() else None
+
+    def _render(path: str, height: int = 26) -> ImageTk.PhotoImage:
+        name = Path(path).stem
+        font_file = _resolve(path)
+        try:
+            font = ImageFont.truetype(str(font_file), height - 8) if font_file else ImageFont.load_default()
+        except OSError:
+            font = ImageFont.load_default()
+        left, top, right, bottom = ImageDraw.Draw(Image.new("RGBA", (1, 1))).textbbox((0, 0), name, font=font)
+        img = Image.new("RGBA", (right - left + 16, height), bg)
+        ImageDraw.Draw(img).text((8 - left, (height - (bottom - top)) // 2 - top), name, font=font, fill=fg)
+        photo = ImageTk.PhotoImage(img)
+        thumbs.append(photo)
+        return photo
+
+    def _select(path: str) -> None:
+        var.set(path)
+        button.configure(image=_render(path))
+
+    menu = tk.Menu(parent, tearoff=0, background=bg, foreground=fg, activebackground=fg, activeforeground=bg)
+    for path in options:
+        menu.add_command(image=_render(path), command=lambda p=path: _select(p))
+
+    button = ttk.Menubutton(parent, image=_render(initial), menu=menu)
+    button.grid(row=row, column=1, sticky="w", padx=4, pady=2)
     return var
 
 
