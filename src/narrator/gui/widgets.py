@@ -132,19 +132,73 @@ def checkbox_field(parent: tk.Widget, row: int, label: str, initial: bool) -> tk
     return var
 
 
+def _ask_opacity(parent: tk.Widget, hex_rgb: str, initial_alpha: int) -> int | None:
+    """A modal popup with a slider for the alpha channel, shown right after
+    the system color picker returns (which has no alpha support of its
+    own). Returns the chosen alpha (0-255), or None if cancelled.
+    """
+    top = tk.Toplevel(parent)
+    top.title("Opacity")
+    top.transient(parent.winfo_toplevel())
+    top.resizable(False, False)
+
+    result: dict[str, int | None] = {"alpha": None}
+
+    frame = ttk.Frame(top, padding=10)
+    frame.pack(fill="both", expand=True)
+
+    preview = tk.Label(frame, text="  ", relief="sunken", width=4, height=2)
+    preview.grid(row=0, column=0, rowspan=2, padx=(0, 10))
+
+    r, g, b = int(hex_rgb[1:3], 16), int(hex_rgb[3:5], 16), int(hex_rgb[5:7], 16)
+    pct_var = tk.DoubleVar(value=round(initial_alpha / 255 * 100))
+    pct_label = ttk.Label(frame, text="")
+
+    def _update_preview(*_args) -> None:
+        pct = pct_var.get()
+        alpha = pct / 100
+        # tk can't render real alpha; approximate by blending against a
+        # mid-gray backdrop so the preview still hints at translucency.
+        blended = tuple(round(c * alpha + 128 * (1 - alpha)) for c in (r, g, b))
+        preview.configure(bg="#{:02x}{:02x}{:02x}".format(*blended))
+        pct_label.configure(text=f"{pct:.0f}%")
+
+    ttk.Label(frame, text="Opacity").grid(row=0, column=1, sticky="w")
+    ttk.Scale(frame, from_=0, to=100, variable=pct_var, orient="horizontal", length=180, command=_update_preview).grid(
+        row=1, column=1, sticky="ew"
+    )
+    pct_label.grid(row=1, column=2, padx=(6, 0))
+
+    def _ok() -> None:
+        result["alpha"] = round(pct_var.get() / 100 * 255)
+        top.destroy()
+
+    def _cancel() -> None:
+        top.destroy()
+
+    btns = ttk.Frame(frame)
+    btns.grid(row=2, column=0, columnspan=3, pady=(10, 0), sticky="e")
+    ttk.Button(btns, text="Cancel", command=_cancel).pack(side="right", padx=(6, 0))
+    ttk.Button(btns, text="OK", command=_ok).pack(side="right")
+
+    _update_preview()
+    top.protocol("WM_DELETE_WINDOW", _cancel)
+    top.grab_set()
+    top.focus_set()
+    top.wait_window()
+    return result["alpha"]
+
+
 def rgba_color_field(parent: tk.Widget, row: int, label: str, initial: str) -> tk.StringVar:
     """A hex-text entry (source of truth, editable directly as '#RRGGBBAA')
-    plus a swatch button that opens the system color picker for RGB and
-    preserves the existing alpha value (Tkinter's built-in chooser has no
-    alpha channel support).
+    plus a swatch that doubles as its own button: clicking it opens the
+    system color picker for RGB, then a follow-up popup to set the alpha
+    channel (Tkinter's built-in chooser has no alpha support).
     """
     labeled_row(parent, row, label)
     var = tk.StringVar(value=initial)
     entry = ttk.Entry(parent, textvariable=var, width=10)
     entry.grid(row=row, column=1, sticky="w", padx=4, pady=2)
-
-    swatch = tk.Label(parent, text="  ", relief="sunken", width=3)
-    swatch.grid(row=row, column=2, sticky="w", padx=4, pady=2)
 
     def _refresh_swatch(*_args) -> None:
         try:
@@ -158,12 +212,18 @@ def rgba_color_field(parent: tk.Widget, row: int, label: str, initial: str) -> t
             r, g, b, a = parse_rgba(var.get())
         except ValueError:
             r, g, b, a = 255, 255, 255, 255
-        _rgb, hex_str = colorchooser.askcolor(color=f"#{r:02x}{g:02x}{b:02x}")
-        if hex_str:
-            var.set(f"{hex_str.upper()}{a:02X}")
-            _refresh_swatch()
+        _rgb, hex_str = colorchooser.askcolor(color=f"#{r:02x}{g:02x}{b:02x}", parent=parent)
+        if not hex_str:
+            return
+        new_alpha = _ask_opacity(parent, hex_str, a)
+        if new_alpha is None:
+            return
+        var.set(f"{hex_str.upper()}{new_alpha:02X}")
+        _refresh_swatch()
 
-    ttk.Button(parent, text="Pick", command=_pick_color, width=5).grid(row=row, column=3, sticky="w", padx=4, pady=2)
+    swatch = tk.Button(parent, text="  ", relief="raised", bd=1, width=3, cursor="hand2", command=_pick_color)
+    swatch.grid(row=row, column=2, sticky="w", padx=4, pady=2)
+
     var.trace_add("write", _refresh_swatch)
     _refresh_swatch()
     return var
