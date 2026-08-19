@@ -88,6 +88,7 @@ class PreviewSync:
 
 
 PREVIEW_BORDER = "#4a4a4a"
+MARGIN_GUIDE_COLOR = "#5dd5ff"
 
 
 class ScaledImageCanvas(tk.Canvas):
@@ -100,10 +101,12 @@ class ScaledImageCanvas(tk.Canvas):
         )
         self._pil_image: Image.Image | None = None
         self._photo: ImageTk.PhotoImage | None = None
+        self._layout: LayoutConfig | None = None
         self.bind("<Configure>", self._redraw)
 
-    def show(self, image: Image.Image) -> None:
+    def show(self, image: Image.Image, layout: LayoutConfig | None = None) -> None:
         self._pil_image = image
+        self._layout = layout
         self._redraw()
 
     def _redraw(self, _event: object = None) -> None:
@@ -120,7 +123,21 @@ class ScaledImageCanvas(tk.Canvas):
         self.delete("all")
         cx, cy = avail_w // 2, avail_h // 2
         self.create_image(cx, cy, image=self._photo, anchor="center")
-        self.create_rectangle(
-            cx - new_w // 2, cy - new_h // 2, cx + new_w // 2, cy + new_h // 2,
-            outline=PREVIEW_BORDER,
-        )
+        x0, y0 = cx - new_w // 2, cy - new_h // 2
+        x1, y1 = cx + new_w // 2, cy + new_h // 2
+        self.create_rectangle(x0, y0, x1, y1, outline=PREVIEW_BORDER)
+        if self._layout is not None:
+            self._draw_margin_guides(x0, y0, x1, y1)
+
+    def _draw_margin_guides(self, x0: int, y0: int, x1: int, y1: int) -> None:
+        layout = self._layout
+        assert layout is not None
+        w, h = x1 - x0, y1 - y0
+        left = x0 + w * layout.margin_left_pct / 100.0
+        right = x1 - w * layout.margin_right_pct / 100.0
+        top = y0 + h * layout.margin_top_pct / 100.0
+        bottom = y1 - h * layout.margin_bottom_pct / 100.0
+        for x in (left, right):
+            self.create_line(x, y0, x, y1, fill=MARGIN_GUIDE_COLOR, dash=(4, 3))
+        for y in (top, bottom):
+            self.create_line(x0, y, x1, y, fill=MARGIN_GUIDE_COLOR, dash=(4, 3))

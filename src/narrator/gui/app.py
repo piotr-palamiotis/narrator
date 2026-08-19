@@ -247,7 +247,8 @@ class NarratorGUI:
             return
         live_renderer = getattr(self.controller, "_renderer", None)
         image = self._preview_sync.refresh(*cfgs, live_renderer)
-        self.preview_canvas.show(image)
+        _canvas, layout, _style = cfgs
+        self.preview_canvas.show(image, layout)
 
     def _poll_preview_text(self) -> None:
         self._refresh_preview()
