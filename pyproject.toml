@@ -1,0 +1,38 @@
+[project]
+name = "narrator"
+version = "0.1.0"
+description = "Live speech captioning streamed as an NDI RGBA source"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.6",
+    "pyyaml>=6.0",
+    "watchdog>=4.0",
+    "sounddevice>=0.4.6",
+    "numpy>=1.26",
+    "scipy>=1.12",
+    "pillow>=10.2",
+    "onnxruntime>=1.17",
+    "pywhispercpp>=1.2.0",
+    "cyndilib>=0.0.9",
+    "platformdirs>=4.0",
+    "sv-ttk>=2.6",
+    "pystray>=0.19",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+narrator = "narrator.main:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+narrator = ["config/defaults.yaml"]

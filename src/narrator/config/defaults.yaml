@@ -1,0 +1,64 @@
+app:
+  log_level: INFO
+
+audio:
+  device: "default"
+  sample_rate: 16000
+  frame_ms: 30
+
+asr:
+  model: "large-v3"
+  language: "pl"
+  device: auto
+  vad_threshold: 0.5
+  step_ms: 500
+  agreement_passes: 2
+  end_silence_ms: 650
+  max_context_seconds: 20
+  clear_after_silence_seconds: 8
+  show_partial_captions: false
+
+canvas:
+  width_px: 1920
+  height_px: 1080
+  background_color: "#00000000"
+
+layout:
+  max_lines: 2
+  margin_top_pct: 10.0
+  margin_bottom_pct: 5.0
+  margin_left_pct: 5.0
+  margin_right_pct: 5.0
+  interline_pct: 1.0
+  text_align: left
+  vertical_align_within_box: bottom
+
+style:
+  font_family: "assets/fonts/NotoSans-Regular.ttf"
+  font_color: "#FFFFFFFF"
+  min_font_px: 8
+  line_fill_ratio: 0.90
+  overrides:
+    background_band:
+      enabled: true
+      shape: pill
+      color: "#000000A0"
+      corner_radius_pct: 2.0
+      padding_pct: 1.0
+    shadow:
+      enabled: false
+      offset_x_pct: 0.3
+      offset_y_pct: 0.3
+      blur_px: 4
+      color: "#000000C0"
+    stroke:
+      enabled: true
+      width_px: 2
+      color: "#000000FF"
+
+ndi:
+  source_name: "LiveCaption"
+  fps: 30
+
+gui:
+  enabled: true
