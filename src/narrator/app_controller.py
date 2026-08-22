@@ -65,6 +65,9 @@ class AppController:
         self._ndi_stop_event: threading.Event | None = None
         self._ndi_thread: threading.Thread | None = None
 
+        self._audio_stop_event: threading.Event | None = None
+        self._audio_thread: threading.Thread | None = None
+
         self._stopped = False
         self._stop_lock = threading.Lock()
 
@@ -86,13 +89,10 @@ class AppController:
 
         self._renderer = CaptionRenderer(self._config.canvas, self._config.layout, self._config.style)
         self._start_ndi_stream()
-
-        self._mic = MicCapture(self._config.audio.device, self._config.audio.frame_ms)
-        self._mic.start()
+        self._start_audio_capture()
 
         self._spawn_asr_process()
 
-        self._spawn_thread(self._feed_audio_loop)
         self._spawn_thread(self._drain_events_loop)
         self._spawn_thread(self._supervise_asr_loop)
 
@@ -130,6 +130,33 @@ class AppController:
             old_sender.close()
         self._start_ndi_stream()
 
+    def _start_audio_capture(self) -> None:
+        """(Re)creates mic capture and its feed thread against the current
+        config. Uses its own stop event (distinct from the app-wide
+        `_stop_event`) so an `audio` config change can restart just capture
+        -- see `_on_config_changed` -- without tearing down the rest of the app.
+        """
+        self._audio_stop_event = threading.Event()
+        self._mic = MicCapture(self._config.audio.device, self._config.audio.frame_ms)
+        self._mic.start()
+        mic, audio_stop_event = self._mic, self._audio_stop_event
+        self._audio_thread = threading.Thread(
+            target=lambda: self._feed_audio_loop(mic, audio_stop_event),
+            daemon=True,
+        )
+        self._audio_thread.start()
+
+    def _restart_audio_capture(self) -> None:
+        logger.info("audio config changed; restarting audio capture")
+        old_stop_event, old_thread, old_mic = self._audio_stop_event, self._audio_thread, self._mic
+        if old_stop_event is not None:
+            old_stop_event.set()
+        if old_thread is not None:
+            old_thread.join(timeout=5)
+        if old_mic is not None:
+            old_mic.stop()
+        self._start_audio_capture()
+
     def _spawn_asr_process(self) -> None:
         self._asr_stop_event.clear()
         asr_config = self._config.asr
@@ -149,8 +176,8 @@ class AppController:
         self._asr_process.start()
         self._asr_spawn_time = time.monotonic()
 
-    def _feed_audio_loop(self) -> None:
-        for frame in self._mic.frames(timeout=0.5, stop_event=self._stop_event):
+    def _feed_audio_loop(self, mic: MicCapture, stop_event: threading.Event) -> None:
+        for frame in mic.frames(timeout=0.5, stop_event=stop_event):
             try:
                 self._audio_queue.put_nowait(frame)
             except queue.Full:
@@ -255,9 +282,15 @@ class AppController:
                         _ASR_RESTART_BACKOFF_SECONDS * (2 ** max(self._consecutive_quick_crashes - 1, 0)),
                         _ASR_RESTART_BACKOFF_MAX_SECONDS,
                     )
-                    time.sleep(backoff)
+                    # Interruptible: stop() can be called while this backoff is in
+                    # progress (the crash loop's backoff climbs to 30s), and without
+                    # checking the event again here, we'd spawn a fresh ASR process
+                    # right after the rest of the app has already torn down -- an
+                    # orphaned process stop() will never join again.
+                    if self._stop_event.wait(backoff):
+                        break
                     self._spawn_asr_process()
-            time.sleep(1.0)
+            self._stop_event.wait(1.0)
 
     def _on_config_changed(self, new_config: RootConfig) -> None:
         with self._config_lock:
@@ -279,7 +312,7 @@ class AppController:
                     self._asr_process.join(timeout=5)
                 self._spawn_asr_process()
             if new_config.audio != old_config.audio:
-                logger.warning("audio config changed; restart the app for this to take effect")
+                self._restart_audio_capture()
 
     def stop(self) -> None:
         """Idempotent: safe to call more than once (e.g. a signal handler
@@ -296,6 +329,8 @@ class AppController:
         self._asr_stop_event.set()
         if self._ndi_stop_event is not None:
             self._ndi_stop_event.set()
+        if self._audio_stop_event is not None:
+            self._audio_stop_event.set()
         if self._watcher is not None:
             self._watcher.stop()
         if self._mic is not None:
@@ -304,6 +339,8 @@ class AppController:
             self._asr_process.join(timeout=5)
         if self._ndi_thread is not None:
             self._ndi_thread.join(timeout=5)
+        if self._audio_thread is not None:
+            self._audio_thread.join(timeout=5)
         if self._sender is not None:
             self._sender.close()
         for thread in self._threads:

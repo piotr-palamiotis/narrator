@@ -95,7 +95,8 @@ Most fields hot-reload without a restart. Exceptions handled explicitly in
 `_on_config_changed`: an `ndi`/`canvas` change tears down and restarts just
 the NDI stream (`_restart_ndi_stream`, its own stop event separate from the
 app-wide one); an `asr` change restarts the ASR worker process; an `audio`
-change just logs a warning that a full app restart is needed.
+change tears down and restarts just mic capture and its feed thread
+(`_restart_audio_capture`, same pattern, its own stop event).
 
 Schema lives in `narrator.config.schema` (Pydantic). **There is deliberately
 no `font_size` field anywhere** — font size is always derived at render time
