@@ -9,11 +9,10 @@ Only while the operator has unsaved edits pending (the form no longer
 matches the live config) does it fall back to a private `CaptionRenderer`,
 fully decoupled from the live broadcast, so editing fields can preview a
 "what if" layout without mutating what's currently on air. That fallback
-mirrors whatever text the live app's caption buffer currently holds, falling
-back further to a bundled sample paragraph when the app hasn't produced any
-captions yet, and re-renders through the same geometry/wrap pipeline the
-real renderer uses so margin, font, and line-count edits reflow the
-previewed text instead of deleting it.
+mirrors whatever text the live app's caption buffer currently holds (blank
+if the app hasn't produced any captions yet), and re-renders through the
+same geometry/wrap pipeline the real renderer uses so margin, font, and
+line-count edits reflow the previewed text instead of deleting it.
 
 `ScaledImageCanvas` is a small `tk.Canvas` that keeps the last frame it was
 given and re-fits it (preserving aspect ratio, letterboxed as needed) on
@@ -29,18 +28,6 @@ from narrator.config.schema import CanvasConfig, LayoutConfig, StyleConfig
 from narrator.render.canvas import CaptionRenderer
 
 PREVIEW_BG = "#1c1c1c"
-
-SAMPLE_TEXT = (
-    "This is a live preview of the caption canvas. It uses placeholder text "
-    "so you can see how margins, font, and line count settings affect the "
-    "layout before any real captions arrive. As you adjust the controls "
-    "around this canvas, this text reflows to match -- it is never cleared "
-    "just because the layout changed. Once the app starts transcribing real "
-    "speech, this preview will switch over and mirror the actual live "
-    "captions instead. Try changing the max line count, the margins on each "
-    "side, or the font below to see the effect immediately, without needing "
-    "to save first."
-)
 
 
 class PreviewSync:
@@ -70,8 +57,6 @@ class PreviewSync:
                 source_text = live_renderer.snapshot_text()
             except Exception:
                 source_text = ""
-        if not source_text:
-            source_text = SAMPLE_TEXT
 
         if source_text != self._last_source_text:
             if source_text.startswith(self._last_source_text) and self._last_source_text:
