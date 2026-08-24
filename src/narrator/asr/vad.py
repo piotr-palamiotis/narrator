@@ -8,7 +8,7 @@ ONNX Runtime for a lightweight, easy-to-package VAD. The model file itself
 (assets/vad/silero_vad.onnx, MIT-licensed, see assets/vad/LICENSE-silero-vad.txt)
 is redistributed directly and driven with a small hand-written wrapper instead.
 
-Model contract (Silero VAD v4/v5 ONNX graph, confirmed via `get_inputs()` /
+Model contract (Silero VAD v5 ONNX graph, confirmed via `get_inputs()` /
 `get_outputs()` on the bundled graph):
   inputs:  input (1, N) float32 audio chunk, state (2, 1, 128) float32 recurrent
            state, sr () int64 sample rate
@@ -18,6 +18,18 @@ Chunk size must be exactly 512 samples at 16kHz (32ms) -- this wrapper buffers
 arbitrary-length input frames internally and only runs inference once a full
 512-sample window has accumulated, so callers (audio/capture.py's frame_ms)
 don't need to match this exactly.
+
+The v5 graph's causal convolutions also require 64 samples of left context
+from the *previous* window prepended to each 512-sample window fed to
+`input` (verified against the official `silero-vad` package's own
+`OnnxWrapper.__call__`, which does the same) -- without it the graph is
+structurally starved of temporal continuity between windows and its output
+saturates near a fixed low-probability constant regardless of input,
+including on real, clearly-audible speech. This was confirmed empirically:
+feeding bare 512-sample windows with no context produced <0.04 probability
+across an entire 60s reference speech file; prepending the trailing 64
+samples of the prior window raised that to a 0.78 mean with 77% of windows
+correctly crossing the default 0.5 threshold on the same file.
 """
 from __future__ import annotations
 
@@ -27,7 +39,8 @@ import numpy as np
 import onnxruntime as ort
 
 _MODEL_PATH = Path(__file__).resolve().parents[3] / "assets" / "vad" / "silero_vad.onnx"
-_WINDOW_SAMPLES = 512  # required by the Silero v4/v5 graph at 16kHz
+_WINDOW_SAMPLES = 512  # required by the Silero v5 graph at 16kHz
+_CONTEXT_SAMPLES = 64  # required left-context for the same graph's causal convs
 _SAMPLE_RATE = 16000
 
 
@@ -38,10 +51,12 @@ class SileroVad:
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
         self._sr = np.array(_SAMPLE_RATE, dtype=np.int64)
         self._pending = np.zeros(0, dtype=np.float32)
+        self._context = np.zeros(_CONTEXT_SAMPLES, dtype=np.float32)
 
     def reset(self) -> None:
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
         self._pending = np.zeros(0, dtype=np.float32)
+        self._context = np.zeros(_CONTEXT_SAMPLES, dtype=np.float32)
 
     def process(self, frame: np.ndarray) -> list[float]:
         """Feed an arbitrary-length mono float32 frame at 16kHz. Returns the
@@ -56,16 +71,18 @@ class SileroVad:
                 self._pending[:_WINDOW_SAMPLES],
                 self._pending[_WINDOW_SAMPLES:],
             )
+            model_input = np.concatenate([self._context, window])
             outputs = self._session.run(
                 None,
                 {
-                    "input": window.reshape(1, -1),
+                    "input": model_input.reshape(1, -1),
                     "state": self._state,
                     "sr": self._sr,
                 },
             )
             prob, self._state = outputs[0], outputs[1]
             probabilities.append(float(prob[0][0]))
+            self._context = window[-_CONTEXT_SAMPLES:]
         return probabilities
 
     def is_speech(self, probabilities: list[float]) -> bool:

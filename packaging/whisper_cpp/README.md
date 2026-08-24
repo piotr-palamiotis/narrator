@@ -13,7 +13,13 @@ documented build flags (github.com/absadiki/pywhispercpp).
 - CMake >= 3.21 and a C/C++ compiler (build-essential on Ubuntu, MSVC Build
   Tools on Windows).
 - The **Vulkan SDK** (https://vulkan.lunarg.com/) installed, so the Vulkan
-  headers/loader are available to CMake at build time.
+  headers/loader are available to CMake at build time. whisper.cpp's Vulkan
+  backend also needs `find_package(SPIRV-Headers)` and `find_package(SPIRV-Tools)`
+  to succeed -- the official LunarG SDK tarball bundles both, but a
+  minimal apt-based setup needs them installed explicitly too (Ubuntu:
+  `spirv-headers` and `spirv-tools` packages), or CMake's configure step
+  fails with "Could not find a package configuration file provided by
+  SPIRV-Headers" even though the Vulkan loader itself was found fine.
 - Python matching the venv narrator will run in.
 
 ## Ubuntu
@@ -34,6 +40,37 @@ $env:GGML_VULKAN = "1"
 pip install --no-cache-dir --force-reinstall -v `
     git+https://github.com/absadiki/pywhispercpp
 ```
+
+## Fixing the shared-library RPATH (required after every source build)
+
+Confirmed empirically, not theoretical: a `pip install git+...` source build
+of pywhispercpp reports `Successfully installed pywhispercpp` but is **not
+actually usable yet**. The built extension (`_pywhispercpp*.so`) and its
+sibling libraries (`libwhisper.so.1`, `libggml*.so`, `libggml-vulkan.so`,
+...) land permanently in site-packages, but pywhispercpp's build does not
+set a `$ORIGIN`-relative RPATH on them -- it bakes in the *absolute path of
+pip's temporary build directory* instead. That directory is deleted the
+moment the install finishes, so the very next `import pywhispercpp.model`
+fails with `ImportError: libwhisper.so.1: cannot open shared object file: No
+such file or directory` (verify with `readelf -d <file> | grep RUNPATH` --
+it'll show `/tmp/pip-req-build-.../build/lib...`, a path that no longer
+exists). This is an upstream packaging gap in every source build, not
+something specific to one machine or one Vulkan setup.
+
+Fix it once per build, right after the `pip install` command above:
+
+```bash
+pip install patchelf   # no root needed, prebuilt wheel
+SITE=$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+for f in "$SITE"/lib{whisper,ggml,ggml-base,ggml-cpu,ggml-vulkan}.so* \
+         "$SITE"/_pywhispercpp*.so; do
+    [ -f "$f" ] && patchelf --set-rpath '$ORIGIN' "$f"
+done
+```
+
+After this, the built libraries resolve their sibling dependencies relative
+to their own directory and need no `LD_LIBRARY_PATH` at runtime -- confirmed
+by importing in a completely clean environment.
 
 ## Verifying the build picked up Vulkan
 
