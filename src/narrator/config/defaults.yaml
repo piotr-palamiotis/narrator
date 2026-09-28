@@ -8,8 +8,19 @@ audio:
 
 asr:
   model: "large-v3"
+  # Dynamic language switching: "pl" is the default caption language; when
+  # detection reports a different language confidently at this many
+  # consecutive utterance-finalizes, the active language switches (and
+  # switches back when Polish returns). 0 = never switch; "auto" = follow
+  # the speaker verbatim per utterance instead (no default language).
+  # Note: whisper transcribes; it has no X->Polish translation.
   language: "pl"
+  language_switch_threshold: 2
   device: auto
+  # Which Vulkan GPU to use when several are present. "auto" prefers the
+  # first discrete card, so a machine with an iGPU alongside a discrete GPU
+  # does not silently run inference on the slow one.
+  gpu_device: auto
   vad_threshold: 0.5
   step_ms: 500
   agreement_passes: 2

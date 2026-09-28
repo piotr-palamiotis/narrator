@@ -1,0 +1,11 @@
+{
+  "voice": "en_US-amy-low",
+  "piper_params": {"noise_scale": 0.0, "noise_w_scale": 0.0, "length_scale": 1.0, "sentence_silence": 0.4},
+  "clips": [
+    {
+      "id": "english",
+      "transcript": "The next speaker will present in English, so please switch your headsets.",
+      "reference": "The next speaker will present in English, so please switch your headsets."
+    }
+  ]
+}

@@ -19,6 +19,11 @@ from narrator.config.schema import AsrConfig
 
 logger = logging.getLogger(__name__)
 
+# Upper bound on frames ingested between two decode steps. Only a guard against
+# a pathological producer starving the decode step entirely; app_controller's
+# queue is itself bounded well below this.
+_MAX_DRAIN_FRAMES = 1000
+
 
 def run_asr_worker(
     config: AsrConfig,
@@ -42,4 +47,20 @@ def run_asr_worker(
             frame = audio_queue.get(timeout=0.5)
         except queue.Empty:
             continue
-        decoder.feed(frame)
+
+        # Ingest everything that queued up while the previous decode step was
+        # running, *then* decode once. Feeding one frame per decode instead
+        # makes the worker consume ~1 frame (30ms of audio) per decode step
+        # (0.3-2.1s), so the bounded queue in app_controller saturates within
+        # seconds and its drop-oldest policy starts discarding the great
+        # majority of incoming audio -- the decode window ends up stitched
+        # from non-adjacent fragments, which is what garbled the captions.
+        # VAD is cheap enough to keep up with real time on its own, so the
+        # drain always completes.
+        decoder.feed(frame, run_decode_step=False)
+        for _ in range(_MAX_DRAIN_FRAMES):
+            try:
+                decoder.feed(audio_queue.get_nowait(), run_decode_step=False)
+            except queue.Empty:
+                break
+        decoder.tick()

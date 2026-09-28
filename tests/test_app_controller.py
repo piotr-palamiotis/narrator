@@ -96,3 +96,141 @@ def test_set_caption_mode_rejects_unknown_mode():
     except ValueError:
         return
     raise AssertionError("expected ValueError for an invalid caption mode")
+
+
+# --- ASR worker lifecycle -------------------------------------------------
+#
+# Regression tests for a cluster of restart bugs with one operator-visible
+# symptom: GPU worked on first launch, then any config edit dropped it to CPU
+# permanently and leaked a worker process per edit until the machine ran out
+# of memory.
+
+import threading
+import time
+
+from narrator.config.schema import AsrDevice, RootConfig
+
+
+class FakeProcess:
+    """Stands in for mp.Process. Stays 'alive' until stopped, so a test can
+    model a worker that is slow to honour its stop event."""
+
+    def __init__(self, ignore_stop: bool = False) -> None:
+        self.alive = True
+        self.exitcode = None
+        self.terminated = False
+        self.killed = False
+        self._ignore_stop = ignore_stop
+
+    def start(self) -> None:
+        self.alive = True
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def join(self, timeout=None) -> None:
+        if not self._ignore_stop:
+            self.alive = False
+            self.exitcode = 0
+
+    def terminate(self) -> None:
+        self.terminated = True
+        if self._ignore_stop:
+            self.alive = False
+            self.exitcode = -15
+
+    def kill(self) -> None:
+        self.killed = True
+        self.alive = False
+        self.exitcode = -9
+
+
+def make_lifecycle_controller(monkeypatch, processes):
+    """Controller with just enough state for the ASR lifecycle, and mp.Process
+    replaced by a queue of FakeProcesses."""
+    controller = AppController.__new__(AppController)
+    controller._config = RootConfig()
+    controller._asr_lock = threading.Lock()
+    controller._stop_event = threading.Event()
+    controller._asr_process = None
+    controller._asr_stop_event = None
+    controller._asr_spawn_time = 0.0
+    controller._consecutive_quick_crashes = 0
+    controller._force_asr_cpu = False
+    controller._audio_queue = None
+    controller._event_queue = None
+
+    spawned = []
+    made = iter(processes)
+
+    def fake_process(*args, **kwargs):
+        proc = next(made)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr("narrator.app_controller.mp.Process", fake_process)
+    monkeypatch.setattr("narrator.app_controller.mp.Event", lambda: threading.Event())
+    return controller, spawned
+
+
+def test_restart_gives_each_generation_its_own_stop_event(monkeypatch):
+    """The old shared event was cleared by the incoming generation, which
+    un-stopped any outgoing worker that hadn't exited yet."""
+    controller, spawned = make_lifecycle_controller(monkeypatch, [FakeProcess(), FakeProcess()])
+
+    with controller._asr_lock:
+        controller._spawn_asr_process()
+    first_stop_event = controller._asr_stop_event
+
+    controller._restart_asr_process()
+
+    assert controller._asr_stop_event is not first_stop_event
+    assert first_stop_event.is_set(), "outgoing worker must stay stopped"
+    assert not controller._asr_stop_event.is_set(), "incoming worker must not start stopped"
+
+
+def test_restart_does_not_count_as_a_crash(monkeypatch):
+    """Three config edits used to trip the crash-loop breaker and pin the app
+    to CPU, because a deliberate restart looked identical to a crash."""
+    controller, _ = make_lifecycle_controller(
+        monkeypatch, [FakeProcess() for _ in range(4)]
+    )
+    with controller._asr_lock:
+        controller._spawn_asr_process()
+
+    for _ in range(3):
+        controller._restart_asr_process()
+
+    assert controller._consecutive_quick_crashes == 0
+    assert controller._force_asr_cpu is False, "config edits must not force CPU"
+
+
+def test_restart_escalates_to_terminate_when_worker_ignores_stop(monkeypatch):
+    """A worker mid-decode or loading a 3GB model won't exit cooperatively;
+    leaving it running leaked a whole whisper model per config edit."""
+    stubborn = FakeProcess(ignore_stop=True)
+    controller, _ = make_lifecycle_controller(monkeypatch, [stubborn, FakeProcess()])
+    with controller._asr_lock:
+        controller._spawn_asr_process()
+
+    controller._restart_asr_process()
+
+    assert stubborn.terminated, "outgoing worker must be terminated, not orphaned"
+    assert not stubborn.is_alive()
+
+
+def test_supervisor_ignores_a_worker_detached_for_restart(monkeypatch):
+    """While a deliberate restart is in flight `_asr_process` is None, which
+    is what stops the supervisor from racing it and spawning a duplicate."""
+    controller, spawned = make_lifecycle_controller(monkeypatch, [FakeProcess()])
+    with controller._asr_lock:
+        controller._spawn_asr_process()
+    controller._asr_process = None  # simulate restart in flight
+
+    supervisor = threading.Thread(target=controller._supervise_asr_loop, daemon=True)
+    supervisor.start()
+    time.sleep(0.2)
+    controller._stop_event.set()
+    supervisor.join(timeout=5)
+
+    assert len(spawned) == 1, "supervisor must not spawn while a restart is in flight"

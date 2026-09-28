@@ -66,3 +66,25 @@ def test_no_font_size_field_exists_anywhere():
         return False
     assert not find_key(dumped, "font_size")
     assert not find_key(dumped, "font_size_px")
+
+
+def test_asr_gpu_device_defaults_to_auto():
+    from narrator.config.schema import AsrConfig
+
+    assert AsrConfig().gpu_device == "auto"
+
+
+def test_asr_gpu_device_accepts_explicit_index():
+    from narrator.config.schema import AsrConfig
+
+    assert AsrConfig(gpu_device=1).gpu_device == 1
+
+
+def test_asr_gpu_device_rejects_nonsense():
+    import pytest
+    from pydantic import ValidationError
+
+    from narrator.config.schema import AsrConfig
+
+    with pytest.raises(ValidationError):
+        AsrConfig(gpu_device="second one")

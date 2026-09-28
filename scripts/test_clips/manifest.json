@@ -1,0 +1,41 @@
+{
+  "voice": "pl_PL-darkman-medium",
+  "piper_params": {
+    "noise_scale": 0.0,
+    "noise_w_scale": 0.0,
+    "length_scale": 1.0,
+    "sentence_silence": 0.4
+  },
+  "clips": [
+    {
+      "id": "intro",
+      "transcript": "Witajcie na dzisiejszym spotkaniu.",
+      "reference": "Witajcie na dzisiejszym spotkaniu."
+    },
+    {
+      "id": "numbers",
+      "transcript": "W roku 2000 miasto liczyło 15000 mieszkańców.",
+      "reference": "W roku 2000 miasto liczyło 15 tysięcy mieszkańców."
+    },
+    {
+      "id": "tech",
+      "transcript": "Napisy na żywo powstają w oparciu o lokalny model rozpoznawania mowy.",
+      "reference": "Napisy na żywo powstają w oparciu o lokalny model rozpoznawania mowy."
+    },
+    {
+      "id": "punct",
+      "transcript": "Czy to działa? Tak, działa bardzo dobrze!",
+      "reference": "Czy to działa? Tak, działa bardzo dobrze!"
+    },
+    {
+      "id": "long",
+      "transcript": "To zdanie jest znacznie dłuższe niż pozostałe, żeby sprawdzić, jak dekoder radzi sobie z dłuższą wypowiedzią bez przerwy pomiędzy słowami, gdy okno dekodera rośnie.",
+      "reference": "To zdanie jest znacznie dłuższe niż pozostałe, żeby sprawdzić, jak dekoder radzi sobie z dłuższą wypowiedzią bez przerwy pomiędzy słowami, gdy okno dekodera rośnie."
+    },
+    {
+      "id": "mixed",
+      "transcript": "System działa na procesorze, na karcie graficznej, albo przełącza się na procesor awaryjnie.",
+      "reference": "System działa na procesorze, na karcie graficznej, albo przełącza się na procesor awaryjnie."
+    }
+  ]
+}

@@ -12,7 +12,11 @@ dependencies = [
     "scipy>=1.12",
     "pillow>=10.2",
     "onnxruntime>=1.17",
-    "pywhispercpp>=1.2.0",
+    # 1.5.1 is the version verified to ship a Vulkan-enabled ggml backend
+    # (libggml-vulkan.so) in its prebuilt wheels, which is what makes GPU
+    # acceleration work with no source build. Older wheels were CPU-only, so
+    # this floor is deliberate rather than incidental.
+    "pywhispercpp>=1.5.1",
     "cyndilib>=0.0.9",
     "platformdirs>=4.0",
     "sv-ttk>=2.6",

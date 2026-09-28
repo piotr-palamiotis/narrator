@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, Field, model_validator
 
@@ -70,7 +70,22 @@ class AudioConfig(BaseModel):
 class AsrConfig(BaseModel):
     model: str = "large-v3"
     language: str = "pl"
+    # Dynamic language switching (only when `language` is a forced code, not
+    # "auto"): the configured language is used for decoding until detection
+    # reports a DIFFERENT language confidently this many consecutive times
+    # (once per utterance finalize, plus periodic checks inside long
+    # utterances), at which point the active language switches -- and switches
+    # back the same way. 0 disables switching entirely (pure forced). The
+    # special value language="auto" instead follows the speaker verbatim per
+    # utterance with no default language.
+    language_switch_threshold: int = Field(default=2, ge=0)
     device: AsrDevice = AsrDevice.AUTO
+    # Which Vulkan GPU to use when more than one is present (a discrete card
+    # alongside an integrated one is the common case). "auto" picks the first
+    # discrete GPU, falling back to whatever is enumerated first -- without
+    # this, whisper.cpp always takes GPU 0, which on a machine whose iGPU
+    # enumerates first would silently run inference on the slow adapter.
+    gpu_device: int | Literal["auto"] = "auto"
     vad_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     step_ms: int = Field(default=500, gt=0)
     agreement_passes: int = Field(default=2, ge=1)

@@ -33,6 +33,13 @@ logger = logging.getLogger(__name__)
 _ASR_RESTART_BACKOFF_SECONDS = 2.0
 _ASR_RESTART_BACKOFF_MAX_SECONDS = 30.0
 
+# How long to let an ASR worker shut down cooperatively before escalating.
+# Generous because the worker can be inside a multi-second decode, or loading
+# a 3GB model, when it is asked to stop -- but bounded, because a worker that
+# outlives its replacement holds a whole whisper model resident.
+_ASR_GRACEFUL_STOP_SECONDS = 10.0
+_ASR_FORCE_STOP_SECONDS = 5.0
+
 # A worker that dies within this many seconds of starting is considered a
 # "quick crash" (as opposed to dying after having run fine for a while, e.g.
 # because the operator edited the ASR config). After this many quick crashes
@@ -54,8 +61,18 @@ class AppController:
 
         self._audio_queue: mp.Queue = mp.Queue(maxsize=200)
         self._event_queue: mp.Queue = mp.Queue()
-        self._asr_stop_event = mp.Event()
+        # One stop event per worker *generation*, not one shared for the life
+        # of the app: a single reused event cannot express "stop the old
+        # worker but not the new one". The previous shared event was cleared
+        # by the incoming generation in _spawn_asr_process, which resurrected
+        # any outgoing worker that hadn't exited yet -- see
+        # _restart_asr_process for the full failure.
+        self._asr_stop_event: "mp.synchronize.Event | None" = None
         self._asr_process: mp.Process | None = None
+        # Serializes every ASR lifecycle transition. Without it the config
+        # watcher thread and the supervisor thread can both decide to spawn a
+        # worker for the same death, leaking one of them.
+        self._asr_lock = threading.Lock()
 
         self._stop_event = threading.Event()
         self._threads: list[threading.Thread] = []
@@ -91,7 +108,8 @@ class AppController:
         self._start_ndi_stream()
         self._start_audio_capture()
 
-        self._spawn_asr_process()
+        with self._asr_lock:
+            self._spawn_asr_process()
 
         self._spawn_thread(self._drain_events_loop)
         self._spawn_thread(self._supervise_asr_loop)
@@ -158,23 +176,83 @@ class AppController:
         self._start_audio_capture()
 
     def _spawn_asr_process(self) -> None:
-        self._asr_stop_event.clear()
+        """Start a new ASR worker generation. Caller must hold `_asr_lock`."""
         asr_config = self._config.asr
         if self._force_asr_cpu and asr_config.device != AsrDevice.CPU:
             asr_config = asr_config.model_copy(update={"device": AsrDevice.CPU})
-        self._asr_process = mp.Process(
+        stop_event = mp.Event()
+        process = mp.Process(
             target=run_asr_worker,
             args=(
                 asr_config,
                 self._audio_queue,
                 self._event_queue,
-                self._asr_stop_event,
+                stop_event,
                 self._config.app.log_level,
             ),
             daemon=True,
         )
-        self._asr_process.start()
+        process.start()
+        self._asr_process = process
+        self._asr_stop_event = stop_event
         self._asr_spawn_time = time.monotonic()
+
+    @staticmethod
+    def _shut_down_asr_process(
+        process: mp.Process | None, stop_event: "mp.synchronize.Event | None"
+    ) -> None:
+        """Stop one ASR worker generation and *guarantee* it is gone.
+
+        A cooperative stop alone is not enough. The worker can be several
+        seconds from noticing the event (mid-decode) or tens of seconds away
+        (loading a 3GB large-v3 model), so a bare `join(timeout=5)` routinely
+        returns with the process still running. Leaving it there is what
+        turned a config edit into a resource leak: each survivor keeps a
+        whole whisper model resident -- ~3GB of VRAM on the GPU path -- and
+        keeps draining the shared audio queue, so a few edits exhausted VRAM,
+        pushed subsequent workers onto CPU, and eventually ran the machine
+        out of memory. Escalate to terminate/kill rather than orphan it.
+        """
+        if process is None:
+            return
+        if stop_event is not None:
+            stop_event.set()
+        process.join(timeout=_ASR_GRACEFUL_STOP_SECONDS)
+        if process.is_alive():
+            logger.warning(
+                "ASR worker did not exit within %.0fs of being asked to stop; terminating",
+                _ASR_GRACEFUL_STOP_SECONDS,
+            )
+            process.terminate()
+            process.join(timeout=_ASR_FORCE_STOP_SECONDS)
+        if process.is_alive():
+            logger.error("ASR worker ignored SIGTERM; killing")
+            process.kill()
+            process.join(timeout=_ASR_FORCE_STOP_SECONDS)
+
+    def _restart_asr_process(self) -> None:
+        """Replace the running ASR worker with one built from current config.
+
+        Detaching the outgoing process *before* stopping it is deliberate:
+        `_supervise_asr_loop` treats "the current worker is not alive" as a
+        crash, and a deliberate restart would otherwise be miscounted as one.
+        That miscount was not cosmetic -- three of them tripped the
+        crash-loop breaker and pinned the app to CPU permanently, and the
+        supervisor's own restart raced this one, leaking a worker each time.
+        """
+        with self._asr_lock:
+            old_process, old_stop_event = self._asr_process, self._asr_stop_event
+            self._asr_process, self._asr_stop_event = None, None
+            # A deliberate restart is a fresh attempt, not a continuation of
+            # whatever crash streak preceded it.
+            self._consecutive_quick_crashes = 0
+
+        self._shut_down_asr_process(old_process, old_stop_event)
+
+        with self._asr_lock:
+            if self._stop_event.is_set():
+                return
+            self._spawn_asr_process()
 
     def _feed_audio_loop(self, mic: MicCapture, stop_event: threading.Event) -> None:
         for frame in mic.frames(timeout=0.5, stop_event=stop_event):
@@ -244,10 +322,16 @@ class AppController:
 
     def _supervise_asr_loop(self) -> None:
         while not self._stop_event.is_set():
-            if self._asr_process is not None and not self._asr_process.is_alive():
-                exit_code = self._asr_process.exitcode
+            # Snapshot under the lock. `_asr_process` is None precisely while a
+            # deliberate restart is in flight, which is how an intentional
+            # stop is distinguished from a crash without a separate flag.
+            with self._asr_lock:
+                process = self._asr_process
+                spawn_time = self._asr_spawn_time
+            if process is not None and not process.is_alive():
+                exit_code = process.exitcode
                 if not self._stop_event.is_set():
-                    uptime = time.monotonic() - self._asr_spawn_time
+                    uptime = time.monotonic() - spawn_time
                     if uptime < _QUICK_CRASH_WINDOW_SECONDS:
                         self._consecutive_quick_crashes += 1
                     else:
@@ -289,7 +373,15 @@ class AppController:
                     # orphaned process stop() will never join again.
                     if self._stop_event.wait(backoff):
                         break
-                    self._spawn_asr_process()
+                    # Reap the dead process so it leaves no zombie, then take
+                    # over only if nothing else replaced it while we waited
+                    # out the backoff (a config change during the backoff
+                    # spawns its own generation -- respawning here too would
+                    # leave two workers fighting over the audio queue).
+                    process.join(timeout=_ASR_FORCE_STOP_SECONDS)
+                    with self._asr_lock:
+                        if self._asr_process is process and not self._stop_event.is_set():
+                            self._spawn_asr_process()
             self._stop_event.wait(1.0)
 
     def _on_config_changed(self, new_config: RootConfig) -> None:
@@ -307,10 +399,7 @@ class AppController:
                     # fresh, un-penalized try.
                     self._force_asr_cpu = False
                     self._consecutive_quick_crashes = 0
-                self._asr_stop_event.set()
-                if self._asr_process is not None:
-                    self._asr_process.join(timeout=5)
-                self._spawn_asr_process()
+                self._restart_asr_process()
             if new_config.audio != old_config.audio:
                 self._restart_audio_capture()
 
@@ -326,7 +415,6 @@ class AppController:
             self._stopped = True
 
         self._stop_event.set()
-        self._asr_stop_event.set()
         if self._ndi_stop_event is not None:
             self._ndi_stop_event.set()
         if self._audio_stop_event is not None:
@@ -335,8 +423,13 @@ class AppController:
             self._watcher.stop()
         if self._mic is not None:
             self._mic.stop()
-        if self._asr_process is not None:
-            self._asr_process.join(timeout=5)
+        with self._asr_lock:
+            asr_process, asr_stop_event = self._asr_process, self._asr_stop_event
+            self._asr_process, self._asr_stop_event = None, None
+        # Same escalation as a restart: a worker still loading a multi-GB model
+        # will not honour a cooperative stop in time, and a daemon process left
+        # behind here keeps the GPU and the audio queue busy after "shutdown".
+        self._shut_down_asr_process(asr_process, asr_stop_event)
         if self._ndi_thread is not None:
             self._ndi_thread.join(timeout=5)
         if self._audio_thread is not None:

@@ -1,25 +1,137 @@
-# Building a Vulkan-accelerated whisper.cpp for narrator
+# GPU acceleration for narrator (and when you'd rebuild whisper.cpp)
 
-By default, `pip install pywhispercpp` installs a prebuilt **CPU-only**
-wheel from PyPI. To get real GPU acceleration (NVIDIA or AMD, via Vulkan)
-you must build `pywhispercpp` from source with the Vulkan ggml backend
-enabled. This is a one-time step on each build machine/target platform
-before running `packaging/pyinstaller/build_linux.sh` or
-`build_windows.ps1` -- confirmed against the pywhispercpp project's own
-documented build flags (github.com/absadiki/pywhispercpp).
+## Start here: you probably do not need to build anything
 
-## Prerequisites (build machine only -- not required at runtime for the CPU fallback path)
+An earlier version of this document said the PyPI `pywhispercpp` wheel was
+**CPU-only** and that a from-source rebuild with `GGML_VULKAN=1` was required
+for GPU acceleration. That is **not true of current wheels**, and following
+those instructions unnecessarily was costing a slow, fragile source build on
+every deployment.
+
+Verified against `pywhispercpp` 1.5.1 on a Radeon RX 6700 XT (RADV,
+Mesa 25.2):
+
+- The wheel installs `libggml-vulkan.so` into site-packages alongside
+  `libggml-cpu.so`. Vulkan is compiled in.
+- `use_gpu=True` really does run inference on the discrete GPU. whisper.cpp
+  logs `ggml_vulkan: Found 2 Vulkan devices` and
+  `whisper_backend_init_gpu: using Vulkan0 backend`.
+- Measured decode latency on that GPU, large-v3: ~0.3s for a 2s window,
+  ~1.4s for a 20s window. Comfortably real-time for live captioning.
+
+So the normal deployment is just:
+
+```bash
+pip install -e .
+```
+
+### Model choice: do not use `large-v3-turbo` on pywhispercpp 1.5.1
+
+The wheel's bundled whisper.cpp predates the turbo tensor layout: loading
+`large-v3-turbo` (or `large-v3-turbo-q5_0` etc.) logs
+`ERROR not all tensors loaded from model file - expected 587, got 170` and
+then **segfaults the process** (measured on the RX 6700 XT / Mesa 25.2
+setup, and it would do the same on CPU). In narrator that is worse than it
+sounds: the ASR worker dies at spawn, the supervisor's quick-crash fallback
+kicks in after 3 attempts, and the app silently lands on the CPU path --
+which on a pre-AVX CPU means ~96 seconds per 2s decode window (measured on
+the same Pentium G4560 test box). Stick with `large-v3` until the wheel
+ships a newer whisper.cpp; it decodes a 20s window in ~1.0s on the RX 6700
+XT, which is comfortably real-time.
+
+## Runtime requirements on the target machine
+
+You need the Vulkan **loader and driver**, which come from the graphics
+driver packages -- not the SDK, and *not* the `vulkan-tools` diagnostic
+package:
+
+```bash
+# Ubuntu/Debian, AMD (Mesa RADV):
+sudo apt install libvulkan1 mesa-vulkan-drivers
+```
+
+That gives you `libvulkan.so.1` plus an ICD JSON in
+`/usr/share/vulkan/icd.d/` (e.g. `radeon_icd.json`), which is all
+whisper.cpp and narrator's own device probe need.
+
+`vulkaninfo` (from `vulkan-tools`) is a *diagnostic* tool and is **not**
+required. narrator deliberately does not depend on it: it enumerates GPUs by
+calling `libvulkan.so.1` through ctypes (see
+`narrator.asr.backend._vulkan_devices`). An older revision shelled out to
+`vulkaninfo`, which made narrator report "no Vulkan devices" on machines
+that had a perfectly working GPU but no diagnostic package installed.
+
+## CPU architecture: no special build needed
+
+The same wheels are built for **baseline x86-64**. Disassembling
+`libggml-cpu.so`, `libggml-base.so`, `libwhisper.so` and `libggml-vulkan.so`
+finds **zero** AVX/AVX2/FMA/VEX-encoded instructions, so they load and run on
+pre-AVX CPUs. Verified on an Intel Pentium G4560, which tops out at SSE4.2:
+both `use_gpu=True` and the `use_gpu=False` CPU fallback load and transcribe
+without an illegal-instruction crash.
+
+In other words, an old CPU is not a reason to rebuild whisper.cpp, and the
+CPU fallback path is safe to rely on everywhere.
+
+## Verifying which backend you actually got
+
+```bash
+python -c "
+from narrator.asr.backend import WhisperBackend
+from narrator.config.schema import AsrConfig
+b = WhisperBackend(AsrConfig(model='tiny', device='vulkan'))
+print(b.resolved_device_description)
+"
+```
+
+This prints the selected adapter, e.g.:
+
+```
+Vulkan (AMD Radeon RX 6700 XT (RADV NAVI22) [discrete])
+```
+
+If it prints `CPU`, check that `libvulkan1` and your driver's ICD are
+installed (see above) and that the user running narrator can open
+`/dev/dri/renderD*` (membership in the `render` group on most distros).
+
+### Choosing between multiple GPUs
+
+Machines with a discrete card *and* an integrated one expose both to Vulkan.
+whisper.cpp on its own always takes device 0, so on a box whose iGPU
+enumerates first it would silently run on the slow adapter. narrator defaults
+`asr.gpu_device: auto`, which prefers the first **discrete** GPU. Override it
+with an explicit index if you need a specific card:
+
+```yaml
+asr:
+  device: vulkan
+  gpu_device: 1
+```
+
+The indices are the ones narrator logs at startup
+(`Vulkan devices: 0=..., 1=...`), which match whisper.cpp's own ordering.
+
+---
+
+# Building pywhispercpp from source
+
+Only needed if a future wheel drops the Vulkan backend, or you want a
+different ggml backend (CUDA/HIP) than the wheel ships. Everything below is
+still accurate for that case.
+
+## Prerequisites (build machine only)
 
 - CMake >= 3.21 and a C/C++ compiler (build-essential on Ubuntu, MSVC Build
   Tools on Windows).
-- The **Vulkan SDK** (https://vulkan.lunarg.com/) installed, so the Vulkan
+- The **Vulkan SDK** (https://vulkan.lunarg.com/), so the Vulkan
   headers/loader are available to CMake at build time. whisper.cpp's Vulkan
-  backend also needs `find_package(SPIRV-Headers)` and `find_package(SPIRV-Tools)`
-  to succeed -- the official LunarG SDK tarball bundles both, but a
-  minimal apt-based setup needs them installed explicitly too (Ubuntu:
-  `spirv-headers` and `spirv-tools` packages), or CMake's configure step
-  fails with "Could not find a package configuration file provided by
-  SPIRV-Headers" even though the Vulkan loader itself was found fine.
+  backend also needs `find_package(SPIRV-Headers)` and
+  `find_package(SPIRV-Tools)` to succeed -- the official LunarG SDK tarball
+  bundles both, but a minimal apt-based setup needs them installed
+  explicitly too (Ubuntu: `spirv-headers` and `spirv-tools`), or CMake's
+  configure step fails with "Could not find a package configuration file
+  provided by SPIRV-Headers" even though the Vulkan loader itself was found
+  fine.
 - Python matching the venv narrator will run in.
 
 ## Ubuntu
@@ -72,39 +184,11 @@ After this, the built libraries resolve their sibling dependencies relative
 to their own directory and need no `LD_LIBRARY_PATH` at runtime -- confirmed
 by importing in a completely clean environment.
 
-## Verifying the build picked up Vulkan
-
-```bash
-python -c "
-from narrator.asr.backend import WhisperBackend
-from narrator.config.schema import AsrConfig
-b = WhisperBackend(AsrConfig(model='tiny', device='vulkan'))
-print(b.resolved_device_description)
-"
-```
-
-This should print `Vulkan (<your GPU name>)` rather than `CPU`. If it falls
-back to CPU, check that:
-- The Vulkan SDK was installed and discoverable by CMake during the pip build.
-- Your GPU has a working Vulkan driver (`vulkaninfo --summary` should list it).
-- The pip install log (`-v`) actually shows a Vulkan CMake configure step --
-  if it silently built without it, `GGML_VULKAN=1` wasn't picked up (check
-  the environment variable is set in the same shell as the pip install).
-
-## Why this instead of vendoring whisper.cpp directly
+## Why pywhispercpp instead of vendoring whisper.cpp directly
 
 The original plan considered vendoring whisper.cpp as a git submodule driven
 by a custom ctypes wrapper, for maximum control over build flags. In
-practice, pywhispercpp's own `GGML_VULKAN=1` source-build path gives the
-same Vulkan-enabled shared library with far less custom glue code to
-maintain, so `narrator.asr.backend.WhisperBackend` targets pywhispercpp
-directly rather than a hand-written ctypes binding. Revisit the vendored
-approach only if a future pywhispercpp release drops or breaks this build
-flag.
-
-## CPU-only builds
-
-If you don't need GPU acceleration on a given build machine, the plain
-`pip install pywhispercpp` (CPU-only wheel) is fine -- `asr.device: auto`
-will detect the lack of a Vulkan-enabled backend at runtime (GPU init will
-simply fail) and fall back to CPU automatically.
+practice the published wheel already ships the Vulkan backend, so
+`narrator.asr.backend.WhisperBackend` targets pywhispercpp directly rather
+than a hand-written ctypes binding. Revisit the vendored approach only if a
+future pywhispercpp release drops the Vulkan backend from its wheels.

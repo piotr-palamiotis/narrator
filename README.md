@@ -24,10 +24,13 @@ full design rationale.
   bundled Vulkan support) -- CPU fallback works with no extra packages.
 - **Windows**: microphone capture and Vulkan (via GPU vendor drivers) work
   out of the box; no extra system packages needed.
-- A GPU-accelerated build additionally requires rebuilding `pywhispercpp`
-  from source with `GGML_VULKAN=1` -- see
-  `packaging/whisper_cpp/README.md`. The plain `pip install` gives a
-  CPU-only build, which still works (just without GPU acceleration).
+- **No GPU build step is required.** The published `pywhispercpp` wheel
+  already ships the Vulkan ggml backend, so a plain `pip install -e .` gets
+  GPU acceleration (verified on a Radeon RX 6700 XT via RADV). You need the
+  Vulkan loader and driver ICD only -- `libvulkan1` plus
+  `mesa-vulkan-drivers` on AMD/Intel -- and *not* the `vulkan-tools`
+  diagnostic package. `packaging/whisper_cpp/README.md` covers source
+  builds, now only needed for a non-Vulkan ggml backend.
 
 ## Setup (development)
 
@@ -96,10 +99,14 @@ microphone, GPU, display, or NDI receiver. What that means concretely:
   `write_video`, no errors).
 - **Not runnable in that sandbox, needs verification on your target
   machine(s)**: live microphone capture (`sounddevice`/PortAudio wasn't
-  available there), real whisper.cpp inference (the sandbox CPU lacks
-  AVX2, which prebuilt whisper.cpp builds require -- your target "very good
-  machine" won't have this problem), the Tkinter GUI (no `tkinter`/display
-  in that sandbox), and true GPU (Vulkan) acceleration end-to-end.
+  available there) and the Tkinter GUI (no `tkinter`/display in that
+  sandbox).
+
+  Note: an earlier revision of this list claimed prebuilt whisper.cpp
+  requires AVX2. It does not -- the shipped libraries contain no AVX/AVX2/FMA
+  instructions at all and run fine on a pre-AVX Pentium G4560. Real
+  whisper.cpp inference and Vulkan GPU acceleration have since been verified
+  end-to-end on that machine against `test.mp3`.
 - The ASR backend's Python API usage (`pywhispercpp.model.Model`,
   `context_params={"use_gpu": ...}`, model auto-download) and the NDI
   bindings (`cyndilib.Sender`/`VideoSendFrame`, `FourCC.RGBA`) were both
