@@ -230,13 +230,17 @@ live).
   through a PipeWire virtual mic into a real `AppController`, records FINAL events, and
   reports per-clip WER, finalize latency, and cross-pass determinism. Baselines on this
   repo's hardware (RX 6700 XT): `small`+step 600 ≈ 7% WER / 0.8s, `medium`+step 350 ≈
-  7–10% WER / 0.5–0.8s; `large-v3` collapses under streaming (repetition loops,
-  multi-second decode steps; latest measurements 130% WER auto / 176% forced-pl,
-  5–6 step overruns per pass) despite being clean offline — beam search was tested
+  7–10% WER / 0.5–0.8s; `large-v3` used to collapse under streaming (repetition loops,
+  multi-second decode steps) despite being clean offline — beam search was tested
   as a loop mitigation and is unusable in pywhispercpp 1.5.1 (GPU-path 'patience'
-  error → silent CPU fallback → 104s decode steps). The default model remains
-  large-v3 at the operator's explicit choice; medium/small are measurably better
-  for live streaming on this hardware.
+  error → silent CPU fallback → 104s decode steps). **Fixed at the text layer**
+  (streaming_decoder.py): large-v3's dominant failure was whole-sentence repetition
+  loops (same 6–9 word sentence 5–6× inside one hypothesis), and `_collapse_repetitions`
+  now runs to phrase length 16, collapsing those loops — harness WER 1.28 → 0.14 mean
+  (mixed 11.7 → 0.9, numbers → 0.00). whisper.cpp has no no_repeat_ngram_size (that's
+  faster-whisper) and `entropy_thold`/`suppress_regex` don't break in-decode loops, so
+  this collapse is the enforcement point. The default model remains large-v3 at the
+  operator's explicit choice.
 - `narrator/asr/autoconfigure.py` (+ `bench.py`, `quality_probe.py`, `metrics.py`) —
   `narrator --autoconfigure` benchmarks candidates in throwaway subprocesses (speed per
   window size + WER of the *streaming* decoder on the fixtures) and writes the winner's

@@ -63,22 +63,28 @@ def _common_prefix_length(a: list[str], b: list[str]) -> int:
     return i
 
 
-def _collapse_repetitions(words: list[str], max_phrase_len: int = 4) -> list[str]:
+def _collapse_repetitions(words: list[str], max_phrase_len: int = 16) -> list[str]:
     """Collapse immediately repeated phrases: "niż niż" -> "niż",
     "modele modele rozpoznawania" -> "modele rozpoznawania",
-    "z do nie z do nie" -> "z do nie".
+    "z do nie z do nie" -> "z do nie", and whole-sentence loops.
 
     Whisper's streaming decode (a growing window re-decoded every step) is
     prone to repeating an n-gram across a window boundary; left in, the
     duplication reaches the committed caption. Measured on the stress
-    harness: it accounted for roughly a third of the residual streaming WER
-    on clips whose offline transcription was clean.
+    harness: word/short-phrase repeats accounted for roughly a third of the
+    residual streaming WER on clips whose offline transcription was clean,
+    and large-v3's greedy decoding additionally produces whole-sentence
+    repetition loops (the same 6-9 word sentence emitted 5-6 times inside a
+    single hypothesis) -- whisper.cpp has no no_repeat_ngram_size knob and
+    beam search is unusable in pywhispercpp 1.5.1, so the text layer is the
+    only place this can be broken.
 
-    Runs to a fixpoint for phrase lengths 1..max_phrase_len. Tradeoff, made
+    Runs to a fixpoint for phrase lengths 1..max_phrase_len. Tradeoffs, made
     deliberately: a speaker genuinely repeating a word for emphasis ("tak,
-    tak") is merged into one word. For a live lower-third that is the right
-    side of the trade -- a stuck repetition loop is far more visible than a
-    lost emphasis.
+    tak") or a short phrase is merged into one instance, and a genuinely
+    repeated long sentence (chorus lines, read-backs) likewise shows once.
+    For a live lower-third that is the right side of the trade -- a stuck
+    repetition loop is far more visible than a lost emphasis.
     """
     collapsed = words
     changed = True

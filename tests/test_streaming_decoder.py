@@ -237,6 +237,22 @@ def test_collapse_runs_to_fixpoint():
     assert _collapse_repetitions(["z", "do", "nie"] * 3) == ["z", "do", "nie"]
 
 
+def test_collapse_whole_sentence_loop():
+    """large-v3's greedy streaming decode can emit the same 6-9 word sentence
+    5-6 times inside one hypothesis (measured on the stress harness, mixed/
+    numbers clips); whisper.cpp has no no_repeat_ngram_size and beam search is
+    unusable in pywhispercpp 1.5.1, so sentence-length loops must collapse at
+    the text layer."""
+    sentence = "System działa na procesorze awaryjnie".split()
+    assert _collapse_repetitions(sentence * 6) == sentence
+    # Two different sentences interleaved as a loop also collapses.
+    s1 = "Gdy okno dekodera rośnie".split()
+    s2 = "System działa na procesorze".split()
+    assert _collapse_repetitions(s1 + s2 + s1 + s2) == s1 + s2
+    # A sentence repeated with a differing tail keeps the tail.
+    assert _collapse_repetitions(s1 + ["koniec"]) == s1 + ["koniec"]
+
+
 def test_decoder_hypothesis_collapsed_before_agreement():
     """A doubled word must not block the agreement prefix or reach a FINAL."""
     config = AsrConfig(step_ms=100, agreement_passes=2, end_silence_ms=300, clear_after_silence_seconds=5)
