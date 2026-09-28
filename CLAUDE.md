@@ -223,6 +223,7 @@ live).
 - `src/narrator/` — package source (see architecture above for the pipeline through `asr/` → `audio/` → `captions/` → `config/` → `gui/` → `ndi/` → `render/`).
 - `tests/` — pytest unit tests (config validation, layout/wrap, streaming decoder, app controller).
 - `scripts/render_preview.py` — headless rendering sanity check, no audio/GPU/NDI required.
+- `scripts/live_language_demo.py` — plays a pl→en→pl schedule through the virtual mic into the real app and prints the observed caption timeline vs expectations (dynamic language switching end-to-end).
 - `scripts/gen_test_clips.py` — generates byte-deterministic Polish TTS fixtures (piper,
   zero noise scales) with known transcripts into `scripts/test_clips/`.
 - `scripts/stress_full_pipeline.py` — full-pipeline ASR stress harness: plays the fixtures
