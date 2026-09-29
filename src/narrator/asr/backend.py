@@ -22,8 +22,9 @@ GPU support, verified empirically on this project's target hardware
     `libggml-cpu.so`, `libggml-base.so`, `libwhisper.so` and
     `libggml-vulkan.so` finds zero AVX/AVX2/FMA/VEX-encoded instructions.
     They therefore load and run on pre-AVX CPUs (verified on a Pentium
-    G4560, which has only up to SSE4.2), so the CPU fallback path is safe
-    everywhere and no CPU-specific build is needed for deployment.
+    G4560, which has only up to SSE4.2), so an explicitly configured CPU
+    device (asr.device: cpu) is safe everywhere and no CPU-specific build is
+    needed for deployment.
 
 Device detection is done by calling into `libvulkan.so.1` directly with
 ctypes rather than shelling out to the `vulkaninfo` CLI. `vulkaninfo` ships
@@ -250,6 +251,18 @@ def audio_ctx_for_seconds(window_seconds: float) -> int:
     return max(_MIN_AUDIO_CTX, min(_FULL_AUDIO_CTX, exact + _AUDIO_CTX_MARGIN))
 
 
+class DevicePolicyError(RuntimeError):
+    """The configured ASR device could not be used or stopped working.
+
+    Raised instead of silently falling back to CPU. The configured device is
+    final by policy: a transient failure (the previous worker generation not
+    yet having released the GPU, a driver hiccup) must surface as a worker
+    crash the supervisor can see -- not as an invisible downgrade that leaves
+    the operator's "GPU" config running 10x slower on CPU with a GUI
+    indicator claiming all is well.
+    """
+
+
 class WhisperBackend:
     def __init__(self, config: AsrConfig) -> None:
         self._config = config
@@ -280,8 +293,15 @@ class WhisperBackend:
                 self._resolved_device_description = f"Vulkan ({label})"
                 logger.info("ASR backend: %s", self._resolved_device_description)
                 return
-            except Exception as exc:  # native init can fail in many ways; any failure -> CPU fallback
-                logger.warning("GPU backend init failed (%s); falling back to CPU", exc)
+            except Exception as exc:
+                # The configured device is final. Silently falling back to CPU
+                # here is what turned an operator's GPU config into a CPU
+                # worker with zero feedback (and left a GUI indicator saying
+                # everything was fine). Surface it; the supervisor decides
+                # what a failed device means (config policy, or app exit).
+                raise DevicePolicyError(
+                    f"GPU backend init failed on {self._config.device.value}: {exc}"
+                ) from exc
 
         self._model = self._load_model(use_gpu=False)
         self._resolved_device_description = "CPU"
@@ -311,6 +331,23 @@ class WhisperBackend:
     @property
     def resolved_device_description(self) -> str:
         return self._resolved_device_description
+
+    def close(self) -> None:
+        """Release the whisper model and its native memory deterministically.
+
+        pywhispercpp's Model frees the C context in `__del__`, which only runs
+        when CPython's GC collects the object -- and collection timing inside
+        reference cycles is unspecified. On a VRAM-constrained GPU the
+        successor generation can then race this generation's cleanup: its
+        `Model(use_gpu=True)` init fails for lack of memory and, before this
+        change, that failure silently became a CPU downgrade. Dropping the
+        reference here (and breaking any reference cycle by clearing our own
+        handle) makes the teardown deterministic: by the time the worker
+        process exits, the model is either freed or in the hands of the GC of
+        a process that is about to die anyway -- never still resident while
+        the next generation initializes.
+        """
+        self._model = None
 
     def _detect_language(self, audio: np.ndarray) -> str:
         """Language code for this decode pass (asr.language == "auto").
@@ -392,11 +429,12 @@ class WhisperBackend:
         try:
             segments = self._model.transcribe(audio, **kwargs)
         except Exception as exc:
-            if self._resolved_device_description.startswith("Vulkan"):
-                logger.warning("GPU inference failed (%s); reinitializing on CPU", exc)
-                self._model = self._load_model(use_gpu=False)
-                self._resolved_device_description = "CPU (fallback after GPU failure)"
-                segments = self._model.transcribe(audio, **kwargs)
-            else:
-                raise
+            # Same policy as init: the configured device is final. The old
+            # behavior -- silently reinitializing on CPU mid-stream -- made a
+            # transient GPU hiccup a permanent, invisible downgrade. The
+            # exception propagates; the supervisor restarts the worker and, if
+            # the device is genuinely gone, exits the app rather than whisper.
+            raise DevicePolicyError(
+                f"GPU inference failed on {self._config.device.value}: {exc}"
+            ) from exc
         return [(seg.t0 / 100.0, seg.t1 / 100.0, seg.text.strip()) for seg in segments]

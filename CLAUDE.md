@@ -92,11 +92,20 @@ understands the full concurrency picture:
   `multiprocessing.Queue`.
 - **ASR worker**: a *separate OS process* (`narrator.asr.worker.run_asr_worker`),
   not a thread — isolates whisper.cpp native-code crashes / stalled GPU calls
-  from rendering, NDI output, and the GUI. `AppController._supervise_asr_loop`
-  watches it and restarts on death with backoff; after
-  `_QUICK_CRASHES_BEFORE_CPU_FALLBACK` (3) crashes within
-  `_QUICK_CRASH_WINDOW_SECONDS` (15s) of spawn, it force-falls-back to CPU
-  for subsequent respawns until the device is deliberately changed.
+  from rendering, NDI output, and the GUI. Launched with the `spawn` start
+  method (forced in `AppController.__init__`): forking from the multi-threaded
+  app SIGSEGVs the child inside ggml's Vulkan init on any post-startup ASR
+  restart (measured: exit -11 within ~2s, every time; the first spawn from a
+  just-started app happened to work, which masked this for a long time).
+  `AppController._supervise_asr_loop` watches it and restarts on death with
+  backoff; after `_QUICK_CRASHES_BEFORE_EXIT` (3) crashes within
+  `_QUICK_CRASH_WINDOW_SECONDS` (15s) of spawn, it stops the app with an
+  explanation instead of falling back to CPU — **the configured device is
+  final by policy**: no code path downgrades GPU→CPU silently (the old
+  init-fallback, the transcribe-time fallback, and the crash-loop CPU force
+  all existed and are gone). Restart drains stale audio frames so the next
+  generation doesn't caption pre-restart speech, and the worker releases the
+  whisper model deterministically in a `finally` block.
 - **Event-drain thread**: applies `CaptionEvent`s (PARTIAL/FINAL/CLEAR/STATUS)
   from the worker's event queue to the renderer.
 - **Render + NDI send**: a fixed-fps thread

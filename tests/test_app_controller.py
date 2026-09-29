@@ -146,8 +146,8 @@ class FakeProcess:
 
 
 def make_lifecycle_controller(monkeypatch, processes):
-    """Controller with just enough state for the ASR lifecycle, and mp.Process
-    replaced by a queue of FakeProcesses."""
+    """Controller with just enough state for the ASR lifecycle (and stop()),
+    and mp.Process replaced by a queue of FakeProcesses."""
     controller = AppController.__new__(AppController)
     controller._config = RootConfig()
     controller._asr_lock = threading.Lock()
@@ -156,9 +156,19 @@ def make_lifecycle_controller(monkeypatch, processes):
     controller._asr_stop_event = None
     controller._asr_spawn_time = 0.0
     controller._consecutive_quick_crashes = 0
-    controller._force_asr_cpu = False
     controller._audio_queue = None
     controller._event_queue = None
+    # stop() support (the crash-loop policy path calls it)
+    controller._stopped = False
+    controller._stop_lock = threading.Lock()
+    controller._ndi_stop_event = None
+    controller._audio_stop_event = None
+    controller._watcher = None
+    controller._mic = None
+    controller._ndi_thread = None
+    controller._audio_thread = None
+    controller._sender = None
+    controller._threads = []
 
     spawned = []
     made = iter(processes)
@@ -202,7 +212,7 @@ def test_restart_does_not_count_as_a_crash(monkeypatch):
         controller._restart_asr_process()
 
     assert controller._consecutive_quick_crashes == 0
-    assert controller._force_asr_cpu is False, "config edits must not force CPU"
+    assert not controller._stopped, "config edits must not terminate the app"
 
 
 def test_restart_escalates_to_terminate_when_worker_ignores_stop(monkeypatch):
@@ -234,3 +244,45 @@ def test_supervisor_ignores_a_worker_detached_for_restart(monkeypatch):
     supervisor.join(timeout=5)
 
     assert len(spawned) == 1, "supervisor must not spawn while a restart is in flight"
+
+
+def test_crash_loop_terminates_app_instead_of_forcing_cpu(monkeypatch):
+    """The configured device is final by policy. The old behavior -- forcing
+    CPU after 3 quick crashes -- silently downgraded a GPU config the operator
+    explicitly chose. Now the supervisor stops the app with an explanation."""
+    dead = FakeProcess()
+    dead.alive = False
+    dead.exitcode = -6
+    controller, spawned = make_lifecycle_controller(monkeypatch, [FakeProcess(), FakeProcess()])
+    controller._consecutive_quick_crashes = 2  # one more quick crash trips it
+    with controller._asr_lock:
+        controller._spawn_asr_process()
+    controller._asr_process.alive = False  # the generation just died quickly
+    controller._asr_process.exitcode = -6
+
+    supervisor = threading.Thread(target=controller._supervise_asr_loop, daemon=True)
+    supervisor.start()
+    supervisor.join(timeout=10)
+
+    assert not supervisor.is_alive(), "supervisor must exit after tripping the breaker"
+    assert controller._stopped, "app must be stopped, not downgraded to CPU"
+    assert controller._stop_event.is_set()
+    # No force-CPU state exists anymore; a fresh spawn with the same device
+    # config is what stop() teardown implies.
+    assert controller._config.asr.device != AsrDevice.CPU
+
+
+def test_drain_audio_queue_drops_stale_frames():
+    """Frames queued for the outgoing worker must not reach the successor's
+    decoder: they would produce a caption for pre-restart speech."""
+    import queue as queue_mod
+
+    controller = AppController.__new__(AppController)
+    controller._audio_queue = queue_mod.Queue()
+    for i in range(3):
+        controller._audio_queue.put(i)
+
+    drained = controller._drain_audio_queue()
+
+    assert drained == 3
+    assert controller._audio_queue.empty()

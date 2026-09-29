@@ -21,7 +21,9 @@ full design rationale.
 - **Ubuntu**: `libportaudio2` for microphone capture
   (`sudo apt install libportaudio2`). For GPU acceleration, a working
   Vulkan driver (`mesa-vulkan-drivers` for AMD/Intel, or the NVIDIA driver's
-  bundled Vulkan support) -- CPU fallback works with no extra packages.
+  bundled Vulkan support) -- CPU (`asr.device: cpu`) works with no extra
+  packages. The configured device is used as-is: if the GPU cannot be
+  initialized, the app says so and exits rather than silently switching to CPU.
 - **Windows**: microphone capture and Vulkan (via GPU vendor drivers) work
   out of the box; no extra system packages needed.
 - **No GPU build step is required.** The published `pywhispercpp` wheel

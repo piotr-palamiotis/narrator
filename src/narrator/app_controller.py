@@ -43,14 +43,20 @@ _ASR_FORCE_STOP_SECONDS = 5.0
 # A worker that dies within this many seconds of starting is considered a
 # "quick crash" (as opposed to dying after having run fine for a while, e.g.
 # because the operator edited the ASR config). After this many quick crashes
-# in a row, the supervisor stops trusting the configured device and forces
-# CPU for subsequent respawns -- see _supervise_asr_loop.
+# in a row, the supervisor stops the app: the configured device is final by
+# policy, and silently falling back to CPU would hide a broken GPU setup
+# behind a 10x slowdown -- see _supervise_asr_loop.
 _QUICK_CRASH_WINDOW_SECONDS = 15.0
-_QUICK_CRASHES_BEFORE_CPU_FALLBACK = 3
+_QUICK_CRASHES_BEFORE_EXIT = 3
 
 
 class AppController:
     def __init__(self, config_path: Path) -> None:
+        # Must precede every mp.Queue/mp.Event creation below: those bind to
+        # the current start-method context, and mixing contexts (a fork-
+        # created SemLock shared with a spawn-launched Process) raises at
+        # spawn time.
+        self._set_mp_start_method()
         self._config_path = config_path
         self._config: RootConfig | None = None
         self._config_lock = threading.Lock()
@@ -90,7 +96,6 @@ class AppController:
 
         self._asr_spawn_time: float = 0.0
         self._consecutive_quick_crashes: int = 0
-        self._force_asr_cpu: bool = False
 
         # "auto": captions come from the ASR worker, as before. "manual": the
         # operator types captions in the GUI instead -- ASR events other than
@@ -175,11 +180,28 @@ class AppController:
             old_mic.stop()
         self._start_audio_capture()
 
+    def _drain_audio_queue(self) -> int:
+        """Empty the shared audio queue; returns the number of frames dropped.
+
+        Called between ASR worker generations. Frames queued for the outgoing
+        worker are stale by the time the successor starts (its decoder window
+        is empty); letting them through would make the new generation decode
+        a fragment of pre-restart audio and emit a caption for speech the
+        operator heard long ago.
+        """
+        if self._audio_queue is None:  # lifecycle tests / never started
+            return 0
+        drained = 0
+        while True:
+            try:
+                self._audio_queue.get_nowait()
+            except queue.Empty:
+                return drained
+            drained += 1
+
     def _spawn_asr_process(self) -> None:
         """Start a new ASR worker generation. Caller must hold `_asr_lock`."""
         asr_config = self._config.asr
-        if self._force_asr_cpu and asr_config.device != AsrDevice.CPU:
-            asr_config = asr_config.model_copy(update={"device": AsrDevice.CPU})
         stop_event = mp.Event()
         process = mp.Process(
             target=run_asr_worker,
@@ -196,6 +218,28 @@ class AppController:
         self._asr_process = process
         self._asr_stop_event = stop_event
         self._asr_spawn_time = time.monotonic()
+
+    @staticmethod
+    def _set_mp_start_method() -> None:
+        """Force the 'spawn' start method for the ASR worker process.
+
+        The default on Linux is 'fork': the worker inherits the parent's
+        memory, including every loaded library and its locks. Forking from a
+        process that already runs Vulkan/PortAudio/watchdog threads is a
+        known recipe for native-level breakage in the child -- measured here:
+        a forked ASR worker SIGSEGVs inside ggml's Vulkan init during any
+        post-startup ASR restart (exit -11 within ~2s, three times in a row),
+        which the old crash-loop policy then converted into a silent,
+        permanent CPU downgrade. 'spawn' starts a fresh interpreter that
+        imports the worker module cleanly; model load is no slower in any
+        measurable way (the 3GB model load dominates either way), and the
+        first spawn (from a process that has only just started) happened to
+        work with fork -- spawn makes every generation equally clean.
+        """
+        try:
+            mp.set_start_method("spawn", force=True)
+        except RuntimeError:
+            pass  # already set by a previous start() in this interpreter
 
     @staticmethod
     def _shut_down_asr_process(
@@ -248,6 +292,12 @@ class AppController:
             self._consecutive_quick_crashes = 0
 
         self._shut_down_asr_process(old_process, old_stop_event)
+
+        # The outgoing worker can no longer consume these, and the incoming
+        # one must not start mid-way through old speech.
+        drained = self._drain_audio_queue()
+        if drained:
+            logger.info("discarded %d stale audio frame(s) from before the ASR restart", drained)
 
         with self._asr_lock:
             if self._stop_event.is_set():
@@ -345,22 +395,28 @@ class AppController:
                         self._consecutive_quick_crashes,
                         "" if self._consecutive_quick_crashes == 1 else "es",
                     )
-
+                    # Crash-loop policy: terminate the app rather than fall
+                    # back to CPU. The old behavior forced CPU after 3 quick
+                    # crashes -- which silently downgraded a GPU config the
+                    # operator explicitly chose, exactly what DevicePolicyError
+                    # elsewhere exists to prevent. The configured device is
+                    # final: if the worker cannot start on it repeatedly, the
+                    # app must stop and say why, not run at a fraction of the
+                    # performance the operator believes they have.
                     if (
-                        not self._force_asr_cpu
-                        and self._consecutive_quick_crashes >= _QUICK_CRASHES_BEFORE_CPU_FALLBACK
+                        self._consecutive_quick_crashes >= _QUICK_CRASHES_BEFORE_EXIT
                         and self._config.asr.device != AsrDevice.CPU
                     ):
-                        self._force_asr_cpu = True
-                        self._consecutive_quick_crashes = 0
                         logger.error(
                             "ASR worker crashed %d times in a row shortly after starting "
-                            "(configured device=%s); forcing CPU for subsequent restarts. "
-                            "Change asr.device to 'cpu' to make this permanent, or restart "
-                            "the app to retry the configured device.",
-                            _QUICK_CRASHES_BEFORE_CPU_FALLBACK,
+                            "(configured device=%s); stopping the app. The configured "
+                            "device is final by policy -- fix the device/driver or set "
+                            "asr.device to 'cpu' explicitly.",
+                            _QUICK_CRASHES_BEFORE_EXIT,
                             self._config.asr.device.value,
                         )
+                        self.stop()
+                        break
 
                     backoff = min(
                         _ASR_RESTART_BACKOFF_SECONDS * (2 ** max(self._consecutive_quick_crashes - 1, 0)),
@@ -394,10 +450,10 @@ class AppController:
             if new_config.asr != old_config.asr:
                 logger.info("asr config changed; restarting ASR worker")
                 if new_config.asr.device != old_config.asr.device:
-                    # A deliberate device change means the crash-loop breaker's
-                    # state (if any) is stale -- give the newly-chosen device a
-                    # fresh, un-penalized try.
-                    self._force_asr_cpu = False
+                    # A deliberate device change is a fresh attempt: clear the
+                    # crash-loop counter so the newly-chosen device gets an
+                    # un-penalized try (three crashes on the OLD device must
+                    # not immediately terminate the app on the new one).
                     self._consecutive_quick_crashes = 0
                 self._restart_asr_process()
             if new_config.audio != old_config.audio:
@@ -436,5 +492,10 @@ class AppController:
             self._audio_thread.join(timeout=5)
         if self._sender is not None:
             self._sender.close()
+        current = threading.current_thread()
         for thread in self._threads:
-            thread.join(timeout=5)
+            # The supervisor can be the caller (crash-loop policy): joining
+            # itself raises "cannot join current thread" and would abort
+            # teardown midway, leaving the worker/N mic/sender uncleaned.
+            if thread is not current and thread.is_alive():
+                thread.join(timeout=5)

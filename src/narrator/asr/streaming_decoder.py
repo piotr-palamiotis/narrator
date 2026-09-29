@@ -30,7 +30,7 @@ from collections.abc import Callable
 
 import numpy as np
 
-from narrator.asr.backend import WhisperBackend, _LANGUAGE_PROB_THRESHOLD
+from narrator.asr.backend import DevicePolicyError, WhisperBackend, _LANGUAGE_PROB_THRESHOLD
 from narrator.asr.events import CaptionEvent, CaptionEventType
 from narrator.asr.vad import SileroVad
 from narrator.audio.ring_buffer import AudioWindow
@@ -333,6 +333,12 @@ class StreamingDecoder:
         started = time.monotonic()
         try:
             segments = self._backend.transcribe(self._window.samples, language=self._locked_language)
+        except DevicePolicyError:
+            # The configured device failed mid-stream. Re-raising ends the
+            # worker process so the supervisor can apply device policy;
+            # swallowing it (as any other decode failure) would leave a
+            # worker that can never decode again spinning on every step.
+            raise
         except Exception:
             logger.exception("ASR decode step failed; skipping this step")
             return
