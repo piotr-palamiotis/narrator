@@ -88,3 +88,49 @@ def test_asr_gpu_device_rejects_nonsense():
 
     with pytest.raises(ValidationError):
         AsrConfig(gpu_device="second one")
+
+
+# --- language whitelist -----------------------------------------------------
+
+
+def test_language_whitelist_defaults_empty():
+    from narrator.config.schema import AsrConfig
+
+    assert AsrConfig().language_whitelist == []
+
+
+def test_language_whitelist_accepts_known_codes():
+    from narrator.config.schema import AsrConfig
+
+    config = AsrConfig(language_whitelist=["pl", "en"])
+    assert config.language_whitelist == ["pl", "en"]
+
+
+def test_language_whitelist_rejects_unknown_code():
+    from narrator.config.schema import AsrConfig
+
+    with pytest.raises(ValidationError, match="not a language whisper supports"):
+        AsrConfig(language_whitelist=["pl", "xx"])
+
+
+def test_language_whitelist_rejects_auto():
+    from narrator.config.schema import AsrConfig
+
+    with pytest.raises(ValidationError, match="ISO codes"):
+        AsrConfig(language_whitelist=["pl", "auto"])
+
+
+def test_forced_language_is_implicit_whitelist_member():
+    """language=pl with a whitelist that forgets pl must not strand the
+    default language outside the allowed set -- the validator prepends it."""
+    from narrator.config.schema import AsrConfig
+
+    config = AsrConfig(language="pl", language_whitelist=["en"])
+    assert config.language_whitelist == ["pl", "en"]
+
+
+def test_auto_language_is_not_added_to_whitelist():
+    from narrator.config.schema import AsrConfig
+
+    config = AsrConfig(language="auto", language_whitelist=["en"])
+    assert config.language_whitelist == ["en"]

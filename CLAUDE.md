@@ -124,22 +124,31 @@ atomic in-memory swap (`AppController._on_config_changed`). Invalid edits are
 logged and ignored; the last-good config stays live. This keeps headless and
 GUI-driven operation behaviorally identical.
 
-**Language handling** (`asr.language` + `asr.language_switch_threshold`):
-three modes. A forced code with `language_switch_threshold: 0` decodes
-everything in that language forever. A forced code with a threshold > 0
-(dynamic, the default: `pl` + 2) decodes in the configured language until
-detection reports a DIFFERENT language confidently at that many consecutive
-utterance-finalizes, then switches active language — and switches back the
-same way. Until the switch, foreign utterances are captioned in the default
-language (wrong but immediate — never delayed or dropped); the switch applies
-from the next utterance. Dynamic-mode detection runs **after** the finalize
-decode (see streaming_decoder.py): `auto_detect_language` pads its mel to a
-fixed 30s window, so its cost is ~445ms on large-v3 **regardless of slice
-length** (tiny 28ms / small 82ms / medium 245ms; mel itself ~5ms), and its
-result only affects the *next* utterance — running it before the decode would
-be pure added latency on every finalize. A smaller detection model is NOT a
+**Language handling** (`asr.language` + `asr.language_switch_threshold` +
+`asr.language_whitelist`): three modes. A forced code with
+`language_switch_threshold: 0` decodes everything in that language forever.
+A forced code with a threshold > 0 (dynamic, the default: `pl` + 2) decodes
+in the configured language until detection reports a DIFFERENT language
+confidently at that many consecutive utterance-finalizes, then switches
+active language — and switches back the same way. Until the switch, foreign
+utterances are captioned in the default language (wrong but immediate —
+never delayed or dropped); the switch applies from the next utterance.
+Dynamic-mode detection runs **after** the finalize decode (see
+streaming_decoder.py): `auto_detect_language` pads its mel to a fixed 30s
+window, so its cost is ~445ms on large-v3 **regardless of slice length**
+(tiny 28ms / small 82ms / medium 245ms; mel itself ~5ms), and its result
+only affects the *next* utterance — running it before the decode would be
+pure added latency on every finalize. A smaller detection model is NOT a
 viable substitute: small/medium confuse Polish with Russian/Ukrainian on
-mid-clip 2s slices (measured 7/12 and 8/12 vs large-v3's 12/12). `"auto"` instead follows the speaker verbatim per
+mid-clip 2s slices (measured 7/12 and 8/12 vs large-v3's 12/12).
+`language_whitelist` (optional, edited via the GUI's dropdown+Add/list+
+Remove editor on the Audio/ASR tab) restricts every language decision to a
+known set by re-argmaxing the detector's full probability table
+(backend.py `_restrict_to_whitelist`) — exact, not a guess; a pl+en venue
+can never produce German. Empty = unrestricted. The validator keeps the
+forced `language` an implicit member of a non-empty whitelist and rejects
+unknown codes; an empty list is never auto-populated (that would silently
+disable switching). `"auto"` instead follows the speaker verbatim per
 utterance: pywhispercpp 1.5.1's `detect_language=True` transcribe param is
 broken (always returns zero segments — verified), so `WhisperBackend` uses
 the dedicated `auto_detect_language()` API; the StreamingDecoder locks one

@@ -16,6 +16,11 @@ asr:
   # Note: whisper transcribes; it has no X->Polish translation.
   language: "pl"
   language_switch_threshold: 2
+  # Optional: restrict the languages the decoder may use (ISO codes). Empty =
+  # whisper decides freely. With a whitelist, detection re-argmaxes over the
+  # listed set, so a pl+en venue can never produce German. The configured
+  # `language` (if not "auto") is always an implicit member.
+  language_whitelist: []
   device: auto
   # Which Vulkan GPU to use when several are present. "auto" prefers the
   # first discrete card, so a machine with an iGPU alongside a discrete GPU

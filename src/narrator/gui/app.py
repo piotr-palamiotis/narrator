@@ -20,6 +20,7 @@ import sv_ttk
 from pydantic import ValidationError
 
 from narrator.audio.devices import list_input_devices
+from narrator.asr.whisper_languages import language_display_name, whisper_language_codes
 from narrator.config.loader import load_config, save_config
 from narrator.config.schema import (
     AsrConfig,
@@ -78,6 +79,22 @@ _AUTOSAVE_ONLY_FIELD_NAMES = [
 ]
 
 _AUTOSAVE_DEBOUNCE_MS = 800
+
+
+def final_whitelist_display(codes: list[str]) -> str:
+    """Comma-joined codes for the listbox's backing var; de-duplicated, order
+    preserved (the first entry carries the most weight in ties and reads as
+    the 'primary' language)."""
+    seen: list[str] = []
+    for code in codes:
+        if code not in seen:
+            seen.append(code)
+    return ", ".join(seen)
+
+
+def final_whitelist_parse(text: str) -> list[str]:
+    """Inverse of final_whitelist_display: split, strip, drop empties."""
+    return [code for code in (part.strip() for part in text.split(",")) if code]
 
 # Font files available in the "Font file" dropdown, scanned from assets/fonts/.
 _FONTS_DIR = Path(__file__).resolve().parents[3] / "assets" / "fonts"
@@ -377,8 +394,9 @@ class NarratorGUI:
         self.asr_language = text_field(auto, 3, "Language (ISO code or 'auto')", asr.language, width=10)
         self.asr_device = dropdown_field(auto, 4, "ASR device", asr.device.value, ["auto", "vulkan", "cpu"])
         self.asr_show_partial = checkbox_field(auto, 5, "Show partial (unconfirmed) captions", asr.show_partial_captions)
+        self._build_language_whitelist_editor(auto, start_row=6)
         ttk.Label(auto, text="Audio/ASR model+device changes restart the ASR worker automatically.", foreground="gray").grid(
-            row=6, column=0, columnspan=4, sticky="w", padx=4, pady=(8, 2)
+            row=12, column=0, columnspan=4, sticky="w", padx=4, pady=(8, 2)
         )
 
         self._manual_settings_frame = ttk.Frame(tab)
@@ -397,6 +415,79 @@ class NarratorGUI:
         self.manual_entry.pack(fill="x", padx=4)
         self.manual_entry.bind("<Return>", self._on_manual_submit)
         self._manual_settings_frame.grid_remove()
+
+    def _build_language_whitelist_editor(self, parent: ttk.Frame, start_row: int) -> None:
+        """Language whitelist editor: restricts which languages the decoder
+        may use (empty = whisper decides freely). A dropdown of every
+        language this whisper build supports plus an Add button fills the
+        list; Remove takes the selected entry out. Changes autosave like any
+        other field (the var trace fires on every mutation).
+        """
+        row = start_row
+        ttk.Separator(parent).grid(row=row, column=0, columnspan=4, sticky="ew", pady=6)
+        row += 1
+        ttk.Label(parent, text="Language whitelist (empty = unrestricted):").grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=4, pady=2
+        )
+        row += 1
+
+        codes = list(whisper_language_codes())
+        # The default caption language should be one click away at the top.
+        default_code = self.config.asr.language
+        if default_code in codes:
+            codes.remove(default_code)
+            codes.insert(0, default_code)
+
+        picker_frame = ttk.Frame(parent)
+        picker_frame.grid(row=row, column=0, columnspan=4, sticky="w", padx=4, pady=2)
+        self._whitelist_var = tk.StringVar(value=final_whitelist_display(self.config.asr.language_whitelist))
+
+        add_var = tk.StringVar()
+        add_dropdown = ttk.Combobox(picker_frame, textvariable=add_var, values=[
+            language_display_name(code) for code in codes
+        ], state="readonly", width=24)
+        add_dropdown.pack(side="left")
+        self._whitelist_code_by_label = {
+            language_display_name(code): code for code in codes
+        }
+
+        def _add() -> None:
+            code = self._whitelist_code_by_label.get(add_var.get())
+            if code is None:
+                return
+            current = final_whitelist_parse(self._whitelist_var.get())
+            if code in current:
+                return
+            current.append(code)
+            self._whitelist_var.set(final_whitelist_display(current))
+
+        ttk.Button(picker_frame, text="Add", command=_add).pack(side="left", padx=(6, 0))
+
+        row += 1
+        list_frame = ttk.Frame(parent)
+        list_frame.grid(row=row, column=0, columnspan=4, sticky="w", padx=4, pady=(2, 2))
+        self._whitelist_listbox = tk.Listbox(list_frame, height=3, width=34, selectmode="browse")
+        self._whitelist_listbox.pack(side="left")
+
+        def _remove() -> None:
+            selection = self._whitelist_listbox.curselection()
+            if not selection:
+                return
+            current = final_whitelist_parse(self._whitelist_var.get())
+            del current[selection[0]]
+            self._whitelist_var.set(final_whitelist_display(current))
+
+        ttk.Button(list_frame, text="Remove", command=_remove).pack(side="left", padx=(6, 0))
+
+        # Sync listbox <-> var, and let the autosave machinery see changes.
+        def _sync_listbox(*_args) -> None:
+            self._whitelist_listbox.delete(0, "end")
+            for code in final_whitelist_parse(self._whitelist_var.get()):
+                self._whitelist_listbox.insert("end", language_display_name(code))
+
+        self._whitelist_var.trace_add("write", _sync_listbox)
+        self._whitelist_var.trace_add("write", self._on_field_changed)
+        _sync_listbox()
 
     def _build_ndi_tab(self, notebook: ttk.Notebook) -> None:
         tab = scrollable_tab(notebook, "NDI")
@@ -422,6 +513,7 @@ class NarratorGUI:
                 max_context_seconds=self.config.asr.max_context_seconds,
                 clear_after_silence_seconds=self.config.asr.clear_after_silence_seconds,
                 show_partial_captions=self.asr_show_partial.get(),
+                language_whitelist=final_whitelist_parse(self._whitelist_var.get()),
             ),
             canvas=CanvasConfig(
                 width_px=self.canvas_width.get(),

@@ -1,5 +1,6 @@
 import numpy as np
 
+from narrator.asr.backend import _restrict_to_whitelist
 from narrator.asr.events import CaptionEventType
 from narrator.asr.streaming_decoder import StreamingDecoder, _collapse_repetitions
 from narrator.config.schema import AsrConfig
@@ -209,6 +210,25 @@ def test_tick_is_a_noop_when_not_in_speech():
 
 def test_collapse_single_word_repeat():
     assert _collapse_repetitions(["niż", "niż", "pozostałe"]) == ["niż", "pozostałe"]
+
+
+# ---------------------------------------------------------------------------
+# _restrict_to_whitelist (detection probability re-argmax)
+# ---------------------------------------------------------------------------
+
+
+def test_whitelist_restriction_picks_best_allowed_language():
+    probs = {"de": 0.6, "pl": 0.3, "en": 0.1, "ru": 0.001}
+    assert _restrict_to_whitelist(probs, ["pl", "en"]) == ("pl", 0.3)
+
+
+def test_whitelist_restriction_keeps_top_when_it_is_allowed():
+    probs = {"en": 0.9, "pl": 0.05}
+    assert _restrict_to_whitelist(probs, ["pl", "en"]) == ("en", 0.9)
+
+
+def test_whitelist_restriction_returns_none_when_nothing_matches():
+    assert _restrict_to_whitelist({"de": 0.9, "ru": 0.1}, ["pl"]) is None
 
 
 def test_collapse_multi_word_phrase_repeat():
