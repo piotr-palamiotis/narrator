@@ -77,6 +77,16 @@ def test_disqualified_when_wer_over_floor():
     assert not bad.qualified
 
 
+def test_doubled_words_disqualify_even_with_good_speed_and_wer():
+    """Doubled words in the probe's FINAL text mean the streaming decoder's
+    repetition collapse is absent or broken -- the measurement does not
+    describe the shipping decoder, so the candidate cannot be ranked."""
+    doubled = make_result("loopy", s10=0.2, wer=0.02, doubled=True)
+    grade_candidate(doubled)
+    assert not doubled.qualified
+    assert doubled.score == float("-inf")
+
+
 def test_wer_at_floor_scores_zero_accuracy_but_qualifies():
     edge = make_result("edge", s10=0.3, wer=WER_FLOOR)
     grade_candidate(edge)
@@ -129,8 +139,8 @@ def test_decide_prefers_more_accurate_at_equal_speed():
 
 
 def test_decide_skips_disqualified_even_if_accurate():
-    # Mirrors the stress-test lesson: large-v3 is accurate offline but its
-    # streaming decode overruns the cadence -> must not be chosen.
+    # A fast, accurate candidate that overruns the cadence on some window
+    # must not be chosen: that is the queue-saturation regime.
     large = make_result("large-v3", s10=12.0, wer=0.02)  # ratio 1.2x... use worse
     large.decode_seconds_by_window = {"10.0s": 20.0, "5.0s": 8.0, "2.0s": 0.3}
     medium = make_result("medium", s10=0.55, wer=0.08)
@@ -138,6 +148,18 @@ def test_decide_skips_disqualified_even_if_accurate():
     grade_candidate(medium)
     assert not large.qualified
     assert decide([large, medium]).model == "medium"
+
+
+def test_decide_prefers_more_accurate_when_both_at_speed_cap():
+    """On capable hardware both models cap the speed term (both decode a 10s
+    window well under the 0.6s reference), so accuracy decides -- the
+    post-collapse-fix regime, where large-v3 can legitimately win."""
+    large = make_result("large-v3", s10=0.58, wer=0.02)
+    medium = make_result("medium", s10=0.33, wer=0.08)
+    for r in (large, medium):
+        grade_candidate(r)
+    assert large.qualified and medium.qualified
+    assert decide([medium, large]).model == "large-v3"
 
 
 def test_decide_raises_when_nothing_qualifies():

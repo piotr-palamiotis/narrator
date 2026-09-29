@@ -244,10 +244,14 @@ live).
 - `narrator/asr/autoconfigure.py` (+ `bench.py`, `quality_probe.py`, `metrics.py`) —
   `narrator --autoconfigure` benchmarks candidates in throwaway subprocesses (speed per
   window size + WER of the *streaming* decoder on the fixtures) and writes the winner's
-  model/device/step_ms to config.yaml. Qualification gates encode the stress-test
-  lessons: decode slower than 1.5x real time at any window, or WER > 0.30, disqualify.
-  The quality probe must stay streaming-shaped (real-time feed + tick) — offline
-  transcription would wrongly crown large-v3.
+  model/device/step_ms to config.yaml. Qualification gates: decode slower than 1.5x real
+  time at any window, streaming WER > 0.30, or doubled words in FINAL text disqualify.
+  The last gate guards the sentence-loop collapse fix: `doubled=True` means the text-layer
+  fix is absent/broken, so the candidate is unrankable. Post-collapse-fix, large-v3
+  streams cleanly (probe: WER 0.145, doubled False; raw decode 0.06x realtime at a 10s
+  window) and qualifies; on capable hardware all models cap the speed term, so measured
+  accuracy decides. The quality probe must stay streaming-shaped (real-time feed + tick) —
+  offline transcription would miss exactly the failure modes these gates guard.
 - `packaging/pyinstaller/` — standalone binary build (spec + per-OS build scripts).
 - `packaging/whisper_cpp/README.md` — GPU/Vulkan runtime requirements, plus source-build instructions for the rare case a non-Vulkan ggml backend is needed.
 - `assets/` — bundled font (Polish-capable) and Silero VAD ONNX model, referenced by `packaging/pyinstaller/narrator.spec` for the standalone build.

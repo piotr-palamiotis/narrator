@@ -48,8 +48,12 @@ def _run_autoconfigure(config_path: Path, models: list[str] | None) -> int:
             print(f"  {c.model:<12} 10s={c.decode_seconds_by_window.get('10.0s', float('nan')):.2f}s "
                   f"ratio={c.slowest_decode_ratio:.2f}x WER={wer_text} score={c.score:.3f}")
         else:
-            print(f"  {c.model:<12} disqualified (ratio={c.slowest_decode_ratio:.2f}x, "
-                  f"WER={c.wer if c.wer is not None else 'n/a'})")
+            reason = "doubled words" if c.doubled else ""
+            if reason:
+                print(f"  {c.model:<12} disqualified: {reason}")
+            else:
+                print(f"  {c.model:<12} disqualified (ratio={c.slowest_decode_ratio:.2f}x, "
+                      f"WER={c.wer if c.wer is not None else 'n/a'})")
     return 0
 
 

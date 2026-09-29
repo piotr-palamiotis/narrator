@@ -9,11 +9,16 @@ Ranking criterion (accuracy first, then live performance):
      decode time, lower better) + 30% accuracy (WER on the Polish fixtures).
 
 Why both gates: the large-v3 lesson from the stress test -- it's accurate
-offline, but repetition loops make its streaming decode steps so slow that
-audio gets dropped and live accuracy collapses (~74% WER vs medium's ~8%).
-An autoconfigurer that benchmarked offline quality alone would have picked
-it. The qualification ratio (decode slower than 1.5x real time at any probed
-window) is the live-pipeline signal that predicts exactly that failure.
+offline, but before the sentence-loop collapse fix (streaming_decoder.py
+`_collapse_repetitions`) its streaming decode hit repetition loops that
+slowed steps and collapsed live accuracy (~74% WER vs medium's ~8%). An
+autoconfigurer that benchmarked offline quality alone would have picked it.
+With that fix in place large-v3 now streams cleanly (measured: 0.06x
+real-time decode at a 10s window, ~2% streaming WER on the fixtures) and can
+legitimately win on capable hardware; the gates remain as regression guards
+-- a decode step slower than 1.5x real time at any probed window still means
+the queue-saturation regime, and a streaming WER over the floor still means
+garbled captions, whichever model causes them.
 
 Pure decision logic (`grade_candidate`, `decide`, `derive_step_ms`) is
 testable without touching GPU or models: see tests/test_autoconfigure.py.
@@ -48,13 +53,15 @@ CANDIDATE_MODELS = ("large-v3", "medium", "small", "base", "tiny")
 # Decode step slower than 1.5x real time at any probed window -> disqualified:
 # that is the onset of the queue-saturation regime that destroyed large-v3.
 SLOW_FACTOR = 1.5
-# WER above this disqualifies a candidate outright (large-v3 streaming hit
-# 0.74; medium hits ~0.08; nothing legitimately useful lives above 0.30).
+# WER above this disqualifies a candidate outright. Originally sized when
+# large-v3's streaming decode hit 0.74 pre-collapse-fix; it stays as a
+# regression net (nothing legitimately useful lives above 0.30).
 WER_FLOOR = 0.30
 # Worst-window decode ratio used for the speed term.
 SPEED_WINDOW_LABEL = "10.0s"
-# 10s decode considered "perfect" for the speed term (medium measured 0.59s
-# raw; the live pipeline measured ~0.6-0.8s finalize latency at step 350).
+# 10s decode considered "perfect" for the speed term (reference-machine
+# measurements: medium 0.33s, large-v3 0.58s -- both cap at 1.0, so the
+# score then differentiates on accuracy; slower machines spread out).
 SPEED_REFERENCE_S = 0.6
 # Score weights: speed dominates because all qualifiers are already accurate
 # enough; latency is the user-visible differentiator for live captions.
@@ -158,7 +165,8 @@ def grade_candidate(result: BenchResult) -> None:
                         (WER 0 -> 1.0, WER >= WER_FLOOR -> 0)
 
     Candidates with a bench error, no measurements, a decode ratio over
-    SLOW_FACTOR, or WER over WER_FLOOR do not qualify.
+    SLOW_FACTOR, WER over WER_FLOOR, or doubled words in the probe's FINAL
+    text do not qualify.
     """
     if result.error or not result.decode_seconds_by_window:
         result.qualified = False
@@ -172,6 +180,15 @@ def grade_candidate(result: BenchResult) -> None:
         return
 
     if result.wer is not None and result.wer > WER_FLOOR:
+        result.qualified = False
+        result.score = float("-inf")
+        return
+
+    # The probe's `doubled` flag means immediate repeated words survived into
+    # FINAL captions. The streaming decoder collapses those; if they appear
+    # anyway, the text-layer fix is absent or broken and this measurement
+    # does not describe the shipping decoder. Disqualify rather than rank.
+    if result.doubled:
         result.qualified = False
         result.score = float("-inf")
         return

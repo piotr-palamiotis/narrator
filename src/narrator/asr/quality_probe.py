@@ -7,11 +7,14 @@ rationale as bench.py; only the `BENCH_JSON:`-prefixed line is consumed).
 This is the *accuracy* half of autoconfigure, and it deliberately replays the
 STREAMING decode -- GrowingWindow + local agreement + VAD force-finalize at
 the configured step_ms/agreement/end_silence -- not one-shot transcription.
-The stress test showed why the distinction is decisive: large-v3 transcribes
-short clips cleanly offline, but its streaming decode hits repetition loops
-(growing windows re-decoded repeatedly), its steps slow to seconds, and live
-accuracy collapses (~74% WER vs medium's ~8%). An offline probe would crown
-exactly the wrong model; this one measures what live captioning experiences.
+Why the distinction is decisive: large-v3 transcribes short clips cleanly
+offline, but pre-collapse-fix its streaming decode hit repetition loops that
+slowed steps and collapsed live accuracy (~74% WER vs medium's ~8%); an
+offline probe would crown exactly the wrong model. This probe measures what
+live captioning actually experiences. It also reports `doubled` (immediate
+repeated words in FINAL text) -- autoconfigure disqualifies on it, since the
+shipping decoder collapses those and their presence means the text-layer fix
+is absent or broken.
 
 Frames are fed in real time (30ms per 30ms of wall clock) using the worker's
 drain-then-tick shape, so decode steps contend with accumulating audio the
