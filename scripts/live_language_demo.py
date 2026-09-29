@@ -1,14 +1,10 @@
-"""Live demo of dynamic language switching (asr.language=pl + threshold=2).
+"""Live demo of whitelist-based language selection (pl+en whitelist).
 
 Plays a deterministic schedule of Polish and English Piper fixtures through
 the PipeWire virtual mic into a real AppController and prints the observed
-caption timeline next to the expected behavior:
-
-  pl, pl, en, en, en, pl, pl, pl
-  -> [pl] [pl] [pl] [pl] [en] [en] [en] [pl]
-     (foreign utterances are captioned in the default language until the
-      streak of confident detections crosses the threshold; the switch
-      applies from the utterance AFTER the threshold-crossing finalize)
+caption timeline next to the expected behavior: with a pl+en whitelist each
+utterance is decoded in the highest-confidence allowed language, so captions
+follow the speaker's language per utterance.
 
 Usage: .venv/bin/python scripts/live_language_demo.py
 """
@@ -70,8 +66,7 @@ def main() -> None:
         update={
             "model": "large-v3",
             "device": AsrDevice.AUTO,
-            "language": "pl",
-            "language_switch_threshold": 2,
+            "language_whitelist": ["pl", "en"],
             "step_ms": 900,
         }
     )

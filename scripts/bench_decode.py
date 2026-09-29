@@ -36,7 +36,7 @@ def main() -> None:
 
     device = "cpu" if use_cpu else "vulkan"
     backend = WhisperBackend(
-        AsrConfig(model=model, device=device, language="pl")  # type: ignore[arg-type]
+        AsrConfig(model=model, device=device, language_whitelist=["pl"])  # type: ignore[arg-type]
     )
     print(f"backend: {backend.resolved_device_description} (model={model})")
 

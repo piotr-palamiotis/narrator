@@ -193,7 +193,14 @@ def write_config(path: Path, asr_overrides: dict, language: str) -> None:
     config.audio.device = "default"
     config.gui.enabled = False
     config.app.log_level = "WARNING"
-    asr: dict = {"model": "large-v3", "device": AsrDevice.AUTO, "language": language}
+    # --language pl pins the whitelist to Polish (permanent-forced); "auto"
+    # runs unrestricted per-utterance detection. Either way the whitelist is
+    # the only language control.
+    asr: dict = {
+        "model": "large-v3",
+        "device": AsrDevice.AUTO,
+        "language_whitelist": [] if language == "auto" else [language],
+    }
     asr.update(asr_overrides)
     config.asr = config.asr.model_copy(update=asr)
     from narrator.config.loader import save_config
@@ -301,8 +308,8 @@ def main() -> None:
     ap.add_argument("--agreement-passes", type=int, default=None, help="asr.agreement_passes override")
     ap.add_argument("--end-silence-ms", type=int, default=None, help="asr.end_silence_ms override")
     ap.add_argument("--language", default="pl", choices=["pl", "auto"],
-                    help="asr.language: 'pl' forces Polish; 'auto' detects per utterance "
-                         "(English speech -> English captions, everything else -> Polish)")
+                    help="whitelist shortcut: 'pl' pins Polish; 'auto' detects per utterance "
+                         "(any language whisper reports)")
     args = ap.parse_args()
 
     overrides: dict = {}

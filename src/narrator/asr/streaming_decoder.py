@@ -30,7 +30,7 @@ from collections.abc import Callable
 
 import numpy as np
 
-from narrator.asr.backend import DevicePolicyError, WhisperBackend, _LANGUAGE_PROB_THRESHOLD
+from narrator.asr.backend import DevicePolicyError, WhisperBackend
 from narrator.asr.events import CaptionEvent, CaptionEventType
 from narrator.asr.vad import SileroVad
 from narrator.audio.ring_buffer import AudioWindow
@@ -42,17 +42,24 @@ _VAD_WINDOW_MS = 32.0  # fixed by the Silero graph's 512-sample-at-16kHz require
 _MIN_DECODE_SECONDS = 0.3  # skip decode steps on near-empty windows
 _OVERRUN_WARN_FACTOR = 2.0  # warn once a decode step takes >2x the configured step
 _OVERRUN_WARN_INTERVAL_SECONDS = 10.0
-# asr.language == "auto": whisper's language detection is unreliable on very
-# short slices (measured on large-v3: a 0.4s slice misdetects 1-in-7 clips;
-# at 1.5s every clip detects correctly with >=0.97 confidence), and even at
-# sufficient length a marginal clip can flip (measured: one clip locked
-# Cyrillic at 1.5s). The lock therefore requires BOTH: the window holds
-# _LANGUAGE_LOCK_MIN_SECONDS of audio AND the backend reports at least
-# _LANGUAGE_PROB_THRESHOLD confidence (backend.py). Until then, decode steps
-# are skipped -- output in an unverified language would be garbage we'd have
-# to suppress anyway, and the post-lock decode covers the whole window.
-# Shorter/ambiguous utterances lock at force-finalize.
+# Language selection is a per-utterance decision over the configured
+# whitelist (backend.detect_language returns the best allowed language plus
+# the probability MARGIN to the runner-up). Two gates keep a marginal
+# decision from being locked as if it were sure:
+#   length: short slices misdetect (large-v3: 0.4s slices get 1-in-7 wrong;
+#   >=1.5s detects correctly), so nothing locks before the window holds
+#   this much audio -- decode steps are skipped until then, and the
+#   post-lock decode covers the whole window at once.
+#   margin: when the top two candidates are close (a 3-language split can
+#   sit near 33/33/33), the decision is deferred and the growing window is
+#   re-detected every step -- which is the "build confidence up" effect:
+#   each step sees more speech until the gap is decisive. At force-finalize
+#   an ambiguous result keeps the PREVIOUS utterance's language (a wrong-but
+#   -consistent caption beats a coin flip that mixes languages mid-speech);
+#   with no history, the top candidate is used anyway (suppressing the
+#   finalize decode would drop audible speech the operator can hear).
 _LANGUAGE_LOCK_MIN_SECONDS = 1.5
+_LANGUAGE_MIN_MARGIN = 0.15
 
 
 def _common_prefix_length(a: list[str], b: list[str]) -> int:
@@ -145,15 +152,15 @@ class StreamingDecoder:
         self._recent_hypotheses: list[list[str]] = []  # last `agreement_passes` hypotheses
         self._committed_word_count = 0
         self._last_final_last_word: str | None = None  # cross-commit repetition guard (see _drop_repeated_boundary)
-        # Per-utterance language lock; set in _start_utterance when config
-        # language is "auto" (see there for why per-step detection is wrong).
+        # Per-utterance language lock: None until detection clears both the
+        # length and margin gates (see the constants' comment). One decision
+        # per utterance -- per-step detection flaps between acoustically
+        # similar languages (measured: Polish intermittently heard as
+        # Ukrainian), producing mixed-language captions.
         self._locked_language: str | None = None
-        # Dynamic mode (forced language + language_switch_threshold > 0):
-        # active decode language and consecutive different-language detection
-        # streak (evaluated once per utterance finalize, after the finalize
-        # decode).
-        self._active_language: str = self._config.language
-        self._language_streak: int = 0
+        # Language of the previous utterance: an ambiguous finalize keeps
+        # this instead of coin-flipping (see _finalize_utterance).
+        self._last_utterance_language: str | None = None
         self._last_overrun_warning = float("-inf")
 
         self._on_event(CaptionEvent(CaptionEventType.STATUS, backend.resolved_device_description))
@@ -221,111 +228,66 @@ class StreamingDecoder:
         self._recent_hypotheses = []
         self._committed_word_count = 0
         self._last_decode_monotonic = 0.0
-        # Language lock: reset here, then fixed for the whole utterance.
-        # With a forced config language that is just the config value; with
-        # "auto" it is detected ONCE on the first decode step
-        # (_ensure_language_locked) and used verbatim -- whatever language the
-        # model hears is what gets transcribed. Detection must happen on the
-        # first decode step, not here: the window was just cleared and has no
-        # audio yet. Per-step detection flaps between acoustically similar
-        # languages (measured: Polish intermittently heard as Ukrainian),
-        # producing mixed-language captions; one decision per utterance keeps
-        # each caption in a single language.
-        self._locked_language: str | None = (
-            self._active_language if self._config.language != "auto" else None
-        )
+        # Language lock: reset here, then fixed for the whole utterance via
+        # _ensure_language_locked on decode steps (detection must happen on a
+        # decode step, not here: the window was just cleared and has no audio
+        # yet). One decision per utterance keeps each caption in a single
+        # language.
+        self._locked_language = None
         # `self._last_final_last_word` deliberately persists across utterances:
         # a stutter at an utterance boundary would otherwise produce adjacent
         # FINALs ending/starting with the same word.
 
     def _ensure_language_locked(self, force: bool = False) -> None:
-        """Resolve the decode language for the current utterance.
+        """Resolve the decode language for the current utterance, once.
 
-        Two modes:
-
-        * language == "auto": detect and lock this utterance's language
-          verbatim. Locks only when the window holds
-          `_LANGUAGE_LOCK_MIN_SECONDS` of audio AND detection confidence
-          clears `_LANGUAGE_PROB_THRESHOLD`; `force` (the finalize path) drops
-          the length requirement but still honors the confidence gate. Until
-          locked, decode steps are skipped -- output in an unverified language
-          would be garbage we'd have to suppress anyway.
-
-        * forced language + language_switch_threshold > 0 (dynamic mode): the
-          configured language is the active decode language. At each utterance
-          finalize -- after the finalize decode, so the detection's encoder
-          pass never lands on the finalize latency path -- the window's
-          language is detected; confident detections of a language DIFFERENT
-          from the active one advance a streak, and at
-          `language_switch_threshold` consecutive hits the active language
-          switches. Decoding never waits in this mode: a foreign-language
-          utterance is first captioned in the default language (imperfect
-          captions beat delayed ones) and the switch applies from the next
-          utterance onward. The streak requires confidence on every hit, so
-          one ambiguous finalize does not flip the venue.
+        Locks when the window holds `_LANGUAGE_LOCK_MIN_SECONDS` of audio AND
+        detection clears the margin gate (`_LANGUAGE_MIN_MARGIN` between the
+        top two allowed candidates). Until then decode steps are skipped:
+        output in an unverified language would be garbage we'd have to
+        suppress anyway, and the post-lock decode covers the whole window at
+        once -- so the deferred decision costs latency only on genuinely
+        ambiguous audio. `force` (the finalize path) drops the length
+        requirement; the margin gate degrades to 'keep the previous
+        utterance's language on ambiguity' there (see _finalize_utterance).
         """
-        if self._config.language == "auto":
-            if self._locked_language is not None:
-                return
-            if not force and self._window.duration_seconds < _LANGUAGE_LOCK_MIN_SECONDS:
-                return
-            result = self._backend.detect_language(self._window.samples)
-            if result is None:
-                return  # detection error; retry on a later step / at finalize
-            language, probability = result
-            if probability < _LANGUAGE_PROB_THRESHOLD:
-                logger.debug(
-                    "language detection inconclusive (%s @ %.2f); collecting more audio",
-                    language,
-                    probability,
-                )
-                return
-            self._locked_language = language
+        if self._locked_language is not None:
             return
-
-        # Dynamic mode over a forced base language.
-        if self._config.language_switch_threshold <= 0:
-            return  # switching disabled: the forced language is permanent
+        # Single-entry whitelist: the language is known from config, no
+        # detection, no waiting -- this is the permanent-forced mode.
+        if len(self._config.language_whitelist) == 1:
+            self._locked_language = self._config.language_whitelist[0]
+            return
+        if not force and self._window.duration_seconds < _LANGUAGE_LOCK_MIN_SECONDS:
+            return
         result = self._backend.detect_language(self._window.samples)
         if result is None:
-            return
-        detected, probability = result
-        if probability < _LANGUAGE_PROB_THRESHOLD:
-            return  # inconclusive: neither confirms nor resets the streak
-        if detected == self._active_language:
-            self._language_streak = 0
-            return
-        self._language_streak += 1
-        logger.info(
-            "detected %s (%.2f) while decoding as %s -- streak %d/%d",
-            detected,
-            probability,
-            self._active_language,
-            self._language_streak,
-            self._config.language_switch_threshold,
-        )
-        if self._language_streak >= self._config.language_switch_threshold:
-            logger.info(
-                "switching active caption language %s -> %s after %d consecutive detections",
-                self._active_language,
-                detected,
-                self._language_streak,
+            return  # detection error; retry on a later step / at finalize
+        language, probability, margin = result
+        # The margin gate applies at force too: finalize handles ambiguity by
+        # keeping the previous utterance's language (see _finalize_utterance).
+        if margin < _LANGUAGE_MIN_MARGIN:
+            logger.debug(
+                "language detection ambiguous (%s @ %.2f, margin %.2f); collecting more audio",
+                language,
+                probability,
+                margin,
             )
-            self._active_language = detected
-            self._locked_language = detected
-            self._language_streak = 0
+            return
+        self._locked_language = language
 
     def _run_decode_step(self, now: float) -> None:
         self._last_decode_monotonic = now
         if self._window.duration_seconds < self._min_decode_seconds:
             return
 
-        # Auto language: before the lock exists we deliberately decode nothing
-        # -- the window is shorter than the reliable-detection minimum, and a
-        # decode in an unverified language produces text we would have to
-        # suppress anyway. Skipping keeps the GPU free; the post-lock decode
-        # transcribes the whole window (including this early audio) at once.
-        if self._config.language == "auto" and self._locked_language is None:
+        # Before the language lock exists we deliberately decode nothing --
+        # the window is shorter than the reliable-detection minimum (or the
+        # detection is still ambiguous), and a decode in an unverified
+        # language produces text we would have to suppress anyway. Skipping
+        # keeps the GPU free; the post-lock decode transcribes the whole
+        # window (including this early audio) at once.
+        if self._locked_language is None:
             self._ensure_language_locked()
             if self._locked_language is None:
                 return
@@ -365,36 +327,40 @@ class StreamingDecoder:
                 self._on_event(CaptionEvent(CaptionEventType.PARTIAL, " ".join(partial_words)))
 
     def _finalize_utterance(self) -> None:
-        # Dynamic mode: the streak check runs AFTER the finalize decode below
-        # (via _ensure_language_locked at the end of this method): the
-        # detection's encoder pass costs ~445ms on large-v3 (constant in slice
-        # length -- the mel is padded to
-        # a fixed 30s window), and its result never affects the utterance
-        # being finalized (the switch applies from the NEXT utterance), so
-        # running it first would add that cost to every utterance's finalize
-        # latency for zero benefit. It runs on a copy of the window samples,
-        # taken before the window is cleared.
-        # Auto mode is different: its lock decides the finalize decode's
-        # language, so its detection must run BEFORE the decode.
-        is_dynamic = self._config.language != "auto" and self._config.language_switch_threshold > 0
+        # The language lock decides the finalize decode's language, so the
+        # force-lock runs BEFORE the decode. The detection's encoder pass
+        # costs ~445ms on large-v3 (constant in slice length -- the mel is
+        # padded to a fixed 30s window); it sits on the finalize latency path
+        # only when the lock hasn't landed during the utterance, which the
+        # margin gate makes rare.
         if self._window.duration_seconds >= self._min_decode_seconds:
-            if self._config.language == "auto":
-                self._ensure_language_locked(force=True)
-                # If the lock never landed (detection failing or never
-                # confident enough), transcribing here would run in the
-                # backend's default language -- suppressing beats emitting
-                # wrong-language text.
-                if self._locked_language is None:
-                    logger.warning(
-                        "utterance finalized without a language lock; dropping %.1fs window",
-                        self._window.duration_seconds,
+            self._ensure_language_locked(force=True)
+            # An ambiguous finalize (margin never cleared): keep the previous
+            # utterance's language rather than coin-flip -- a wrong-but-
+            # consistent caption beats one that mixes languages mid-speech.
+            # With no history (first utterance), use the top candidate anyway:
+            # dropping the window would hide speech the operator can hear.
+            if self._locked_language is None:
+                if self._last_utterance_language is not None:
+                    self._locked_language = self._last_utterance_language
+                    logger.info(
+                        "language still ambiguous at finalize; keeping previous utterance's language %s",
+                        self._locked_language,
                     )
-                    self._in_speech = False
-                    self._window.clear()
-                    self._recent_hypotheses = []
-                    self._committed_word_count = 0
-                    self._silence_ms_accum = 0.0
-                    return
+                else:
+                    result = self._backend.detect_language(self._window.samples)
+                    if result is None:
+                        logger.warning(
+                            "language detection failed at finalize; dropping %.1fs window",
+                            self._window.duration_seconds,
+                        )
+                        self._in_speech = False
+                        self._window.clear()
+                        self._recent_hypotheses = []
+                        self._committed_word_count = 0
+                        self._silence_ms_accum = 0.0
+                        return
+                    self._locked_language = result[0]
             window_seconds = self._window.duration_seconds
             started = time.monotonic()
             try:
@@ -411,17 +377,10 @@ class StreamingDecoder:
                 logger.exception("Final decode pass failed for utterance")
 
         self._in_speech = False
-        # Dynamic mode: exactly ONE detection per finalize, on the still-
-        # intact window (cleared just below) -- advances the switch streak
-        # for the NEXT utterance. With threshold=2 the intended sequence
-        # holds: the first foreign utterance is still decoded in the default
-        # language, and the utterance after the threshold-crossing finalize
-        # is decoded in the new language.
-        if is_dynamic:
-            self._ensure_language_locked()
-        # Next utterance starts fresh: auto re-detects, dynamic re-locks on
-        # the (possibly just-switched) active language.
-        self._locked_language = self._active_language if self._config.language != "auto" else None
+        # Next utterance starts fresh; remember this one's language for the
+        # ambiguity fallback above.
+        self._last_utterance_language = self._locked_language
+        self._locked_language = None
         self._window.clear()
         self._recent_hypotheses = []
         self._committed_word_count = 0

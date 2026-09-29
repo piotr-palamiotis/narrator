@@ -74,7 +74,7 @@ _PREVIEW_FIELD_NAMES = [
 # (and, via the config watcher, applied live) as soon as they change.
 _AUTOSAVE_ONLY_FIELD_NAMES = [
     "audio_device",
-    "asr_model", "asr_language", "asr_device", "asr_show_partial",
+    "asr_model", "asr_device", "asr_show_partial",
     "ndi_name", "ndi_fps",
 ]
 
@@ -391,10 +391,9 @@ class NarratorGUI:
         asr = self.config.asr
         ttk.Separator(auto).grid(row=1, column=0, columnspan=4, sticky="ew", pady=6)
         self.asr_model = text_field(auto, 2, "Whisper model", asr.model, width=30)
-        self.asr_language = text_field(auto, 3, "Language (ISO code or 'auto')", asr.language, width=10)
-        self.asr_device = dropdown_field(auto, 4, "ASR device", asr.device.value, ["auto", "vulkan", "cpu"])
-        self.asr_show_partial = checkbox_field(auto, 5, "Show partial (unconfirmed) captions", asr.show_partial_captions)
-        self._build_language_whitelist_editor(auto, start_row=6)
+        self.asr_device = dropdown_field(auto, 3, "ASR device", asr.device.value, ["auto", "vulkan", "cpu"])
+        self.asr_show_partial = checkbox_field(auto, 4, "Show partial (unconfirmed) captions", asr.show_partial_captions)
+        self._build_language_whitelist_editor(auto, start_row=5)
         ttk.Label(auto, text="Audio/ASR model+device changes restart the ASR worker automatically.", foreground="gray").grid(
             row=12, column=0, columnspan=4, sticky="w", padx=4, pady=(8, 2)
         )
@@ -426,17 +425,12 @@ class NarratorGUI:
         row = start_row
         ttk.Separator(parent).grid(row=row, column=0, columnspan=4, sticky="ew", pady=6)
         row += 1
-        ttk.Label(parent, text="Language whitelist (empty = unrestricted):").grid(
+        ttk.Label(parent, text="Languages (empty = auto-detect; with entries, each utterance is decoded in the best-matching listed language)").grid(
             row=row, column=0, columnspan=2, sticky="w", padx=4, pady=2
         )
         row += 1
 
         codes = list(whisper_language_codes())
-        # The default caption language should be one click away at the top.
-        default_code = self.config.asr.language
-        if default_code in codes:
-            codes.remove(default_code)
-            codes.insert(0, default_code)
 
         picker_frame = ttk.Frame(parent)
         picker_frame.grid(row=row, column=0, columnspan=4, sticky="w", padx=4, pady=2)
@@ -504,7 +498,6 @@ class NarratorGUI:
             audio=self.config.audio.model_copy(update={"device": self.audio_device.get()}),
             asr=AsrConfig(
                 model=self.asr_model.get(),
-                language=self.asr_language.get(),
                 device=self.asr_device.get(),
                 vad_threshold=self.config.asr.vad_threshold,
                 step_ms=self.config.asr.step_ms,

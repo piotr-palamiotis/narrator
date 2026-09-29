@@ -63,7 +63,7 @@ def main() -> None:
     print(f"clip: {mp3} -> {duration:.1f}s @16kHz mono")
 
     events: queue.Queue[CaptionEvent] = queue.Queue()
-    config = AsrConfig(model="large-v3", device="vulkan", language="pl", step_ms=step_ms)
+    config = AsrConfig(model="large-v3", device="vulkan", language_whitelist=["pl"], step_ms=step_ms)
     backend = WhisperBackend(config)
     print(f"backend: {backend.resolved_device_description}")
 

@@ -203,7 +203,7 @@ def select_gpu_index(devices: list[VulkanDevice], configured: int | str) -> int:
 # real speech produces; it only bites on runaway repetition loops.
 _MAX_TOKENS_PER_STEP = 200
 
-# asr.language="auto": pywhispercpp 1.5.1's `detect_language=True` transcribe
+# pywhispercpp 1.5.1's `detect_language=True` transcribe
 # param is broken -- it returns zero segments on any input (verified on a
 # fresh model with clean audio). Detection is done through the dedicated
 # `auto_detect_language()` API instead, and whatever code it reports is used
@@ -236,26 +236,29 @@ _AUDIO_CTX_MARGIN = 64
 
 def _restrict_to_whitelist(
     all_probs: dict[str, float], whitelist: list[str]
-) -> tuple[str, float] | None:
+) -> tuple[str, float, float] | None:
     """Re-argmax the detector's full probability table over `whitelist`.
 
     auto_detect_language returns softmax probabilities for every language it
     knows; restricting the decision to the operator's set is therefore exact
     (the same computation whisper does, minus the disallowed entries) -- not
-    a guess. Returns None only when nothing in the whitelist has a usable
-    probability (cannot happen with a validated config, but a defensive
-    None lets the caller keep the unrestricted result).
+    a guess. Returns (code, probability, runner_up_margin): margin is the gap
+    to the best DISALLOWED... no -- to the second-best ALLOWED language, the
+    quantity the StreamingDecoder gates its per-utterance lock on (a wide
+    margin means the decision is safe; a narrow one means the utterance is
+    genuinely ambiguous and more audio is needed). Returns None only when
+    nothing in the whitelist has a usable probability.
     """
     allowed = set(whitelist)
-    best_code: str | None = None
-    best_prob = -1.0
-    for code, prob in all_probs.items():
-        if code in allowed and float(prob) > best_prob:
-            best_code = code
-            best_prob = float(prob)
-    if best_code is None:
+    scored = sorted(
+        ((float(prob), code) for code, prob in all_probs.items() if code in allowed),
+        reverse=True,
+    )
+    if not scored:
         return None
-    return best_code, best_prob
+    best_prob, best_code = scored[0]
+    runner_up_prob = scored[1][0] if len(scored) > 1 else 0.0
+    return best_code, best_prob, best_prob - runner_up_prob
 
 
 def audio_ctx_for_seconds(window_seconds: float) -> int:
@@ -373,49 +376,55 @@ class WhisperBackend:
         """
         self._model = None
 
-    def _detect_language(self, audio: np.ndarray) -> str:
-        """Language code for this decode pass (asr.language == "auto").
+    def _detect_language(self, audio: np.ndarray) -> tuple[str, float, float]:
+        """Language decision over the configured whitelist.
 
-        Uses the dedicated detection API on a short leading slice of the
+        Runs the dedicated detection API on a short leading slice of the
         window (see _LANGUAGE_DETECT_MAX_SECONDS). With no whitelist the
-        detected code is returned verbatim -- the caption shows whatever the
-        model hears. With `language_whitelist` configured, the probabilities
-        are re-argmaxed over that set: a venue known to be pl+en can never
-        produce German, no matter how confidently whisper hears it. The
-        StreamingDecoder calls this once per utterance and locks the result;
-        per-step detection flaps between acoustically similar languages
-        (measured: Polish clips intermittently decoded as Ukrainian), which
-        mixes languages mid-caption.
+        unrestricted top is returned with its margin over the runner-up
+        (computationally identical shape to the whitelist case). The caller
+        (StreamingDecoder) gates its per-utterance lock on the margin: a
+        narrow gap means the utterance is ambiguous and needs more audio.
+        Returns (code, probability, margin).
         """
         max_samples = int(_LANGUAGE_DETECT_MAX_SECONDS * 16000)
         slice_audio = audio[:max_samples] if len(audio) > max_samples else audio
         try:
             (detected, probability), all_probs = self._model.auto_detect_language(slice_audio)
         except Exception:
-            logger.exception("language detection failed; falling back to config default")
-            return self._config.language if self._config.language != "auto" else "en"
-        detected = str(detected)
-        probability = float(probability)
+            logger.exception("language detection failed")
+            raise
         whitelist = self._config.language_whitelist
         if whitelist:
             restricted = _restrict_to_whitelist(all_probs, whitelist)
-            if restricted is not None and restricted[0] != detected:
+            if restricted is None:
+                # Validated configs always overlap the detector's table; treat
+                # as a failed detection rather than inventing a language.
+                raise ValueError(
+                    f"none of the whitelisted languages {whitelist} appear in detection probabilities"
+                )
+            code, probability, margin = restricted
+            if code != str(detected):
                 logger.info(
                     "language detection %s (%.2f) restricted by whitelist to %s (%.2f)",
                     detected,
+                    float(probability),
+                    code,
                     probability,
-                    restricted[0],
-                    restricted[1],
                 )
-            if restricted is not None:
-                detected, probability = restricted
-        logger.debug("detected language %s (%.2f)", detected, probability)
-        return detected, probability
+            return code, probability, margin
+        # Unrestricted: margin over the best non-chosen language.
+        ranked = sorted(((float(p), str(c)) for c, p in all_probs.items()), reverse=True)
+        if not ranked:
+            raise ValueError("detector returned no language probabilities")
+        probability = float(probability)
+        runner_up = ranked[1][0] if len(ranked) > 1 and ranked[1][1] != str(detected) else 0.0
+        return str(detected), probability, probability - runner_up
 
-    def detect_language(self, audio: np.ndarray) -> tuple[str, float] | None:
+    def detect_language(self, audio: np.ndarray) -> tuple[str, float, float] | None:
         """Public hook so the StreamingDecoder can lock language per utterance.
-        Returns (language_code, confidence), or None on failure so the caller
-        can retry on a later step. See _detect_language for details."""
+        Returns (language_code, confidence, margin_to_runner_up), or None on
+        failure so the caller can retry on a later step."""
         try:
             return self._detect_language(audio)
         except Exception:
@@ -434,11 +443,17 @@ class WhisperBackend:
         mode with immature Vulkan driver paths), reinitializes on CPU and
         retries once rather than crashing the whole ASR worker process.
         """
-        # Explicit per-call override (used by the StreamingDecoder's per-
-        # utterance language lock) wins over the config; otherwise config
-        # decides between a forced language and per-call detection.
+        # Explicit per-call override (a language the StreamingDecoder locked
+        # for this utterance) wins; otherwise the whitelist decides per call:
+        # empty = let whisper detect (language=None), single/multiple = the
+        # best allowed language for THIS audio.
         if language is None:
-            language = None if self._config.language == "auto" else self._config.language
+            if not self._config.language_whitelist:
+                language = None
+            elif len(self._config.language_whitelist) == 1:
+                language = self._config.language_whitelist[0]
+            else:
+                language = self._detect_language(audio)[0]
         kwargs = {
             "single_segment": False,
             # Shrink the encoder context to the actual window length; see

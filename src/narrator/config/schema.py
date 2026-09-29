@@ -69,22 +69,15 @@ class AudioConfig(BaseModel):
 
 class AsrConfig(BaseModel):
     model: str = "large-v3"
-    language: str = "pl"
-    # Dynamic language switching (only when `language` is a forced code, not
-    # "auto"): the configured language is used for decoding until detection
-    # reports a DIFFERENT language confidently this many consecutive times
-    # (once per utterance finalize, plus periodic checks inside long
-    # utterances), at which point the active language switches -- and switches
-    # back the same way. 0 disables switching entirely (pure forced). The
-    # special value language="auto" instead follows the speaker verbatim per
-    # utterance with no default language.
-    language_switch_threshold: int = Field(default=2, ge=0)
-    # Optional restriction of the languages the decoder may use. Empty = no
-    # restriction (whisper decides freely). When set, every language decision
-    # (auto per-utterance lock and dynamic switching alike) re-argmaxes the
-    # detection probabilities over this whitelist, so a known pl+en venue can
-    # never produce German. The configured `language` (if not "auto") is
-    # always an implicit member.
+    # The language whitelist is the single language control. Empty = auto:
+    # each utterance is decoded in whatever language detection reports (any
+    # of whisper's languages). One entry = that language, permanently. Several
+    # entries = each utterance is decoded in the highest-confidence allowed
+    # language, with the decision gated on the detector's probability MARGIN
+    # between the top two allowed candidates (see streaming_decoder.py):
+    # ambiguous windows are not locked until the margin clears, so a genuine
+    # language switch is never guessed on a coin flip. Unknown codes are
+    # rejected by the validator below.
     language_whitelist: list[str] = Field(default_factory=list)
     device: AsrDevice = AsrDevice.AUTO
     # Which Vulkan GPU to use when more than one is present (a discrete card
@@ -105,31 +98,23 @@ class AsrConfig(BaseModel):
     def _check_language_whitelist(self) -> "AsrConfig":
         # Unknown codes would silently never match any detection -- an
         # operator typo like "pol" would shrink the effective whitelist
-        # without any signal. Reject at config time instead. "auto" in the
-        # list means 'follow the speaker verbatim', which the dynamic-switch
-        # machinery cannot express; the per-utterance "auto" language mode is
-        # the supported way to get that behavior.
+        # without any signal. Reject at config time instead.
         from narrator.asr.whisper_languages import whisper_language_codes
 
         valid = set(whisper_language_codes())
         for code in self.language_whitelist:
-            if code == "auto":
-                raise ValueError("language_whitelist must contain ISO codes, not 'auto'")
             if code not in valid:
                 raise ValueError(
                     f"language_whitelist entry {code!r} is not a language whisper supports"
                 )
-        # An EMPTY whitelist means unrestricted -- never auto-populate it
-        # with the default language, or `language: pl` + `whitelist: []`
-        # would silently become pl-only and dynamic switching could never
-        # fire. Prepending only applies to an explicit list that forgot its
-        # own default language.
-        if (
-            self.language_whitelist
-            and self.language != "auto"
-            and self.language not in self.language_whitelist
-        ):
-            self.language_whitelist = [self.language, *self.language_whitelist]
+        # De-duplicate, preserving order: a repeated entry would double-count
+        # in the margin computation (harmless for argmax, confusing for
+        # display) and adds nothing.
+        deduped: list[str] = []
+        for code in self.language_whitelist:
+            if code not in deduped:
+                deduped.append(code)
+        self.language_whitelist = deduped
         return self
 
 

@@ -97,15 +97,16 @@ def _stream_transcribe(backend, config, audio: np.ndarray) -> str:
     return " ".join(finals).strip()
 
 
-def _probe_model(model: str, device: str, language: str, clips_dirs: list[Path]) -> dict:
+def _probe_model(model: str, device: str, language_whitelist: list[str], clips_dirs: list[Path]) -> dict:
     from narrator.asr.backend import WhisperBackend
     from narrator.asr.metrics import has_word_doubling, wer
     from narrator.config.schema import AsrConfig
 
     # Probe with default decode params so every candidate is measured under
     # identical, config-shipped conditions (autoconfigure only overrides
-    # model/device/step_ms afterward).
-    config = AsrConfig(model=model, device=device, language=language)
+    # model/device/step_ms afterward). A single-entry whitelist is the
+    # permanent-forced mode: deterministic per clip, no detection latency.
+    config = AsrConfig(model=model, device=device, language_whitelist=language_whitelist)
     backend = WhisperBackend(config)
 
     wers: list[float] = []
@@ -134,7 +135,7 @@ def _probe_model(model: str, device: str, language: str, clips_dirs: list[Path])
     return {
         "model": model,
         "device": device,
-        "language": language,
+        "language_whitelist": language_whitelist,
         "resolved_device": backend.resolved_device_description,
         "probe": "streaming",
         "wer": round(statistics.mean(wers), 4),
@@ -149,9 +150,9 @@ def main() -> int:
         payload = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
         model = str(payload.get("model", "medium"))
         device = str(payload.get("device", "auto"))
-        language = str(payload.get("language", "pl"))
+        language_whitelist = [str(code) for code in payload.get("language_whitelist", ["pl"])]
         clips_dirs = [Path(d) for d in payload.get("clips_dirs", [str(CLIPS_DIR)])]
-        result = _probe_model(model, device, language, clips_dirs)
+        result = _probe_model(model, device, language_whitelist, clips_dirs)
         print("BENCH_JSON:" + json.dumps(result, ensure_ascii=False))
         return 0
     except Exception as exc:

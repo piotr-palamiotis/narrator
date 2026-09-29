@@ -27,12 +27,13 @@ class FakeBackend:
         self.detected_language = "pl"  # returned by detect_language
         self.detected_probability = 0.99
         self.detect_fails = False  # simulate detection errors (returns None)
+        self.detected_margin = 0.9  # decisive by default
 
     def detect_language(self, audio):
         self.detect_calls += 1
         if self.detect_fails:
             return None
-        return (self.detected_language, self.detected_probability)
+        return (self.detected_language, self.detected_probability, self.detected_margin)
 
     def transcribe(self, audio, language=None):
         self.language_calls.append(language)
@@ -61,7 +62,10 @@ def make_decoder(responses, config=None, events=None):
         agreement_passes=2,
         end_silence_ms=300,
         clear_after_silence_seconds=5,
-        language_switch_threshold=0,  # pure forced-language unless a test opts in
+        # Permanent-forced (single entry): the agreement/commit tests only
+        # care about text, not language selection, and must not depend on
+        # detection timing.
+        language_whitelist=["pl"],
     )
     clock = FakeClock()
     decoder = StreamingDecoder(
@@ -98,7 +102,7 @@ def test_status_event_emitted_on_construction():
 
 
 def test_commits_prefix_after_agreement_passes():
-    config = AsrConfig(step_ms=100, agreement_passes=2, end_silence_ms=300, clear_after_silence_seconds=5)
+    config = AsrConfig(step_ms=100, agreement_passes=2, end_silence_ms=300, clear_after_silence_seconds=5, language_whitelist=["pl"])
     decoder, clock, events = make_decoder(
         ["hello world", "hello world there", "hello world there now"], config=config
     )
@@ -117,7 +121,7 @@ def test_commits_prefix_after_agreement_passes():
 
 
 def test_force_finalizes_on_end_silence():
-    config = AsrConfig(step_ms=100, agreement_passes=99, end_silence_ms=100, clear_after_silence_seconds=5)
+    config = AsrConfig(step_ms=100, agreement_passes=99, end_silence_ms=100, clear_after_silence_seconds=5, language_whitelist=["pl"])
     decoder, clock, events = make_decoder(["partial hypothesis", "partial hypothesis final"], config=config)
 
     feed_decode_step(decoder, clock, config)  # decode step; agreement_passes=99 so nothing commits yet
@@ -176,9 +180,8 @@ def test_feed_without_decode_step_ingests_but_does_not_transcribe():
 
 def test_tick_runs_one_decode_step_after_draining():
     """Drain-then-tick must produce exactly one decode for a whole batch of
-    frames, which is what stops the audio queue from backing up.
-    """
-    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=300)
+    frames, which is what stops the audio queue from backing up."""
+    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=300, language_whitelist=["pl"])
     decoder, clock, events = make_decoder(["jeden", "dwa"], config=config)
 
     decoder._vad.level = 1.0
@@ -219,12 +222,13 @@ def test_collapse_single_word_repeat():
 
 def test_whitelist_restriction_picks_best_allowed_language():
     probs = {"de": 0.6, "pl": 0.3, "en": 0.1, "ru": 0.001}
-    assert _restrict_to_whitelist(probs, ["pl", "en"]) == ("pl", 0.3)
+    code, prob, margin = _restrict_to_whitelist(probs, ["pl", "en"])
+    assert (code, round(prob, 6), round(margin, 6)) == ("pl", 0.3, 0.2)
 
 
 def test_whitelist_restriction_keeps_top_when_it_is_allowed():
     probs = {"en": 0.9, "pl": 0.05}
-    assert _restrict_to_whitelist(probs, ["pl", "en"]) == ("en", 0.9)
+    assert _restrict_to_whitelist(probs, ["pl", "en"])[:2] == ("en", 0.9)
 
 
 def test_whitelist_restriction_returns_none_when_nothing_matches():
@@ -275,7 +279,7 @@ def test_collapse_whole_sentence_loop():
 
 def test_decoder_hypothesis_collapsed_before_agreement():
     """A doubled word must not block the agreement prefix or reach a FINAL."""
-    config = AsrConfig(step_ms=100, agreement_passes=2, end_silence_ms=300, clear_after_silence_seconds=5)
+    config = AsrConfig(step_ms=100, agreement_passes=2, end_silence_ms=300, clear_after_silence_seconds=5, language_whitelist=["pl"])
     decoder, clock, events = make_decoder(
         ["lokalne modele modele", "lokalne modele", "lokalne modele"], config=config
     )
@@ -287,7 +291,7 @@ def test_decoder_hypothesis_collapsed_before_agreement():
 
 def test_force_finalize_output_collapsed():
     """The end-silence force-finalize path applies the same collapse."""
-    config = AsrConfig(step_ms=100, agreement_passes=99, end_silence_ms=100, clear_after_silence_seconds=5)
+    config = AsrConfig(step_ms=100, agreement_passes=99, end_silence_ms=100, clear_after_silence_seconds=5, language_whitelist=["pl"])
     decoder, clock, events = make_decoder(
         ["znacznie znacznie dłuższe", "znacznie znacznie dłuższe"], config=config
     )
@@ -300,7 +304,7 @@ def test_force_finalize_output_collapsed():
 def test_cross_commit_repeat_dropped():
     """Window-tail re-decode: word "15" committed, then the next window's
     hypothesis starts with "15" again -> the second must be dropped."""
-    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=300, clear_after_silence_seconds=5)
+    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=300, clear_after_silence_seconds=5, language_whitelist=["pl"])
     decoder, clock, events = make_decoder(
         ["liczyło 15", "liczyło 15 15 tysięcy", "liczyło 15 15 tysięcy mieszkańców"],
         config=config,
@@ -314,7 +318,7 @@ def test_cross_commit_repeat_dropped():
 def test_cross_commit_guard_persists_across_utterances():
     """A stutter at an utterance boundary (next clip starting with the same
     word the previous FINAL ended with) is suppressed too."""
-    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=50, clear_after_silence_seconds=5)
+    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=50, clear_after_silence_seconds=5, language_whitelist=["pl"])
     decoder, clock, events = make_decoder(
         ["dobrze", "dobrze", "dobrze"],  # one word per decode
         config=config,
@@ -329,7 +333,7 @@ def test_cross_commit_guard_persists_across_utterances():
 def test_cross_commit_guard_keeps_genuinely_new_word():
     """Only a first new word IDENTICAL to the previous FINAL's last word is
     dropped; a genuinely new word after the same prefix survives."""
-    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=300, clear_after_silence_seconds=5)
+    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=300, clear_after_silence_seconds=5, language_whitelist=["pl"])
     decoder, clock, events = make_decoder(
         ["liczyło 15", "liczyło 15 tysięcy", "liczyło 15 tysięcy mieszkańców"],
         config=config,
@@ -341,27 +345,27 @@ def test_cross_commit_guard_keeps_genuinely_new_word():
 
 
 # ---------------------------------------------------------------------------
-# per-utterance language lock (asr.language == "auto")
+# per-utterance language selection (language_whitelist)
 # ---------------------------------------------------------------------------
 
 
-def test_forced_language_passed_to_backend():
-    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=300, language="pl")
+def test_single_entry_whitelist_is_permanent_forced():
+    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=300, language_whitelist=["pl"])
     decoder, clock, events = make_decoder(["cześć"], config=config)
     backend = decoder._backend
     feed_decode_step(decoder, clock, config)
     assert backend.language_calls == ["pl"]
-    assert backend.detect_calls == 0  # forced config never detects
+    assert backend.detect_calls == 0  # the language is known from config; detection never runs
 
 
 def test_language_detected_once_and_locked_per_utterance():
-    """auto mode: one detection per utterance, locked language passed to every
-    decode step of that utterance. Detection defers until the window holds
-    _LANGUAGE_LOCK_MIN_SECONDS of audio (short slices misdetect); decode steps
-    before the lock are skipped entirely."""
+    """Multi-entry whitelist: one detection per utterance, locked language
+    passed to every decode step of that utterance. Detection defers until the
+    window holds _LANGUAGE_LOCK_MIN_SECONDS of audio (short slices misdetect);
+    decode steps before the lock are skipped entirely."""
     from narrator.asr.streaming_decoder import _LANGUAGE_LOCK_MIN_SECONDS
 
-    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=300, language="auto")
+    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=300, language_whitelist=["pl", "en"])
     decoder, clock, events = make_decoder(["hello", "hello there", "hello there again"], config=config)
     backend = decoder._backend
     backend.detected_language = "en"
@@ -396,7 +400,7 @@ def test_language_redetected_for_new_utterance():
     burst that only reaches the detection minimum at force-finalize."""
     from narrator.asr.streaming_decoder import _LANGUAGE_LOCK_MIN_SECONDS
 
-    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=50, language="auto")
+    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=50, language_whitelist=["pl", "en"])
     decoder, clock, events = make_decoder(["hello", "cześć", "ignored"], config=config)
     backend = decoder._backend
     backend.detected_language = "en"
@@ -417,17 +421,18 @@ def test_language_redetected_for_new_utterance():
     assert backend.language_calls == ["en", "en", "pl"]
 
 
-def test_low_confidence_detection_defers_lock():
-    """A confident length but low confidence must NOT lock -- the window keeps
-    growing and detection retries (at finalize at the latest). This is the
-    guard against wrong-language captions on marginal clips."""
-    from narrator.asr.streaming_decoder import _LANGUAGE_LOCK_MIN_SECONDS
+def test_ambiguous_margin_defers_lock_then_locks_when_decisive():
+    """The margin gate: when the top two candidates are close, the lock is
+    deferred and the growing window is re-detected on later steps -- the
+    'build confidence up' behavior. Once the margin clears, the language
+    locks and decoding proceeds."""
+    from narrator.asr.streaming_decoder import _LANGUAGE_LOCK_MIN_SECONDS, _LANGUAGE_MIN_MARGIN
 
-    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=300, language="auto")
+    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=300, language_whitelist=["pl", "en"])
     decoder, clock, events = make_decoder(["garbage"], config=config)
     backend = decoder._backend
-    backend.detected_language = "ru"
-    backend.detected_probability = 0.3  # below threshold
+    backend.detected_language = "pl"
+    backend.detected_margin = _LANGUAGE_MIN_MARGIN / 2  # ambiguous
 
     n_frames = int(_LANGUAGE_LOCK_MIN_SECONDS * 1000 / 30) + 2
     decoder._vad.level = 1.0
@@ -436,21 +441,21 @@ def test_low_confidence_detection_defers_lock():
         decoder.feed(FRAME, run_decode_step=False)
     decoder.tick()
     assert backend.detect_calls == 1
-    assert decoder._locked_language is None  # not locked
-    assert backend.language_calls == []  # nothing decoded in a wrong language
+    assert decoder._locked_language is None  # not locked: margin too narrow
+    assert backend.language_calls == []  # nothing decoded in an unverified language
 
-    # Confidence recovers -> next step locks and decodes.
-    backend.detected_probability = 0.98
+    # More audio -> decisive margin -> next step locks and decodes.
+    backend.detected_margin = 0.9
     feed_decode_step(decoder, clock, config)
-    assert decoder._locked_language == "ru"
-    assert backend.language_calls == ["ru"]
+    assert decoder._locked_language == "pl"
+    assert backend.language_calls == ["pl"]
 
 
 def test_detection_error_retries_without_crashing():
     """A detection failure must not crash the loop nor lock a language."""
     from narrator.asr.streaming_decoder import _LANGUAGE_LOCK_MIN_SECONDS
 
-    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=50, language="auto")
+    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=50, language_whitelist=["pl", "en"])
     decoder, clock, events = make_decoder(["cześć", "ignored"], config=config)
     backend = decoder._backend
     backend.detect_fails = True
@@ -468,7 +473,7 @@ def test_detection_error_retries_without_crashing():
 
 
 # ---------------------------------------------------------------------------
-# dynamic language switching (forced base + language_switch_threshold > 0)
+# per-utterance switching (multi-entry whitelist) and finalize hysteresis
 # ---------------------------------------------------------------------------
 
 
@@ -479,113 +484,54 @@ def run_utterance(decoder, clock, config):
     feed_silence(decoder, 2)
 
 
-def test_dynamic_switch_after_threshold_consecutive_detections():
-    """The user's scenario: default pl; English utterances are first captioned
-    in Polish (wrong but immediate); after `language_switch_threshold`
-    consecutive confident English detections the active language flips to en."""
+def test_switch_happens_immediately_on_decisive_detection():
+    """With a multi-entry whitelist the best allowed language wins per
+    utterance, immediately: the old threshold-based switch (N consecutive
+    detections before flipping) is replaced by the margin gate -- a decisive
+    detection IS the switch, and a language returns the moment it's detected
+    again."""
     config = AsrConfig(
         step_ms=100,
         agreement_passes=1,
         end_silence_ms=50,
-        language="pl",
-        language_switch_threshold=2,
+        language_whitelist=["pl", "en"],
         clear_after_silence_seconds=5,
     )
     decoder, clock, events = make_decoder(
-        ["witajcie", "headsets", "headsets", "switch", "witajcie z powrotem"], config=config
+        ["witajcie", "headsets", "witajcie z powrotem"], config=config
     )
     backend = decoder._backend
-    # Speaker is Polish; every detection says pl for the first utterance.
     backend.detected_language = "pl"
-    run_utterance(decoder, clock, config)  # utterance 1: pl detected, streak 0
-    assert decoder._active_language == "pl"
+    run_utterance(decoder, clock, config)  # utterance 1: pl
+    # In multi-entry mode the micro-utterances here (one 30ms frame) defer
+    # the lock to finalize, so each utterance decodes exactly once.
+    assert backend.language_calls == ["pl"]
 
-    # Speaker switches to English: each finalize detects en confidently.
     backend.detected_language = "en"
-    run_utterance(decoder, clock, config)  # streak 1 -> still pl
-    assert decoder._active_language == "pl"
-    assert backend.language_calls[-2:] == ["pl", "pl"]
-    run_utterance(decoder, clock, config)  # streak 2 -> switch to en
-    assert decoder._active_language == "en"
-    # The switch applies from the NEXT utterance: the threshold-crossing
-    # utterance itself still decoded in Polish (detection runs after its
-    # finalize decode).
-    assert backend.language_calls[-2:] == ["pl", "pl"]
-    # The NEXT utterance decodes in English.
-    run_utterance(decoder, clock, config)
-    assert backend.language_calls[-2:] == ["en", "en"]
+    run_utterance(decoder, clock, config)  # utterance 2: en immediately
+    assert backend.language_calls[-1:] == ["en"]
 
-    # Polish returns: two consecutive pl detections flip back.
     backend.detected_language = "pl"
-    run_utterance(decoder, clock, config)
-    run_utterance(decoder, clock, config)
-    assert decoder._active_language == "pl"
+    run_utterance(decoder, clock, config)  # utterance 3: back to pl immediately
+    assert backend.language_calls[-1:] == ["pl"]
 
 
-def test_dynamic_detection_runs_after_finalize_decode():
-    """Dynamic-mode detection is off the finalize latency path: at finalize the
-    decode emits FIRST and the streak detection runs AFTER it (measured: the
-    detection's encoder pass costs ~445ms on large-v3, constant in slice
-    length). Its result can only affect the NEXT utterance, so running it
-    before the decode would be pure added latency.
-    """
+def test_ambiguous_finalize_keeps_previous_utterance_language():
+    """Hysteresis at finalize: if the margin never cleared, the previous
+    utterance's language is kept -- a wrong-but-consistent caption beats a
+    coin flip that mixes languages mid-speech."""
     config = AsrConfig(
         step_ms=100, agreement_passes=1, end_silence_ms=50,
-        language="pl", language_switch_threshold=2, clear_after_silence_seconds=5,
+        language_whitelist=["pl", "en"], clear_after_silence_seconds=5,
     )
-    decoder, clock, events = make_decoder(["headsets"], config=config)
+    decoder, clock, events = make_decoder(["a", "b", "c"], config=config)
     backend = decoder._backend
     backend.detected_language = "en"
-    order: list[str] = []
-    real_detect = backend.detect_language
-    real_transcribe = backend.transcribe
+    run_utterance(decoder, clock, config)  # decisive en
+    assert decoder._last_utterance_language == "en"
 
-    def detect(audio):
-        order.append("detect")
-        return real_detect(audio)
-
-    def transcribe(audio, language=None):
-        order.append("decode")
-        return real_transcribe(audio, language=language)
-
-    backend.detect_language = detect
-    backend.transcribe = transcribe
-    run_utterance(decoder, clock, config)
-    # One decode step mid-speech, the finalize decode, then the detection.
-    assert order == ["decode", "decode", "detect"]
-
-
-def test_dynamic_inconclusive_detection_does_not_reset_streak():
-    """A low-confidence detection is ignored entirely: it neither advances nor
-    resets the streak, so noise between foreign utterances can't stall the switch."""
-    config = AsrConfig(
-        step_ms=100, agreement_passes=1, end_silence_ms=50,
-        language="pl", language_switch_threshold=2, clear_after_silence_seconds=5,
-    )
-    decoder, clock, events = make_decoder(["a", "b", "c", "d"], config=config)
-    backend = decoder._backend
-    backend.detected_language = "en"
-    backend.detected_probability = 0.2  # inconclusive
-    run_utterance(decoder, clock, config)
-    run_utterance(decoder, clock, config)
-    assert decoder._active_language == "pl"
-    assert decoder._language_streak == 0  # ignored, not reset-by-pl
-
-    backend.detected_probability = 0.99
-    run_utterance(decoder, clock, config)
-    assert decoder._language_streak == 1  # counting resumed cleanly
-
-
-def test_dynamic_zero_threshold_disables_switching():
-    config = AsrConfig(
-        step_ms=100, agreement_passes=1, end_silence_ms=50,
-        language="pl", language_switch_threshold=0, clear_after_silence_seconds=5,
-    )
-    decoder, clock, events = make_decoder(["a", "b", "c", "d"], config=config)
-    backend = decoder._backend
-    backend.detected_language = "en"
-    run_utterance(decoder, clock, config)
-    run_utterance(decoder, clock, config)
-    run_utterance(decoder, clock, config)
-    assert decoder._active_language == "pl"
-    assert backend.detect_calls == 0  # detection never even runs
+    backend.detected_margin = 0.01  # ambiguous from here on
+    run_utterance(decoder, clock, config)  # lock deferred; finalize keeps en
+    assert backend.language_calls[-1:] == ["en"]
+    run_utterance(decoder, clock, config)  # still ambiguous: en again
+    assert backend.language_calls[-1:] == ["en"]

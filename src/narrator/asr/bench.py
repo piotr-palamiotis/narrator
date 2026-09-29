@@ -76,7 +76,7 @@ def _bench_model(model: str, device: str, windows_s: list[float]) -> dict:
     from narrator.asr.backend import WhisperBackend, audio_ctx_for_seconds
     from narrator.config.schema import AsrConfig
 
-    config = AsrConfig(model=model, device=device, language="pl")
+    config = AsrConfig(model=model, device=device, language_whitelist=["pl"])
     backend = WhisperBackend(config)
 
     audio = _load_real_audio()

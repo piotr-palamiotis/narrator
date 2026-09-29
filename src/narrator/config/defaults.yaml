@@ -8,18 +8,11 @@ audio:
 
 asr:
   model: "large-v3"
-  # Dynamic language switching: "pl" is the default caption language; when
-  # detection reports a different language confidently at this many
-  # consecutive utterance-finalizes, the active language switches (and
-  # switches back when Polish returns). 0 = never switch; "auto" = follow
-  # the speaker verbatim per utterance instead (no default language).
-  # Note: whisper transcribes; it has no X->Polish translation.
-  language: "pl"
-  language_switch_threshold: 2
-  # Optional: restrict the languages the decoder may use (ISO codes). Empty =
-  # whisper decides freely. With a whitelist, detection re-argmaxes over the
-  # listed set, so a pl+en venue can never produce German. The configured
-  # `language` (if not "auto") is always an implicit member.
+  # The language control. Empty = auto-detect any language, per utterance.
+  # With entries, each utterance is decoded in the best-matching listed
+  # language (one entry = that language permanently). Editable in the GUI
+  # (Audio/ASR tab, dropdown + Add / list + Remove). Whisper transcribes; it
+  # has no X->Polish translation.
   language_whitelist: []
   device: auto
   # Which Vulkan GPU to use when several are present. "auto" prefers the
