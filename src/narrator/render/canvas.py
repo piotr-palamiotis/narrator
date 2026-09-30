@@ -52,6 +52,15 @@ class CaptionRenderer:
     def append_final_text(self, text: str) -> None:
         self._buffer.append_final_text(text)
 
+    def prune_history(self) -> int:
+        """Drop committed caption lines that can no longer be displayed under
+        the current layout, without touching what is on screen. Used by the
+        ASR worker's silence-timeout CLEAR event -- the display keeps showing
+        the last captions; only off-screen history is trimmed. See
+        CaptionBuffer.prune_history.
+        """
+        return self._buffer.prune_history()
+
     def clear(self) -> None:
         self._buffer.clear()
         self._partial_preview = ""

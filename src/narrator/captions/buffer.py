@@ -90,6 +90,31 @@ class CaptionBuffer:
             new_committed = new_committed[-self._history_cap :]
         return (new_committed, last)
 
+    def prune_history(self) -> int:
+        """Drop committed lines that are no longer displayable, keeping what is
+        currently on screen exactly as it is.
+
+        `visible_lines()` shows the last `max_lines` entries, so any committed
+        line beyond that count is already invisible under the current layout
+        settings and can be removed without disturbing the display. The pending
+        tail is never touched -- it is part of the live caption. Returns the
+        number of committed lines dropped (0 when there was nothing to prune).
+
+        This is what the ASR worker's silence-timeout CLEAR event routes to, so
+        the periodic screen-clear after `clear_after_silence_seconds` only
+        trims memory, never the visible lower-third. A true screen wipe
+        (Ctrl+N, the GUI's Clear button) still calls `clear()`.
+        """
+        committed, pending = self._state
+        # The pending tail occupies a display slot of its own, so fewer
+        # committed lines are visible while it exists.
+        visible_committed = max(self._max_lines - (1 if pending else 0), 0)
+        excess = len(committed) - visible_committed
+        if excess <= 0:
+            return 0
+        self._state = (committed[excess:], pending)
+        return excess
+
     def clear(self) -> None:
         self._state = ([], "")
 

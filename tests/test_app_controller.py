@@ -7,12 +7,17 @@ class FakeRenderer:
         self.final_texts: list[str] = []
         self.partial_preview: str | None = None
         self.cleared = False
+        self.pruned = False
 
     def append_final_text(self, text: str) -> None:
         self.final_texts.append(text)
 
     def set_partial_preview(self, text: str) -> None:
         self.partial_preview = text
+
+    def prune_history(self) -> int:
+        self.pruned = True
+        return 0
 
     def clear(self) -> None:
         self.cleared = True
@@ -87,6 +92,19 @@ def test_clear_captions_works_in_either_mode():
     controller.clear_captions()
 
     assert renderer.cleared is True
+
+
+def test_asr_clear_event_prunes_history_instead_of_wiping_screen():
+    """The ASR worker's silence-timeout CLEAR must not blank the lower-third.
+    It only prunes off-screen history; the wipe path stays operator-only
+    (Ctrl+N / the GUI Clear button)."""
+    controller, renderer = make_controller()
+    controller._handle_caption_event(CaptionEvent(CaptionEventType.FINAL, "hello"))
+    controller._handle_caption_event(CaptionEvent(CaptionEventType.CLEAR))
+
+    assert renderer.pruned is True
+    assert renderer.cleared is False
+    assert renderer.final_texts == ["hello"]
 
 
 def test_set_caption_mode_rejects_unknown_mode():

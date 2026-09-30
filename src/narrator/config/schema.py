@@ -91,6 +91,10 @@ class AsrConfig(BaseModel):
     agreement_passes: int = Field(default=2, ge=1)
     end_silence_ms: int = Field(default=650, gt=0)
     max_context_seconds: float = Field(default=20.0, gt=0)
+    # After this much continuous silence, the ASR worker emits a CLEAR event.
+    # CLEAR prunes only off-screen caption history -- the visible lower-third
+    # stays until the operator clears it (Ctrl+N / the GUI Clear button) or
+    # enough new speech scrolls it out under layout.max_lines.
     clear_after_silence_seconds: float = Field(default=8.0, gt=0)
     show_partial_captions: bool = False
 

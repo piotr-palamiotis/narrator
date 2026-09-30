@@ -46,6 +46,44 @@ def test_caption_buffer_rolls_last_n_lines():
     assert len(visible) <= 2
 
 
+def test_caption_buffer_prune_history_keeps_visible_lines():
+    """Pruning drops only lines beyond max_lines; everything currently visible
+    (committed lines within max_lines + pending tail) is byte-identical after.
+    """
+    buf = CaptionBuffer(max_lines=2)
+    buf.configure_geometry("font", 10, box_width=5, measure=FixedWidthMeasure())
+    buf.append_final_text("aa bb cc dd")  # wraps to ["aa bb", "cc dd"]
+    assert buf.visible_lines() == ["aa bb", "cc dd"]
+
+    buf.append_final_text("ee ff")  # becomes ["aa bb", "cc dd", "ee ff"]
+    assert buf.visible_lines() == ["cc dd", "ee ff"]
+
+    dropped = buf.prune_history()
+
+    assert dropped == 1  # "aa bb" was off-screen, "cc dd"/"ee ff" kept
+    assert buf.visible_lines() == ["cc dd", "ee ff"]
+
+
+def test_caption_buffer_prune_history_noop_when_nothing_offscreen():
+    buf = CaptionBuffer(max_lines=5)
+    buf.configure_geometry("font", 10, box_width=50, measure=FixedWidthMeasure())
+    buf.append_final_text("hello world")
+
+    assert buf.prune_history() == 0
+    assert buf.visible_lines() == ["hello world"]
+
+
+def test_caption_buffer_prune_history_keeps_pending_tail():
+    """The pending tail is part of the live caption and is never pruned."""
+    buf = CaptionBuffer(max_lines=2)
+    buf.configure_geometry("font", 10, box_width=4, measure=FixedWidthMeasure())
+    buf.append_final_text("aa bb cc")  # ["aa", "bb", "cc"] -> pending "cc"
+    assert buf.visible_lines() == ["bb", "cc"]
+
+    assert buf.prune_history() == 1  # "aa" was off-screen
+    assert buf.visible_lines() == ["bb", "cc"]
+
+
 def test_caption_buffer_clear():
     buf = CaptionBuffer(max_lines=2)
     buf.configure_geometry("font", 10, box_width=10, measure=FixedWidthMeasure())

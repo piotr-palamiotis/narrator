@@ -24,6 +24,9 @@ asr:
   agreement_passes: 2
   end_silence_ms: 650
   max_context_seconds: 20
+  # After this much silence, off-screen caption history is pruned. The
+  # visible lines are NOT cleared -- they stay until new speech scrolls them
+  # out or the operator clears them (Ctrl+N / the GUI Clear button).
   clear_after_silence_seconds: 8
   show_partial_captions: false
 
