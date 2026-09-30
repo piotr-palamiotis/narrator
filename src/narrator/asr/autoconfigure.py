@@ -257,7 +257,11 @@ def apply_decision(config_path: Path, decision: Decision) -> "RootConfig":
     updated_asr = config.asr.model_copy(
         update={
             "model": decision.model,
-            "device": decision.device,
+            # Coerce to the field's enum: model_copy(update=...) bypasses
+            # validation, so the raw str would leave AsrConfig.device holding
+            # a plain string and every later model_dump would warn
+            # (PydanticSerializationUnexpectedValue: Expected `enum`).
+            "device": AsrDevice(decision.device),
             "step_ms": decision.step_ms,
         }
     )
