@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import tkinter as tk
+from collections.abc import Callable
 from pathlib import Path
 from tkinter import colorchooser, ttk
 
@@ -15,6 +16,12 @@ from narrator.config.schema import parse_rgba
 # net -- see sv_ttk's dark.tcl "colors" array for where these came from).
 _FONT_PICKER_BG = "#1c1c1c"
 _FONT_PICKER_FG = "#fafafa"
+
+# Standard width (in characters) for every text-entry-style control -- Entry,
+# Combobox, and the language listbox -- so they all line up into one column
+# across every tab. Numeric spinboxes stay compact on purpose; they hold at
+# most five digits and stretching them to match would just add dead space.
+CONTROL_WIDTH = 27
 
 
 def scrollable_tab(notebook: ttk.Notebook, text: str) -> ttk.Frame:
@@ -128,7 +135,7 @@ def float_field(parent: tk.Widget, row: int, label: str, initial: float, from_: 
     return var
 
 
-def text_field(parent: tk.Widget, row: int, label: str, initial: str, width: int = 30) -> tk.StringVar:
+def text_field(parent: tk.Widget, row: int, label: str, initial: str, width: int = CONTROL_WIDTH) -> tk.StringVar:
     labeled_row(parent, row, label)
     var = tk.StringVar(value=initial)
     ttk.Entry(parent, textvariable=var, width=width).grid(row=row, column=1, sticky="w", padx=4, pady=2)
@@ -138,10 +145,79 @@ def text_field(parent: tk.Widget, row: int, label: str, initial: str, width: int
 def dropdown_field(parent: tk.Widget, row: int, label: str, initial: str, options: list[str]) -> tk.StringVar:
     labeled_row(parent, row, label)
     var = tk.StringVar(value=initial)
-    ttk.Combobox(parent, textvariable=var, values=options, state="readonly", width=27).grid(
+    ttk.Combobox(parent, textvariable=var, values=options, state="readonly", width=CONTROL_WIDTH).grid(
         row=row, column=1, sticky="w", padx=4, pady=2
     )
     return var
+
+
+class MicLevelMeter(tk.Canvas):
+    """A slim horizontal input-level bar (Tk canvas, no extra dependency).
+
+    `get_level` is polled on the Tk thread (a single-float read off the
+    capture callback's shared attribute is atomic under the GIL). There is
+    deliberately no decay/peak-hold logic: a raw RMS level that flickers
+    with the signal is exactly the "my mic is alive" confirmation this
+    meter is for. The scale is log-ish (x**1/3) because raw RMS spends most
+    of normal speech in the bottom tenth of a linear bar.
+    """
+
+    _HEIGHT = 10
+    _BG = "#2a2a2a"
+    _FILL = "#3fb950"  # green; turns red only when input is clipping
+    _CLIP = "#e06c75"
+    _CLIP_LEVEL = 0.98
+
+    def __init__(self, parent: tk.Widget, get_level: Callable[[], float], width: int = 200) -> None:
+        super().__init__(
+            parent,
+            width=width,
+            height=self._HEIGHT,
+            bg=self._BG,
+            highlightthickness=1,
+            highlightbackground="#4a4a4a",
+            bd=0,
+        )
+        self._get_level = get_level
+        self._bar = self.create_rectangle(0, 0, 0, self._HEIGHT, fill=self._FILL, width=0)
+        self._width_matched = False
+
+    def refresh(self) -> None:
+        if not self._width_matched:
+            self._match_sibling_width()
+        level = max(0.0, min(1.0, self._get_level()))
+        scaled = level ** (1 / 3)
+        w = self.winfo_width() or int(self["width"])
+        self.coords(self._bar, 0, 0, round(w * scaled), self._HEIGHT)
+        self.itemconfigure(self._bar, fill=self._CLIP if level >= self._CLIP_LEVEL else self._FILL)
+
+    def _match_sibling_width(self) -> None:
+        """Size the meter to exactly match the form's text controls.
+
+        Tk sizes Entry/Combobox in characters but a Canvas in pixels, so the
+        match can't be hardcoded -- it's taken from the widest entry-style
+        sibling's requested pixel width once geometry exists (before the
+        window is mapped, winfo reports placeholder sizes; the caller's poll
+        loop simply retries until then).
+        """
+        for child in self.master.winfo_children():
+            if child is self or not isinstance(child, (ttk.Entry, ttk.Combobox)):
+                continue
+            if not child.winfo_ismapped():
+                return  # geometry not computed yet; retry on the next tick
+            req = child.winfo_reqwidth()
+            if req > 1:
+                self.configure(width=req)
+                self._width_matched = True
+                return
+
+
+def mic_level_field(parent: tk.Widget, get_level: Callable[[], float] | None = None) -> MicLevelMeter:
+    """Creates a MicLevelMeter in a form-row position; `get_level` is wired
+    up by the caller (gui/app.py) after construction, when it knows which
+    controller attribute to poll.
+    """
+    return MicLevelMeter(parent, get_level or (lambda: 0.0))
 
 
 def font_picker_field(

@@ -7,7 +7,11 @@ app_controller.AppController._on_config_changed) -- the GUI never mutates
 in-memory state directly, so headless and GUI-driven operation stay
 behaviorally identical (see the plan's "Config Schema & Operator Control
 Surface" rationale).
-"""
+
+Ctrl+N (bound at the root window level, see _CLEAR_SHORTCUT) clears the
+current captions at any time; the Audio/ASR tab also shows a live mic input
+level meter and the ASR worker's Active/Inactive state next to the device
+picker."""
 from __future__ import annotations
 
 import logging
@@ -40,10 +44,12 @@ from narrator.gui.tray import start_tray_icon
 from narrator.gui.widgets import (
     checkbox_field,
     compact_percent_field,
+    CONTROL_WIDTH,
     dropdown_field,
     float_field,
     font_picker_field,
     int_field,
+    mic_level_field,
     percent_field,
     rgba_color_field,
     scrollable_tab,
@@ -54,7 +60,7 @@ logger = logging.getLogger(__name__)
 
 # Bound at the root window level (bind_all) so it works no matter which
 # widget currently has focus, including the manual caption entry.
-_CLEAR_SHORTCUT = "<Control-l>"
+_CLEAR_SHORTCUT = "<Control-n>"
 
 # Field attribute names whose value affects the rendered canvas -- edits to
 # these trigger a debounced live preview refresh (in addition to the autosave
@@ -79,6 +85,26 @@ _AUTOSAVE_ONLY_FIELD_NAMES = [
 ]
 
 _AUTOSAVE_DEBOUNCE_MS = 800
+
+
+def model_dropdown_options(current: str) -> list[str]:
+    """Options for the Whisper model dropdown: every model name pywhispercpp
+    can download on demand (its canonical list), plus any model already in
+    the local cache (resolvable without a download), so a custom name or a
+    direct path to a ggml file -- which config also accepts -- stays
+    selectable instead of being silently lost on the next autosave. The
+    dropdown stays editable (see dropdown_field) for the same reason.
+    """
+    try:
+        from pywhispercpp.constants import AVAILABLE_MODELS, MODELS_DIR
+
+        cached = [p.stem.removeprefix("ggml-") for p in sorted(Path(MODELS_DIR).glob("*.bin"))]
+        options = sorted({*AVAILABLE_MODELS, *cached})
+    except Exception:  # pragma: no cover - only on broken installs
+        options = ["large-v3", "medium", "small", "base", "tiny"]
+    if current and current not in options:
+        options.insert(0, current)
+    return options
 
 
 def final_whitelist_display(codes: list[str]) -> str:
@@ -141,11 +167,6 @@ class NarratorGUI:
         self._build_style_tab(notebook)
         self._build_audio_asr_tab(notebook)
         self._build_ndi_tab(notebook)
-
-        button_bar = ttk.Frame(bottom)
-        button_bar.pack(fill="x")
-        self.status_var = tk.StringVar(value="ASR backend: (starting...)")
-        ttk.Label(button_bar, textvariable=self.status_var).pack(side="right")
 
         for name in _PREVIEW_FIELD_NAMES + _AUTOSAVE_ONLY_FIELD_NAMES:
             getattr(self, name).trace_add("write", self._on_field_changed)
@@ -272,25 +293,34 @@ class NarratorGUI:
         self.root.after(400, self._poll_preview_text)
 
     def _poll_status(self) -> None:
-        backend = getattr(self.controller, "resolved_asr_backend", "unresolved")
-        self.status_var.set(f"ASR backend: {backend}")
+        """Keeps the ASR worker's Active/Inactive indicator (next to the ASR
+        device picker on the Audio/ASR tab) current. "Active" means a live
+        worker *process* exists and hasn't exited.
+        """
+        process = getattr(self.controller, "_asr_process", None)
+        active = process is not None and process.is_alive()
+        self.asr_status_var.set("● Active" if active else "○ Inactive")
+        self.asr_status_label.configure(foreground="pale green" if active else "#e06c75")
         self.root.after(1000, self._poll_status)
+
+    def _current_mic_level(self) -> float:
+        """Latest RMS level from the live mic capture, or 0 when there is
+        none (headless pieces, capture not started yet, or mid-restart --
+        _restart_audio_capture swaps the MicCapture object itself, hence the
+        attribute read instead of caching the instance).
+        """
+        mic = getattr(self.controller, "_mic", None)
+        return mic.level if mic is not None else 0.0
+
+    def _poll_mic_level(self) -> None:
+        self.mic_level.refresh()
+        self.root.after(100, self._poll_mic_level)
 
     def _build_canvas_tab(self, notebook: ttk.Notebook) -> None:
         tab = scrollable_tab(notebook, "Canvas")
         c = self.config.canvas
         self.canvas_width = int_field(tab, 0, "Width (px)", c.width_px, 1, 8000)
         self.canvas_height = int_field(tab, 1, "Height (px)", c.height_px, 1, 8000)
-        ttk.Label(
-            tab,
-            text="Note: width/height changes restart the NDI stream (briefly interrupting it) to apply.",
-            foreground="gray",
-        ).grid(row=2, column=0, columnspan=4, sticky="w", padx=4, pady=(8, 2))
-        ttk.Label(
-            tab,
-            text="Background color is set on the Style tab.",
-            foreground="gray",
-        ).grid(row=3, column=0, columnspan=4, sticky="w", padx=4, pady=(0, 2))
 
     def _build_layout_tab(self, notebook: ttk.Notebook) -> None:
         tab = scrollable_tab(notebook, "Layout")
@@ -300,12 +330,6 @@ class NarratorGUI:
         self.text_align = dropdown_field(tab, 2, "Text align", layout.text_align.value, ["left", "center", "right"])
         self.vertical_align = dropdown_field(
             tab, 3, "Vertical align", layout.vertical_align_within_box.value, ["top", "center", "bottom"]
-        )
-        ttk.Label(tab, text="Font size is never set directly -- it's derived from these values.", foreground="gray").grid(
-            row=4, column=0, columnspan=4, sticky="w", padx=4, pady=(8, 2)
-        )
-        ttk.Label(tab, text="Margins are set around the preview canvas above.", foreground="gray").grid(
-            row=5, column=0, columnspan=4, sticky="w", padx=4, pady=(0, 2)
         )
 
     def _build_style_tab(self, notebook: ttk.Notebook) -> None:
@@ -388,13 +412,23 @@ class NarratorGUI:
             device_names = ["default"]
         self.audio_device = dropdown_field(auto, 0, "Microphone", audio.device, device_names)
 
+        # A live input-level meter: the fastest, friendliest way to answer
+        # "is my mic even on?" without leaving the settings window.
+        ttk.Label(auto, text="Input level").grid(row=1, column=0, sticky="w", padx=4, pady=2)
+        self.mic_level = mic_level_field(auto, get_level=self._current_mic_level)
+        self.mic_level.grid(row=1, column=1, sticky="w", padx=4, pady=2)
+        self._poll_mic_level()
+
+        ttk.Separator(auto).grid(row=3, column=0, columnspan=4, sticky="ew", pady=6)
         asr = self.config.asr
-        ttk.Separator(auto).grid(row=1, column=0, columnspan=4, sticky="ew", pady=6)
-        self.asr_model = text_field(auto, 2, "Whisper model", asr.model, width=30)
-        self.asr_device = dropdown_field(auto, 3, "ASR device", asr.device.value, ["auto", "vulkan", "cpu"])
-        self.asr_show_partial = checkbox_field(auto, 4, "Show partial (unconfirmed) captions", asr.show_partial_captions)
-        self._build_language_whitelist_editor(auto, start_row=5)
-        ttk.Label(auto, text="Audio/ASR model+device changes restart the ASR worker automatically.", foreground="gray").grid(
+        self.asr_model = dropdown_field(auto, 4, "Whisper model", asr.model, model_dropdown_options(asr.model))
+        self.asr_device = dropdown_field(auto, 5, "ASR device", asr.device.value, ["auto", "vulkan", "cpu"])
+        self.asr_status_var = tk.StringVar(value="○ Inactive")
+        self.asr_status_label = ttk.Label(auto, textvariable=self.asr_status_var, foreground="gray")
+        self.asr_status_label.grid(row=5, column=2, columnspan=2, sticky="w", padx=4)
+        self.asr_show_partial = checkbox_field(auto, 6, "Show partial captions", asr.show_partial_captions)
+        self._build_language_whitelist_editor(auto, start_row=7)
+        ttk.Label(auto, text="Ctrl+N clears the captions at any time.", foreground="gray").grid(
             row=12, column=0, columnspan=4, sticky="w", padx=4, pady=(8, 2)
         )
 
@@ -402,7 +436,7 @@ class NarratorGUI:
         self._manual_settings_frame.grid(row=1, column=0, sticky="ew")
         ttk.Label(
             self._manual_settings_frame,
-            text="Type a caption and press Enter to send it.",
+            text="Type a caption, press Enter to send.",
             foreground="gray",
         ).pack(anchor="w", padx=4, pady=(0, 6))
         # A plain single-line Entry can't hold a newline no matter what the
@@ -410,8 +444,8 @@ class NarratorGUI:
         # free -- Enter is bound below to submit the line instead of doing
         # nothing (Entry's default behavior for Return).
         self.manual_entry_var = tk.StringVar()
-        self.manual_entry = ttk.Entry(self._manual_settings_frame, textvariable=self.manual_entry_var)
-        self.manual_entry.pack(fill="x", padx=4)
+        self.manual_entry = ttk.Entry(self._manual_settings_frame, textvariable=self.manual_entry_var, width=CONTROL_WIDTH)
+        self.manual_entry.pack(padx=4, anchor="w")
         self.manual_entry.bind("<Return>", self._on_manual_submit)
         self._manual_settings_frame.grid_remove()
 
@@ -425,7 +459,7 @@ class NarratorGUI:
         row = start_row
         ttk.Separator(parent).grid(row=row, column=0, columnspan=4, sticky="ew", pady=6)
         row += 1
-        ttk.Label(parent, text="Languages (empty = auto-detect; with entries, each utterance is decoded in the best-matching listed language)").grid(
+        ttk.Label(parent, text="Languages").grid(
             row=row, column=0, columnspan=2, sticky="w", padx=4, pady=2
         )
         row += 1
@@ -439,7 +473,7 @@ class NarratorGUI:
         add_var = tk.StringVar()
         add_dropdown = ttk.Combobox(picker_frame, textvariable=add_var, values=[
             language_display_name(code) for code in codes
-        ], state="readonly", width=24)
+        ], state="readonly", width=CONTROL_WIDTH)
         add_dropdown.pack(side="left")
         self._whitelist_code_by_label = {
             language_display_name(code): code for code in codes
@@ -460,7 +494,7 @@ class NarratorGUI:
         row += 1
         list_frame = ttk.Frame(parent)
         list_frame.grid(row=row, column=0, columnspan=4, sticky="w", padx=4, pady=(2, 2))
-        self._whitelist_listbox = tk.Listbox(list_frame, height=3, width=34, selectmode="browse")
+        self._whitelist_listbox = tk.Listbox(list_frame, height=3, width=CONTROL_WIDTH, selectmode="browse")
         self._whitelist_listbox.pack(side="left")
 
         def _remove() -> None:
@@ -486,11 +520,8 @@ class NarratorGUI:
     def _build_ndi_tab(self, notebook: ttk.Notebook) -> None:
         tab = scrollable_tab(notebook, "NDI")
         ndi = self.config.ndi
-        self.ndi_name = text_field(tab, 0, "NDI source name", ndi.source_name, width=30)
+        self.ndi_name = text_field(tab, 0, "NDI source name", ndi.source_name)
         self.ndi_fps = float_field(tab, 1, "Frame rate (fps)", ndi.fps, 1.0, 120.0, 1.0)
-        ttk.Label(tab, text="Changes restart the NDI stream automatically (briefly interrupting it).", foreground="gray").grid(
-            row=2, column=0, columnspan=4, sticky="w", padx=4, pady=(8, 2)
-        )
 
     def _build_config_from_form(self) -> RootConfig:
         return RootConfig(

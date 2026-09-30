@@ -44,6 +44,11 @@ class MicCapture:
         self._queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=max_queued_frames)
         self._stream: sd.InputStream | None = None
         self._native_rate: int | None = None
+        # Loudness of the most recent frame (RMS, 0..~1), read by the GUI's
+        # mic level meter. Published from the PortAudio callback thread; the
+        # single-float write is atomic under the GIL, so pollers neither lock
+        # nor stall the callback.
+        self.level: float = 0.0
 
     def start(self) -> None:
         blocksize = int(self._target_rate * self._frame_ms / 1000)
@@ -81,6 +86,7 @@ class MicCapture:
         mono = indata[:, 0].copy()
         if self._native_rate != self._target_rate:
             mono = resample_poly(mono, self._target_rate, self._native_rate).astype(np.float32)
+        self.level = float(np.sqrt(np.mean(mono**2)))
         try:
             self._queue.put_nowait(mono)
         except queue.Full:
@@ -109,6 +115,7 @@ class MicCapture:
                 continue
 
     def stop(self) -> None:
+        self.level = 0.0  # the meter must not freeze at the last live value
         if self._stream is not None:
             self._stream.stop()
             self._stream.close()
