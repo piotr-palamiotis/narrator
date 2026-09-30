@@ -91,12 +91,36 @@ class AsrConfig(BaseModel):
     agreement_passes: int = Field(default=2, ge=1)
     end_silence_ms: int = Field(default=650, gt=0)
     max_context_seconds: float = Field(default=20.0, gt=0)
-    # After this much continuous silence, the ASR worker emits a CLEAR event.
-    # CLEAR prunes only off-screen caption history -- the visible lower-third
-    # stays until the operator clears it (Ctrl+N / the GUI Clear button) or
-    # enough new speech scrolls it out under layout.max_lines.
-    clear_after_silence_seconds: float = Field(default=8.0, gt=0)
+    # After this much continuous silence, the ASR worker emits a CLEAR event,
+    # which prunes only OFF-SCREEN caption history. The visible lower-third
+    # stays until the operator clears it (Ctrl+N / the GUI Clear button), a
+    # wipe_screen_after_silence_seconds lull elapses, or enough new speech
+    # scrolls it out under layout.max_lines.
+    prune_history_after_silence_seconds: float = Field(default=8.0, gt=0)
+    # After this much silence (and only this much -- a long lull where stale
+    # captions would misattribute to unrelated new speech), the worker emits a
+    # WIPE event: a true screen clear. 0 disables it entirely, which is the
+    # default -- the operator decides when the screen goes blank.
+    wipe_screen_after_silence_seconds: float = Field(default=0.0, ge=0)
     show_partial_captions: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_clear_after_silence(cls, data):
+        """Accept the retired `clear_after_silence_seconds` key.
+
+        That knob's meaning changed when CLEAR stopped wiping the screen
+        (it now only prunes off-screen history), so it was renamed to make
+        the behavior readable from the config file. Old keys are still
+        honored -- mapped onto the prune knob -- so existing config.yaml
+        files keep their value across the upgrade instead of silently
+        reverting to the default. Explicit new keys always win over the old
+        one (setdefault).
+        """
+        if isinstance(data, dict) and "clear_after_silence_seconds" in data:
+            old_value = data.pop("clear_after_silence_seconds")
+            data.setdefault("prune_history_after_silence_seconds", old_value)
+        return data
 
     @model_validator(mode="after")
     def _check_language_whitelist(self) -> "AsrConfig":

@@ -340,14 +340,21 @@ class AppController:
             self._renderer.append_final_text(event.text)
         elif event.type == CaptionEventType.PARTIAL:
             self._renderer.set_partial_preview(event.text)
+        elif event.type == CaptionEventType.WIPE:
+            # True screen clear after a long silence lull (the operator-
+            # equivalent path -- same renderer method as clear_captions).
+            self._renderer.clear()
         elif event.type == CaptionEventType.CLEAR:
-            # The ASR worker emits CLEAR only after clear_after_silence_seconds
-            # of no speech. That timeout must never wipe what the audience is
-            # currently reading: CLEAR only prunes caption lines that are no
-            # longer visible under the current layout settings. A real screen
-            # wipe is operator-initiated (clear_captions <- Ctrl/N or the GUI's
-            # Clear button).
-            self._renderer.prune_history()
+            # The ASR worker emits CLEAR only after
+            # prune_history_after_silence_seconds of no speech. That timeout
+            # must never wipe what the audience is currently reading: CLEAR
+            # only prunes caption lines that are no longer visible under the
+            # current layout settings. A real screen wipe is operator-
+            # initiated (clear_captions <- Ctrl/N or the GUI's Clear button)
+            # or comes in as WIPE after wipe_screen_after_silence_seconds.
+            dropped = self._renderer.prune_history()
+            if dropped:
+                logger.debug("pruned %d off-screen caption line(s) after silence", dropped)
 
     def set_caption_mode(self, mode: str) -> None:
         """Switches between "auto" (ASR-driven) and "manual" (operator-typed)

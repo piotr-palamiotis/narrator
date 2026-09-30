@@ -26,8 +26,14 @@ asr:
   max_context_seconds: 20
   # After this much silence, off-screen caption history is pruned. The
   # visible lines are NOT cleared -- they stay until new speech scrolls them
-  # out or the operator clears them (Ctrl+N / the GUI Clear button).
-  clear_after_silence_seconds: 8
+  # out, an operator clears them (Ctrl+N / the GUI Clear button), or a
+  # wipe_screen_after_silence_seconds lull elapses.
+  prune_history_after_silence_seconds: 8
+  # After this much silence, the screen is truly cleared (like Ctrl+N).
+  # 0 disables it (the default: stale captions are usually better than blank
+  # ones -- raise this only if very old text would misattribute to new
+  # speech, e.g. on a broadcast with long quiet stretches).
+  wipe_screen_after_silence_seconds: 0
   show_partial_captions: false
 
 canvas:

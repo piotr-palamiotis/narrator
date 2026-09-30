@@ -61,7 +61,7 @@ def make_decoder(responses, config=None, events=None):
         step_ms=100,
         agreement_passes=2,
         end_silence_ms=300,
-        clear_after_silence_seconds=5,
+        prune_history_after_silence_seconds=5,
         # Permanent-forced (single entry): the agreement/commit tests only
         # care about text, not language selection, and must not depend on
         # detection timing.
@@ -102,7 +102,7 @@ def test_status_event_emitted_on_construction():
 
 
 def test_commits_prefix_after_agreement_passes():
-    config = AsrConfig(step_ms=100, agreement_passes=2, end_silence_ms=300, clear_after_silence_seconds=5, language_whitelist=["pl"])
+    config = AsrConfig(step_ms=100, agreement_passes=2, end_silence_ms=300, prune_history_after_silence_seconds=5, language_whitelist=["pl"])
     decoder, clock, events = make_decoder(
         ["hello world", "hello world there", "hello world there now"], config=config
     )
@@ -121,7 +121,7 @@ def test_commits_prefix_after_agreement_passes():
 
 
 def test_force_finalizes_on_end_silence():
-    config = AsrConfig(step_ms=100, agreement_passes=99, end_silence_ms=100, clear_after_silence_seconds=5, language_whitelist=["pl"])
+    config = AsrConfig(step_ms=100, agreement_passes=99, end_silence_ms=100, prune_history_after_silence_seconds=5, language_whitelist=["pl"])
     decoder, clock, events = make_decoder(["partial hypothesis", "partial hypothesis final"], config=config)
 
     feed_decode_step(decoder, clock, config)  # decode step; agreement_passes=99 so nothing commits yet
@@ -133,21 +133,29 @@ def test_force_finalizes_on_end_silence():
 
 
 def test_clear_emitted_after_prolonged_silence():
-    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=50, clear_after_silence_seconds=1.0)
+    """Past the prune threshold, CLEAR fires exactly once per silence stretch;
+    with wiping disabled (the default), no WIPE ever fires, however long the
+    silence lasts."""
+    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=50, prune_history_after_silence_seconds=1.0)
     decoder, clock, events = make_decoder(["hi"], config=config)
 
     feed_decode_step(decoder, clock, config)  # decode "hi"; agreement_passes=1 commits immediately
     feed_silence(decoder, 2)  # 2 * 32ms = 64ms >= end_silence_ms=50ms -> force-finalize (no-op text-wise)
     assert any(e.type == CaptionEventType.FINAL for e in events)
 
-    # Now well past clear_after_silence_seconds=1.0 with no further speech.
+    # Now well past prune_history_after_silence_seconds=1.0 with no further speech.
     clock.advance(2.0)
     feed_silence(decoder, 1)
     assert any(e.type == CaptionEventType.CLEAR for e in events)
+    assert not any(e.type == CaptionEventType.WIPE for e in events)  # wipe disabled by default
+
+    clock.advance(60.0)
+    feed_silence(decoder, 1)
+    assert not any(e.type == CaptionEventType.WIPE for e in events)  # even a very long lull
 
 
 def test_no_duplicate_clear_events():
-    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=50, clear_after_silence_seconds=0.5)
+    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=50, prune_history_after_silence_seconds=0.5)
     decoder, clock, events = make_decoder(["hi"], config=config)
 
     feed_decode_step(decoder, clock, config)
@@ -158,6 +166,76 @@ def test_no_duplicate_clear_events():
     feed_silence(decoder, 3)
     clear_events = [e for e in events if e.type == CaptionEventType.CLEAR]
     assert len(clear_events) == 1
+
+
+def test_wipe_emitted_once_after_configured_lull():
+    """With wipe_screen_after_silence_seconds enabled, a long-enough silence
+    produces exactly one WIPE -- and only after it, never before the prune
+    threshold just because both thresholds were crossed in one step."""
+    config = AsrConfig(
+        step_ms=100, agreement_passes=1, end_silence_ms=50,
+        prune_history_after_silence_seconds=0.5, wipe_screen_after_silence_seconds=2.0,
+    )
+    decoder, clock, events = make_decoder(["hi"], config=config)
+
+    feed_decode_step(decoder, clock, config)
+    feed_silence(decoder, 2)  # force-finalize; idle timer starts at last speech
+
+    clock.advance(1.0)  # past prune (0.5s), well short of wipe (2.0s)
+    feed_silence(decoder, 1)
+    assert any(e.type == CaptionEventType.CLEAR for e in events)
+    assert not any(e.type == CaptionEventType.WIPE for e in events)
+
+    clock.advance(1.5)  # total 2.5s idle >= 2.0s
+    feed_silence(decoder, 1)
+    wipe_events = [e for e in events if e.type == CaptionEventType.WIPE]
+    assert len(wipe_events) == 1
+
+    clock.advance(5.0)
+    feed_silence(decoder, 1)
+    wipe_events = [e for e in events if e.type == CaptionEventType.WIPE]
+    assert len(wipe_events) == 1  # no duplicates on continued silence
+
+
+def test_wipe_disabled_by_default_even_after_long_silence():
+    """wipe_screen_after_silence_seconds=0 (the default) must never wipe: the
+    operator decides when the screen goes blank."""
+    config = AsrConfig(
+        step_ms=100, agreement_passes=1, end_silence_ms=50,
+        prune_history_after_silence_seconds=0.5, wipe_screen_after_silence_seconds=0,
+    )
+    decoder, clock, events = make_decoder(["hi"], config=config)
+
+    feed_decode_step(decoder, clock, config)
+    feed_silence(decoder, 2)
+    clock.advance(600.0)
+    feed_silence(decoder, 1)
+
+    assert any(e.type == CaptionEventType.CLEAR for e in events)  # pruning still runs
+    assert not any(e.type == CaptionEventType.WIPE for e in events)
+
+
+def test_new_speech_resets_wipe_timer():
+    """Any speech between lulls re-arms both the prune and wipe timers."""
+    config = AsrConfig(
+        step_ms=100, agreement_passes=1, end_silence_ms=50,
+        prune_history_after_silence_seconds=0.5, wipe_screen_after_silence_seconds=2.0,
+    )
+    decoder, clock, events = make_decoder(["hi", "ho"], config=config)
+
+    feed_decode_step(decoder, clock, config)
+    clock.advance(1.0)  # speech again before any threshold
+    feed_decode_step(decoder, clock, config)
+    clock.advance(1.0)
+    feed_silence(decoder, 1)
+
+    assert not any(e.type == CaptionEventType.WIPE for e in events)
+    clock.advance(1.5)
+    feed_silence(decoder, 1)
+    assert not any(e.type == CaptionEventType.WIPE for e in events)  # only 1.5s idle since last speech
+    clock.advance(1.0)  # 2.5s idle now
+    feed_silence(decoder, 1)
+    assert len([e for e in events if e.type == CaptionEventType.WIPE]) == 1
 
 
 def test_feed_without_decode_step_ingests_but_does_not_transcribe():
@@ -279,7 +357,7 @@ def test_collapse_whole_sentence_loop():
 
 def test_decoder_hypothesis_collapsed_before_agreement():
     """A doubled word must not block the agreement prefix or reach a FINAL."""
-    config = AsrConfig(step_ms=100, agreement_passes=2, end_silence_ms=300, clear_after_silence_seconds=5, language_whitelist=["pl"])
+    config = AsrConfig(step_ms=100, agreement_passes=2, end_silence_ms=300, prune_history_after_silence_seconds=5, language_whitelist=["pl"])
     decoder, clock, events = make_decoder(
         ["lokalne modele modele", "lokalne modele", "lokalne modele"], config=config
     )
@@ -291,7 +369,7 @@ def test_decoder_hypothesis_collapsed_before_agreement():
 
 def test_force_finalize_output_collapsed():
     """The end-silence force-finalize path applies the same collapse."""
-    config = AsrConfig(step_ms=100, agreement_passes=99, end_silence_ms=100, clear_after_silence_seconds=5, language_whitelist=["pl"])
+    config = AsrConfig(step_ms=100, agreement_passes=99, end_silence_ms=100, prune_history_after_silence_seconds=5, language_whitelist=["pl"])
     decoder, clock, events = make_decoder(
         ["znacznie znacznie dłuższe", "znacznie znacznie dłuższe"], config=config
     )
@@ -304,7 +382,7 @@ def test_force_finalize_output_collapsed():
 def test_cross_commit_repeat_dropped():
     """Window-tail re-decode: word "15" committed, then the next window's
     hypothesis starts with "15" again -> the second must be dropped."""
-    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=300, clear_after_silence_seconds=5, language_whitelist=["pl"])
+    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=300, prune_history_after_silence_seconds=5, language_whitelist=["pl"])
     decoder, clock, events = make_decoder(
         ["liczyło 15", "liczyło 15 15 tysięcy", "liczyło 15 15 tysięcy mieszkańców"],
         config=config,
@@ -318,7 +396,7 @@ def test_cross_commit_repeat_dropped():
 def test_cross_commit_guard_persists_across_utterances():
     """A stutter at an utterance boundary (next clip starting with the same
     word the previous FINAL ended with) is suppressed too."""
-    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=50, clear_after_silence_seconds=5, language_whitelist=["pl"])
+    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=50, prune_history_after_silence_seconds=5, language_whitelist=["pl"])
     decoder, clock, events = make_decoder(
         ["dobrze", "dobrze", "dobrze"],  # one word per decode
         config=config,
@@ -333,7 +411,7 @@ def test_cross_commit_guard_persists_across_utterances():
 def test_cross_commit_guard_keeps_genuinely_new_word():
     """Only a first new word IDENTICAL to the previous FINAL's last word is
     dropped; a genuinely new word after the same prefix survives."""
-    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=300, clear_after_silence_seconds=5, language_whitelist=["pl"])
+    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=300, prune_history_after_silence_seconds=5, language_whitelist=["pl"])
     decoder, clock, events = make_decoder(
         ["liczyło 15", "liczyło 15 tysięcy", "liczyło 15 tysięcy mieszkańców"],
         config=config,
@@ -495,7 +573,7 @@ def test_switch_happens_immediately_on_decisive_detection():
         agreement_passes=1,
         end_silence_ms=50,
         language_whitelist=["pl", "en"],
-        clear_after_silence_seconds=5,
+        prune_history_after_silence_seconds=5,
     )
     decoder, clock, events = make_decoder(
         ["witajcie", "headsets", "witajcie z powrotem"], config=config
@@ -522,7 +600,7 @@ def test_ambiguous_finalize_keeps_previous_utterance_language():
     coin flip that mixes languages mid-speech."""
     config = AsrConfig(
         step_ms=100, agreement_passes=1, end_silence_ms=50,
-        language_whitelist=["pl", "en"], clear_after_silence_seconds=5,
+        language_whitelist=["pl", "en"], prune_history_after_silence_seconds=5,
     )
     decoder, clock, events = make_decoder(["a", "b", "c"], config=config)
     backend = decoder._backend

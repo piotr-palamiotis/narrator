@@ -81,6 +81,7 @@ _PREVIEW_FIELD_NAMES = [
 _AUTOSAVE_ONLY_FIELD_NAMES = [
     "audio_device",
     "asr_model", "asr_device", "asr_show_partial",
+    "asr_prune_after", "asr_wipe_after",
     "ndi_name", "ndi_fps",
 ]
 
@@ -427,9 +428,19 @@ class NarratorGUI:
         self.asr_status_label = ttk.Label(auto, textvariable=self.asr_status_var, foreground="gray")
         self.asr_status_label.grid(row=5, column=2, columnspan=2, sticky="w", padx=4)
         self.asr_show_partial = checkbox_field(auto, 6, "Show partial captions", asr.show_partial_captions)
-        self._build_language_whitelist_editor(auto, start_row=7)
+        # Caption retention: prune only ever trims off-screen history; wipe is
+        # the true screen clear (0 disables it). Both reset on any speech.
+        self.asr_prune_after = float_field(
+            auto, 7, "Prune history after silence (s)",
+            asr.prune_history_after_silence_seconds, 1.0, 3600.0, 1.0,
+        )
+        self.asr_wipe_after = float_field(
+            auto, 8, "Wipe screen after silence (s, 0 = off)",
+            asr.wipe_screen_after_silence_seconds, 0.0, 3600.0, 1.0,
+        )
+        self._build_language_whitelist_editor(auto, start_row=10)
         ttk.Label(auto, text="Ctrl+N clears the captions at any time.", foreground="gray").grid(
-            row=12, column=0, columnspan=4, sticky="w", padx=4, pady=(8, 2)
+            row=14, column=0, columnspan=4, sticky="w", padx=4, pady=(8, 2)
         )
 
         self._manual_settings_frame = ttk.Frame(tab)
@@ -535,7 +546,8 @@ class NarratorGUI:
                 agreement_passes=self.config.asr.agreement_passes,
                 end_silence_ms=self.config.asr.end_silence_ms,
                 max_context_seconds=self.config.asr.max_context_seconds,
-                clear_after_silence_seconds=self.config.asr.clear_after_silence_seconds,
+                prune_history_after_silence_seconds=self.asr_prune_after.get(),
+                wipe_screen_after_silence_seconds=self.asr_wipe_after.get(),
                 show_partial_captions=self.asr_show_partial.get(),
                 language_whitelist=final_whitelist_parse(self._whitelist_var.get()),
             ),

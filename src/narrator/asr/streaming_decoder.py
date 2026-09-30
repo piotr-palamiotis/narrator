@@ -147,7 +147,8 @@ class StreamingDecoder:
         self._silence_ms_accum = 0.0
         self._last_decode_monotonic = 0.0
         self._last_speech_monotonic: float | None = None
-        self._cleared_since_silence = True
+        self._pruned_since_silence = True
+        self._wiped_since_silence = True
 
         self._recent_hypotheses: list[list[str]] = []  # last `agreement_passes` hypotheses
         self._committed_word_count = 0
@@ -184,7 +185,8 @@ class StreamingDecoder:
                     self._start_utterance()
                 self._silence_ms_accum = 0.0
                 self._last_speech_monotonic = now
-                self._cleared_since_silence = False
+                self._pruned_since_silence = False
+                self._wiped_since_silence = False
             else:
                 self._silence_ms_accum += _VAD_WINDOW_MS
 
@@ -199,7 +201,8 @@ class StreamingDecoder:
             if run_decode_step:
                 self._maybe_run_decode_step(now)
         else:
-            self._maybe_emit_clear(now)
+            self._maybe_emit_prune(now)
+            self._maybe_emit_wipe(now)
 
     def tick(self) -> None:
         """Run a periodic decode step if `step_ms` has elapsed.
@@ -439,10 +442,33 @@ class StreamingDecoder:
             self._last_final_last_word = new_words[-1]
         return new_words
 
-    def _maybe_emit_clear(self, now: float) -> None:
-        if self._cleared_since_silence or self._last_speech_monotonic is None:
+    def _maybe_emit_prune(self, now: float) -> None:
+        """Idle past `prune_history_after_silence_seconds`: CLEAR, which drops
+        only caption lines that are already invisible under layout.max_lines
+        (memory hygiene -- memory is also bounded by the buffer's history cap,
+        so this is not load-bearing for memory). The display is untouched.
+        """
+        if self._pruned_since_silence or self._last_speech_monotonic is None:
             return
         idle_seconds = now - self._last_speech_monotonic
-        if idle_seconds >= self._config.clear_after_silence_seconds:
+        if idle_seconds >= self._config.prune_history_after_silence_seconds:
             self._on_event(CaptionEvent(CaptionEventType.CLEAR))
-            self._cleared_since_silence = True
+            self._pruned_since_silence = True
+
+    def _maybe_emit_wipe(self, now: float) -> None:
+        """Idle past `wipe_screen_after_silence_seconds`: WIPE, a true screen
+        clear, same as the operator's Ctrl+N. 0 disables it -- the default,
+        because stale captions are usually better than blank ones and the
+        operator knows their venue. Nonzero exists for broadcasts where a
+        very old sentence would misattribute to unrelated new speech.
+        """
+        if (
+            self._config.wipe_screen_after_silence_seconds <= 0
+            or self._wiped_since_silence
+            or self._last_speech_monotonic is None
+        ):
+            return
+        idle_seconds = now - self._last_speech_monotonic
+        if idle_seconds >= self._config.wipe_screen_after_silence_seconds:
+            self._on_event(CaptionEvent(CaptionEventType.WIPE))
+            self._wiped_since_silence = True

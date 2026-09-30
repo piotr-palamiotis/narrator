@@ -11,7 +11,8 @@ from enum import Enum
 class CaptionEventType(str, Enum):
     PARTIAL = "partial"
     FINAL = "final"
-    CLEAR = "clear"
+    CLEAR = "clear"  # prune off-screen caption history (display untouched)
+    WIPE = "wipe"  # true screen clear after a long silence lull (operator-equivalent)
     STATUS = "status"  # informational, e.g. resolved ASR backend/device string
 
 

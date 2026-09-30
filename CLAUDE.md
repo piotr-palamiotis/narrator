@@ -106,7 +106,7 @@ understands the full concurrency picture:
   all existed and are gone). Restart drains stale audio frames so the next
   generation doesn't caption pre-restart speech, and the worker releases the
   whisper model deterministically in a `finally` block.
-- **Event-drain thread**: applies `CaptionEvent`s (PARTIAL/FINAL/CLEAR/STATUS)
+- **Event-drain thread**: applies `CaptionEvent`s (PARTIAL/FINAL/CLEAR/WIPE/STATUS)
   from the worker's event queue to the renderer.
 - **Render + NDI send**: a fixed-fps thread
   (`narrator.ndi.sender.run_render_send_loop`) independent of the ASR/audio
@@ -222,6 +222,19 @@ enforcement point for the "no explicit font_size" rule) → `narrator.render.can
 (Pillow compositing: text, `background_band`/`shadow`/`stroke` style
 overrides) → `narrator.ndi.sender` (`cyndilib`-backed NDI RGBA send,
 transparent background).
+
+**Caption retention (do not regress this)**: the ASR worker's silence
+timers must never blank what the audience is currently reading.
+`prune_history_after_silence_seconds` (renamed from
+`clear_after_silence_seconds`; a `model_validator(mode="before")`
+migration still accepts the old key) emits CLEAR, which drops only lines
+already invisible under `layout.max_lines` (`CaptionBuffer.prune_history`)
+— the visible lower-third is byte-identical after. A true screen clear is
+operator-initiated (Ctrl+N / the GUI Clear button) or comes as WIPE after
+`wipe_screen_after_silence_seconds` of silence (default 0 = off: stale
+captions are usually better than blank ones; raise it when very old text
+would misattribute to new speech). In manual caption mode both events are
+ignored like any other ASR output.
 
 ### GUI (`narrator.gui`)
 

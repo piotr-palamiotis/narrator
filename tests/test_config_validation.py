@@ -74,6 +74,37 @@ def test_asr_gpu_device_defaults_to_auto():
     assert AsrConfig().gpu_device == "auto"
 
 
+def test_old_clear_after_silence_key_migrates_to_prune():
+    """Configs written before the rename keep working: the retired
+    clear_after_silence_seconds key maps onto the prune knob."""
+    from narrator.config.schema import AsrConfig
+
+    config = AsrConfig.model_validate({"clear_after_silence_seconds": 12.5})
+    assert config.prune_history_after_silence_seconds == 12.5
+    assert not hasattr(config, "clear_after_silence_seconds")  # popped, not kept
+
+
+def test_new_prune_key_wins_over_old_alias():
+    """When both keys are present, the explicit new one wins."""
+    from narrator.config.schema import AsrConfig
+
+    config = AsrConfig.model_validate(
+        {"clear_after_silence_seconds": 12.5, "prune_history_after_silence_seconds": 3.0}
+    )
+    assert config.prune_history_after_silence_seconds == 3.0
+
+
+def test_wipe_screen_after_silence_defaults_to_disabled():
+    """0 = the screen never clears on its own; the operator decides."""
+    from narrator.config.schema import AsrConfig
+
+    config = AsrConfig()
+    assert config.wipe_screen_after_silence_seconds == 0.0
+
+    with pytest.raises(ValidationError):
+        AsrConfig(wipe_screen_after_silence_seconds=-1.0)
+
+
 def test_asr_gpu_device_accepts_explicit_index():
     from narrator.config.schema import AsrConfig
 

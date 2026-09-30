@@ -107,6 +107,29 @@ def test_asr_clear_event_prunes_history_instead_of_wiping_screen():
     assert renderer.final_texts == ["hello"]
 
 
+def test_asr_wipe_event_clears_screen():
+    """WIPE (a long-silence lull with wipe_screen_after_silence_seconds set)
+    is the true screen-clear path -- same renderer method as the operator's
+    Ctrl+N."""
+    controller, renderer = make_controller()
+    controller._handle_caption_event(CaptionEvent(CaptionEventType.FINAL, "hello"))
+    controller._handle_caption_event(CaptionEvent(CaptionEventType.WIPE))
+
+    assert renderer.cleared is True
+    assert renderer.final_texts == []
+
+
+def test_wipe_respected_in_auto_mode_only():
+    """Like FINAL/PARTIAL/CLEAR, WIPE must not clobber operator-typed captions
+    while manual mode is active."""
+    controller, renderer = make_controller()
+    controller.set_caption_mode("manual")
+
+    controller._handle_caption_event(CaptionEvent(CaptionEventType.WIPE))
+
+    assert not renderer.cleared
+
+
 def test_set_caption_mode_rejects_unknown_mode():
     controller, _renderer = make_controller()
     try:

@@ -101,9 +101,10 @@ class CaptionBuffer:
         number of committed lines dropped (0 when there was nothing to prune).
 
         This is what the ASR worker's silence-timeout CLEAR event routes to, so
-        the periodic screen-clear after `clear_after_silence_seconds` only
+        the periodic prune after `prune_history_after_silence_seconds` only
         trims memory, never the visible lower-third. A true screen wipe
-        (Ctrl+N, the GUI's Clear button) still calls `clear()`.
+        (Ctrl+N, the GUI's Clear button, or a long-enough silence when
+        `wipe_screen_after_silence_seconds` is enabled) calls `clear()`.
         """
         committed, pending = self._state
         # The pending tail occupies a display slot of its own, so fewer
