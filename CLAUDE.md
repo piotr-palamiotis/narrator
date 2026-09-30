@@ -229,12 +229,27 @@ Tkinter + `sv-ttk` theme, optional (`gui.enabled` in config, or `--no-gui`).
 `app.py` is the main window and Save-button config path (goes through the
 same validate-then-swap path as hand edits); `preview.py` renders a live
 canvas preview; `tray.py` is the system tray icon (`pystray`); `widgets.py`
-holds reusable controls (e.g. opacity/color pickers). The GUI also supports a
+holds reusable controls (e.g. opacity/color pickers, the mic level meter)
+plus the `CONTROL_WIDTH` standard that lines up every entry-style control.
+Ctrl+N (bound at the root-window level, so it works regardless of which
+widget has focus, including the manual caption entry) clears the current
+captions at any time. The Audio/ASR tab carries two live indicators, both
+polled on the Tk thread: the mic input-level meter reads `MicCapture.level`
+— a plain float published from the PortAudio callback thread (the single-
+float write is atomic under the GIL, so polling neither locks nor stalls
+the callback; zeroed on `stop()`; scaled x^(1/3) with no decay/peak-hold by
+design), and it re-reads `controller._mic` fresh each tick because
+`_restart_audio_capture` swaps the MicCapture instance — don't cache it —
+and the ASR worker's Active/Inactive label reflects *process liveness*
+(`_asr_process.is_alive()`), not the STATUS event string (STATUS still
+updates `resolved_asr_backend` on the controller). The Whisper model field
+is a dropdown of pywhispercpp's `AVAILABLE_MODELS` plus locally cached
+models, kept editable so a custom name or direct ggml path in config isn't
+lost on autosave. The GUI also supports a
 manual caption mode (`AppController.set_caption_mode`) where an operator
 types captions directly instead of ASR driving them — the ASR worker keeps
 running underneath so switching back to auto is instant, but its events are
-ignored while manual is active except STATUS (keeps the backend indicator
-live).
+ignored while manual is active except STATUS.
 
 ## Repo layout
 
