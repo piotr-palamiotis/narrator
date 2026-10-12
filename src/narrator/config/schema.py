@@ -90,6 +90,16 @@ class AsrConfig(BaseModel):
     step_ms: int = Field(default=500, gt=0)
     agreement_passes: int = Field(default=2, ge=1)
     end_silence_ms: int = Field(default=650, gt=0)
+    # Continuous speech is force-finalized ("rolled over") at the SMALLER of
+    # max_utterance_ms and max_context_seconds, and the next speech starts a
+    # fresh utterance (fresh whisper context, cleared hypotheses). The
+    # decode window is never trimmed mid-utterance: trimming shifted the
+    # hypotheses under the committed-word count and silently dropped ~5s of
+    # speech per long utterance (documentary narration runs past 20s
+    # without a pause for 40-65% of its speech). Long single contexts also
+    # accumulate errors on noisy audio (measured on a real 88-min assembly
+    # recording, see scripts/stream_eval.py).
+    max_utterance_ms: int = Field(default=20000, gt=0)
     max_context_seconds: float = Field(default=20.0, gt=0)
     # After this much continuous silence, the ASR worker emits a CLEAR event,
     # which prunes only OFF-SCREEN caption history. The visible lower-third
@@ -103,6 +113,15 @@ class AsrConfig(BaseModel):
     # default -- the operator decides when the screen goes blank.
     wipe_screen_after_silence_seconds: float = Field(default=0.0, ge=0)
     show_partial_captions: bool = False
+    # Audio kept from just BEFORE the VAD fires, prepended to each utterance:
+    # Silero needs a window or two to cross its threshold, so without it the
+    # first syllable of an utterance can be clipped. 0 disables it.
+    vad_preroll_ms: int = Field(default=0, ge=0, le=1000)
+    # Characters of already-captioned text handed to whisper as the prompt
+    # for the next utterance's decodes (context for names, spelling and
+    # style); reset by a screen wipe and on a language change. 0 = each
+    # utterance starts from a blank context.
+    prompt_carryover_chars: int = Field(default=0, ge=0, le=1000)
 
     @model_validator(mode="before")
     @classmethod
@@ -143,6 +162,89 @@ class AsrConfig(BaseModel):
             if code not in deduped:
                 deduped.append(code)
         self.language_whitelist = deduped
+        return self
+
+
+# Decode settings `narrator --autoconfigure` may search (asr.<name>), in
+# search order; autoconfigure.search_space can override their value grids.
+AUTOCONFIGURE_SEARCH_SETTINGS = (
+    "max_context_seconds",
+    "vad_threshold",
+    "end_silence_ms",
+    "step_ms",
+    "agreement_passes",
+    "vad_preroll_ms",
+    "prompt_carryover_chars",
+)
+
+
+class AutoconfigureConfig(BaseModel):
+    """Tuning for `narrator --autoconfigure`, which searches the model and
+    decode settings (asr.*) under which live captions best match the
+    reference transcripts in scripts/test_audio/, and writes the winner into
+    this file. Read only by that CLI run -- the live pipeline never touches
+    this section, so editing it in the GUI while captioning is harmless.
+    """
+
+    # Models considered. Ones missing from the local pywhispercpp cache are
+    # skipped (no surprise multi-GB downloads unless --allow-download).
+    # `narrator --models ...` overrides this list for one run.
+    candidate_models: list[str] = Field(
+        default_factory=lambda: ["large-v3", "large-v3-turbo", "medium", "small", "base", "tiny"]
+    )
+    # A model whose benched decode is slower than this multiple of real time
+    # at any window cannot caption live on this machine and is skipped.
+    slow_factor: float = Field(default=1.5, gt=0.0)
+    # Wall-clock budget for new decoding. Results are cached across runs, so
+    # a rerun only spends time on what it has not decoded before.
+    time_budget_minutes: float = Field(default=720.0, gt=0.0)
+    # Median delay from a word being spoken to its caption appearing that a
+    # configuration may have (seconds); 0 = no cap, pure accuracy.
+    max_latency_s: float = Field(default=3.0, ge=0.0)
+    # Evaluation sample: fixed-length excerpts, one per recording before any
+    # recording gets a second. screen (the search) is the first part of dev
+    # (confirmation); holdout recordings are never used for tuning.
+    excerpt_seconds: float = Field(default=90.0, ge=20.0, le=600.0)
+    screen_excerpts: int = Field(default=32, ge=1)
+    dev_excerpts: int = Field(default=96, ge=1)
+    holdout_excerpts: int = Field(default=48, ge=0)
+    # Reference languages that are scored; recordings whose subtitle file is
+    # tagged with another language (e.g. "(English).srt") are skipped.
+    reference_languages: list[str] = Field(default_factory=lambda: ["pl"])
+    # Excerpts that even offline large-v3 disagrees with by more than this
+    # (WER) are dropped: their reference does not match the audio.
+    max_ceiling_wer: float = Field(default=0.85, gt=0.0)
+    # Disk guards for the decoded-excerpt cache (scripts/autoconfigure_cache).
+    min_free_disk_mb: float = Field(default=1024.0, ge=0.0)
+    cache_max_mb: float = Field(default=1024.0, gt=0.0)
+    # Optional per-setting value grids replacing the built-in ones, e.g.
+    # {"step_ms": [400, 600, 900]}.
+    search_space: dict[str, list[int | float]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _check_autoconfigure_bounds(self) -> "AutoconfigureConfig":
+        if self.screen_excerpts > self.dev_excerpts:
+            raise ValueError(
+                "autoconfigure.screen_excerpts must be <= autoconfigure.dev_excerpts "
+                "(the screen set is the first part of the dev set)"
+            )
+        unknown = sorted(set(self.search_space) - set(AUTOCONFIGURE_SEARCH_SETTINGS))
+        if unknown:
+            raise ValueError(
+                f"autoconfigure.search_space has unknown settings {unknown}; "
+                f"known: {list(AUTOCONFIGURE_SEARCH_SETTINGS)}"
+            )
+        empty = sorted(name for name, values in self.search_space.items() if not values)
+        if empty:
+            raise ValueError(f"autoconfigure.search_space entries need at least one value: {empty}")
+        from narrator.asr.whisper_languages import whisper_language_codes
+
+        valid = set(whisper_language_codes())
+        for code in self.reference_languages:
+            if code not in valid:
+                raise ValueError(
+                    f"autoconfigure.reference_languages entry {code!r} is not a language whisper supports"
+                )
         return self
 
 
@@ -229,6 +331,7 @@ class RootConfig(BaseModel):
     style: StyleConfig = Field(default_factory=StyleConfig)
     ndi: NdiConfig = Field(default_factory=NdiConfig)
     gui: GuiConfig = Field(default_factory=GuiConfig)
+    autoconfigure: AutoconfigureConfig = Field(default_factory=AutoconfigureConfig)
 
     @model_validator(mode="after")
     def _check_interline_fits(self) -> "RootConfig":

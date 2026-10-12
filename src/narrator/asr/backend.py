@@ -206,10 +206,10 @@ _MAX_TOKENS_PER_STEP = 200
 # pywhispercpp 1.5.1's `detect_language=True` transcribe
 # param is broken -- it returns zero segments on any input (verified on a
 # fresh model with clean audio). Detection is done through the dedicated
-# `auto_detect_language()` API instead, and whatever code it reports is used
-# verbatim: the decoder transcribes each utterance in whatever language it
-# hears, with no per-language allow-list. The StreamingDecoder calls this once
-# per utterance and locks the result (per-step detection measurably flaps
+# `auto_detect_language()` API instead, and its probability table is
+# restricted to `asr.language_whitelist` when one is set (see
+# _restrict_to_whitelist). The StreamingDecoder calls this once per
+# utterance and locks the result (per-step detection measurably flaps
 # between acoustically similar languages, mixing languages mid-caption).
 # Detection on raw noise/breath can return an arbitrary language at low
 # confidence; a garbage transcription of noise is preferable to silently
@@ -436,12 +436,14 @@ class WhisperBackend:
         audio: np.ndarray,
         sample_rate: int = 16000,
         language: str | None = None,
+        prompt: str | None = None,
     ) -> list[tuple[float, float, str]]:
         """Run one decode pass over `audio` (mono float32 @16kHz). Returns a
-        list of (start_seconds, end_seconds, text) segments. If the current
-        backend is GPU-based and inference raises (a real, observed failure
-        mode with immature Vulkan driver paths), reinitializes on CPU and
-        retries once rather than crashing the whole ASR worker process.
+        list of (start_seconds, end_seconds, text) segments. `prompt` is text
+        whisper treats as what was said just before this audio (context for
+        names, spelling, style); None decodes from a blank context. A failure
+        raises DevicePolicyError -- the configured device is final, there is
+        no silent CPU fallback.
         """
         # Explicit per-call override (a language the StreamingDecoder locked
         # for this utterance) wins; otherwise the whitelist decides per call:
@@ -475,11 +477,15 @@ class WhisperBackend:
             # ladder, a repetition loop can emit tokens up to the text context
             # limit. A live caption window never legitimately needs this many.
             "max_tokens": _MAX_TOKENS_PER_STEP,
+            # Always set explicitly: pywhispercpp keeps decode params between
+            # calls, so a prompt from an earlier call would otherwise leak
+            # into this one. ("" clears it; the binding rejects None.)
+            "initial_prompt": prompt or "",
         }
         if language is not None:
             kwargs["language"] = language
         else:
-            kwargs["language"] = self._detect_language(audio)
+            kwargs["language"] = self._detect_language(audio)[0]
 
         try:
             segments = self._model.transcribe(audio, **kwargs)

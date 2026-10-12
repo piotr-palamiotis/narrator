@@ -43,20 +43,50 @@ _WINDOW_SAMPLES = 512  # required by the Silero v5 graph at 16kHz
 _CONTEXT_SAMPLES = 64  # required left-context for the same graph's causal convs
 _SAMPLE_RATE = 16000
 
+# The v5 LSTM state drifts: after minutes of continuously fed audio (music,
+# crowd noise, anything that is not clean speech) the probabilities collapse
+# toward zero and STAY there even when clear speech resumes -- measured on a
+# real 88-min recording: after ~4 min of concert, speech that a fresh-state
+# VAD scores at 0.58 mean (59% of windows over threshold) scored 0.004 mean
+# (0% over threshold) on the continuous stream, i.e. captions would silently
+# stop working. The state is only meaningful over utterance-scale horizons.
+# Antidote: reset the state after this many seconds of continuously
+# below-threshold windows (music counts as below-threshold, so the reset
+# keeps firing through songs). Measured on the same recording: 10s -> 56%
+# of speech windows over threshold (fresh-state reference: 59%); 30s -> 48%;
+# no reset -> 0%.
+_RESET_AFTER_QUIET_SECONDS = 10.0
+_WINDOW_SECONDS = _WINDOW_SAMPLES / _SAMPLE_RATE
+_QUIET_WINDOWS_FOR_RESET = round(_RESET_AFTER_QUIET_SECONDS / _WINDOW_SECONDS)
+
 
 class SileroVad:
-    def __init__(self, threshold: float = 0.5, model_path: Path = _MODEL_PATH) -> None:
+    def __init__(
+        self,
+        threshold: float = 0.5,
+        model_path: Path = _MODEL_PATH,
+        reset_after_quiet_seconds: float = _RESET_AFTER_QUIET_SECONDS,
+    ) -> None:
         self._threshold = threshold
+        # 0 or negative disables the auto-reset (useful in tests; not
+        # recommended for live use -- see the drift measurement above).
+        self._quiet_windows_for_reset = (
+            round(reset_after_quiet_seconds / _WINDOW_SECONDS)
+            if reset_after_quiet_seconds > 0
+            else 0
+        )
         self._session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
         self._sr = np.array(_SAMPLE_RATE, dtype=np.int64)
         self._pending = np.zeros(0, dtype=np.float32)
         self._context = np.zeros(_CONTEXT_SAMPLES, dtype=np.float32)
+        self._quiet_windows = 0
 
     def reset(self) -> None:
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
         self._pending = np.zeros(0, dtype=np.float32)
         self._context = np.zeros(_CONTEXT_SAMPLES, dtype=np.float32)
+        self._quiet_windows = 0
 
     def process(self, frame: np.ndarray) -> list[float]:
         """Feed an arbitrary-length mono float32 frame at 16kHz. Returns the
@@ -83,6 +113,18 @@ class SileroVad:
             prob, self._state = outputs[0], outputs[1]
             probabilities.append(float(prob[0][0]))
             self._context = window[-_CONTEXT_SAMPLES:]
+            # State-drift antidote: see _RESET_AFTER_QUIET_SECONDS above.
+            # Fires only after long quiet, which the streaming decoder treats
+            # as no active utterance anyway (end_silence_ms is ~0.65s), so a
+            # reset can never land mid-utterance.
+            if float(prob[0][0]) >= self._threshold:
+                self._quiet_windows = 0
+            elif self._quiet_windows_for_reset:
+                self._quiet_windows += 1
+                if self._quiet_windows >= self._quiet_windows_for_reset:
+                    self._state = np.zeros((2, 1, 128), dtype=np.float32)
+                    self._context = np.zeros(_CONTEXT_SAMPLES, dtype=np.float32)
+                    self._quiet_windows = 0
         return probabilities
 
     def is_speech(self, probabilities: list[float]) -> bool:

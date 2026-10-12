@@ -1,16 +1,27 @@
-# PyInstaller spec for narrator. Build with:
+# PyInstaller spec for narrator. Build with (from anywhere):
 #   pyinstaller packaging/pyinstaller/narrator.spec --distpath dist --workpath build
 #
-# Run from the repo root so relative paths below resolve correctly.
+# Paths inside a spec are resolved against the spec file's own directory
+# (SPECPATH), not the invocation cwd, so everything is anchored to the repo
+# root explicitly to keep the build working regardless of where it's run.
+import os
+
 from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
 
+ROOT = os.path.abspath(os.path.join(SPECPATH, os.pardir, os.pardir))
+
+
+def _root(*parts):
+    return os.path.join(ROOT, *parts)
+
+
 datas = [
-    ("assets/fonts/NotoSans-Regular.ttf", "assets/fonts"),
-    ("assets/vad/silero_vad.onnx", "assets/vad"),
-    ("assets/vad/LICENSE-silero-vad.txt", "assets/vad"),
-    ("src/narrator/config/defaults.yaml", "narrator/config"),
+    (_root("assets", "fonts", "NotoSans-Regular.ttf"), "assets/fonts"),
+    (_root("assets", "vad", "silero_vad.onnx"), "assets/vad"),
+    (_root("assets", "vad", "LICENSE-silero-vad.txt"), "assets/vad"),
+    (_root("src", "narrator", "config", "defaults.yaml"), "narrator/config"),
 ]
 binaries = []
 hiddenimports = []
@@ -27,12 +38,12 @@ for package in ("pywhispercpp", "cyndilib", "onnxruntime", "sounddevice"):
     hiddenimports += pkg_hiddenimports
 
 a = Analysis(
-    ["src/narrator/main.py"],
-    pathex=["src"],
+    [_root("src", "narrator", "main.py")],
+    pathex=[_root("src")],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
-    hookspath=["packaging/pyinstaller/hooks"],
+    hookspath=[_root("packaging", "pyinstaller", "hooks")],
     runtime_hooks=[],
     excludes=[],
     cipher=block_cipher,

@@ -76,3 +76,14 @@ def language_display_name(code: str) -> str:
     code itself for anything unknown."""
     name = _LANGUAGE_NAMES.get(code)
     return f"{name} ({code})" if name else code
+
+
+def language_code_for_name(name: str) -> str | None:
+    """'Polish' -> 'pl' (case-insensitive), or None for a name whisper does
+    not know. Used to read the language tag off downloaded subtitle files
+    ("... (Polish_ASR).srt")."""
+    wanted = name.strip().lower()
+    for code, display in _LANGUAGE_NAMES.items():
+        if display.lower() == wanted:
+            return code
+    return None

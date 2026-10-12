@@ -28,6 +28,7 @@ from narrator.asr.whisper_languages import language_display_name, whisper_langua
 from narrator.config.loader import load_config, save_config
 from narrator.config.schema import (
     AsrConfig,
+    AutoconfigureConfig,
     BackgroundBandStyle,
     CanvasConfig,
     GuiConfig,
@@ -81,8 +82,13 @@ _PREVIEW_FIELD_NAMES = [
 _AUTOSAVE_ONLY_FIELD_NAMES = [
     "audio_device",
     "asr_model", "asr_device", "asr_show_partial",
+    "asr_vad_threshold", "asr_step_ms", "asr_agreement_passes",
+    "asr_end_silence_ms", "asr_max_context_s", "asr_max_utterance_ms",
+    "asr_vad_preroll_ms", "asr_prompt_carryover",
     "asr_prune_after", "asr_wipe_after",
     "ndi_name", "ndi_fps",
+    "ac_candidate_models", "ac_time_budget", "ac_max_latency", "ac_slow_factor",
+    "ac_excerpt_seconds", "ac_screen_excerpts", "ac_dev_excerpts", "ac_holdout_excerpts",
 ]
 
 _AUTOSAVE_DEBOUNCE_MS = 800
@@ -167,6 +173,7 @@ class NarratorGUI:
         self._build_layout_tab(notebook)
         self._build_style_tab(notebook)
         self._build_audio_asr_tab(notebook)
+        self._build_autoconfigure_tab(notebook)
         self._build_ndi_tab(notebook)
 
         for name in _PREVIEW_FIELD_NAMES + _AUTOSAVE_ONLY_FIELD_NAMES:
@@ -438,9 +445,28 @@ class NarratorGUI:
             auto, 8, "Wipe screen after silence (s, 0 = off)",
             asr.wipe_screen_after_silence_seconds, 0.0, 3600.0, 1.0,
         )
-        self._build_language_whitelist_editor(auto, start_row=10)
+        # Streaming-decode cadence knobs. These directly drive the ASR worker
+        # (any asr change restarts it), so they live here; the autoconfigure
+        # *benchmark* tuning has its own tab.
+        self.asr_vad_threshold = float_field(
+            auto, 9, "VAD speech threshold (0-1)", asr.vad_threshold, 0.0, 1.0, 0.05,
+        )
+        self.asr_step_ms = int_field(auto, 10, "Decode step (ms)", asr.step_ms, 100, 5000)
+        self.asr_agreement_passes = int_field(auto, 11, "Agreement passes", asr.agreement_passes, 1, 10)
+        self.asr_end_silence_ms = int_field(auto, 12, "End silence (ms)", asr.end_silence_ms, 100, 10000)
+        self.asr_max_context_s = float_field(
+            auto, 13, "Max decode window (s)", asr.max_context_seconds, 1.0, 30.0, 0.5,
+        )
+        self.asr_max_utterance_ms = int_field(
+            auto, 14, "Max utterance (ms)", asr.max_utterance_ms, 1000, 600000,
+        )
+        self.asr_vad_preroll_ms = int_field(auto, 15, "VAD pre-roll (ms)", asr.vad_preroll_ms, 0, 1000)
+        self.asr_prompt_carryover = int_field(
+            auto, 16, "Prompt carry-over (chars, 0 = off)", asr.prompt_carryover_chars, 0, 1000,
+        )
+        self._build_language_whitelist_editor(auto, start_row=17)
         ttk.Label(auto, text="Ctrl+N clears the captions at any time.", foreground="gray").grid(
-            row=14, column=0, columnspan=4, sticky="w", padx=4, pady=(8, 2)
+            row=21, column=0, columnspan=4, sticky="w", padx=4, pady=(8, 2)
         )
 
         self._manual_settings_frame = ttk.Frame(tab)
@@ -528,6 +554,40 @@ class NarratorGUI:
         self._whitelist_var.trace_add("write", self._on_field_changed)
         _sync_listbox()
 
+    def _build_autoconfigure_tab(self, notebook: ttk.Notebook) -> None:
+        """Knobs for `narrator --autoconfigure`, which searches the model and
+        decode settings that make live captions best match the reference
+        recordings in scripts/test_audio/ and writes the winner into the
+        Audio/ASR settings. The search itself runs from the command line
+        (it takes hours); this tab only shapes it.
+        """
+        tab = scrollable_tab(notebook, "Autoconfigure")
+        tab.grid_columnconfigure(0, weight=1)
+        ac = self.config.autoconfigure
+
+        intro = ttk.Label(
+            tab,
+            text="Tuning for `narrator --autoconfigure` (finds the model and decode "
+                 "settings whose live captions best match the reference recordings "
+                 "in scripts/test_audio/, then writes them into the Audio/ASR "
+                 "settings). Results are cached, so reruns only decode what is new.",
+            foreground="gray",
+            wraplength=520,
+            justify="left",
+        )
+        intro.grid(row=0, column=0, columnspan=2, sticky="ew", padx=4, pady=(4, 8))
+
+        self.ac_candidate_models = text_field(
+            tab, 1, "Candidate models (comma-separated)", ", ".join(ac.candidate_models)
+        )
+        self.ac_time_budget = float_field(tab, 2, "Time budget (minutes)", ac.time_budget_minutes, 5.0, 10080.0, 30.0)
+        self.ac_max_latency = float_field(tab, 3, "Max caption delay (s, 0 = no cap)", ac.max_latency_s, 0.0, 30.0, 0.5)
+        self.ac_slow_factor = float_field(tab, 4, "Too-slow model cutoff (x real time)", ac.slow_factor, 1.05, 20.0, 0.05)
+        self.ac_excerpt_seconds = float_field(tab, 5, "Excerpt length (s)", ac.excerpt_seconds, 20.0, 600.0, 5.0)
+        self.ac_screen_excerpts = int_field(tab, 6, "Search excerpts", ac.screen_excerpts, 1, 10000)
+        self.ac_dev_excerpts = int_field(tab, 7, "Confirmation excerpts", ac.dev_excerpts, 1, 10000)
+        self.ac_holdout_excerpts = int_field(tab, 8, "Holdout excerpts", ac.holdout_excerpts, 0, 10000)
+
     def _build_ndi_tab(self, notebook: ttk.Notebook) -> None:
         tab = scrollable_tab(notebook, "NDI")
         ndi = self.config.ndi
@@ -538,18 +598,26 @@ class NarratorGUI:
         return RootConfig(
             app=self.config.app,
             audio=self.config.audio.model_copy(update={"device": self.audio_device.get()}),
-            asr=AsrConfig(
-                model=self.asr_model.get(),
-                device=self.asr_device.get(),
-                vad_threshold=self.config.asr.vad_threshold,
-                step_ms=self.config.asr.step_ms,
-                agreement_passes=self.config.asr.agreement_passes,
-                end_silence_ms=self.config.asr.end_silence_ms,
-                max_context_seconds=self.config.asr.max_context_seconds,
-                prune_history_after_silence_seconds=self.asr_prune_after.get(),
-                wipe_screen_after_silence_seconds=self.asr_wipe_after.get(),
-                show_partial_captions=self.asr_show_partial.get(),
-                language_whitelist=final_whitelist_parse(self._whitelist_var.get()),
+            # Start from the current section so fields without a form
+            # control survive autosave instead of reverting to defaults.
+            asr=AsrConfig.model_validate(
+                {
+                    **self.config.asr.model_dump(),
+                    "model": self.asr_model.get(),
+                    "device": self.asr_device.get(),
+                    "vad_threshold": self.asr_vad_threshold.get(),
+                    "step_ms": self.asr_step_ms.get(),
+                    "agreement_passes": self.asr_agreement_passes.get(),
+                    "end_silence_ms": self.asr_end_silence_ms.get(),
+                    "max_context_seconds": self.asr_max_context_s.get(),
+                    "max_utterance_ms": self.asr_max_utterance_ms.get(),
+                    "vad_preroll_ms": self.asr_vad_preroll_ms.get(),
+                    "prompt_carryover_chars": self.asr_prompt_carryover.get(),
+                    "prune_history_after_silence_seconds": self.asr_prune_after.get(),
+                    "wipe_screen_after_silence_seconds": self.asr_wipe_after.get(),
+                    "show_partial_captions": self.asr_show_partial.get(),
+                    "language_whitelist": final_whitelist_parse(self._whitelist_var.get()),
+                }
             ),
             canvas=CanvasConfig(
                 width_px=self.canvas_width.get(),
@@ -593,6 +661,21 @@ class NarratorGUI:
             ),
             ndi=NdiConfig(source_name=self.ndi_name.get(), fps=self.ndi_fps.get()),
             gui=GuiConfig(enabled=self.config.gui.enabled),
+            autoconfigure=AutoconfigureConfig.model_validate(
+                {
+                    **self.config.autoconfigure.model_dump(),
+                    "candidate_models": [
+                        m for m in (part.strip() for part in self.ac_candidate_models.get().split(",")) if m
+                    ],
+                    "time_budget_minutes": self.ac_time_budget.get(),
+                    "max_latency_s": self.ac_max_latency.get(),
+                    "slow_factor": self.ac_slow_factor.get(),
+                    "excerpt_seconds": self.ac_excerpt_seconds.get(),
+                    "screen_excerpts": self.ac_screen_excerpts.get(),
+                    "dev_excerpts": self.ac_dev_excerpts.get(),
+                    "holdout_excerpts": self.ac_holdout_excerpts.get(),
+                }
+            ),
         )
 
     def _persist(self, new_config: RootConfig) -> None:

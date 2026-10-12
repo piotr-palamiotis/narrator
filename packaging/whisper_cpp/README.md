@@ -1,5 +1,18 @@
 # GPU acceleration for narrator (and when you'd rebuild whisper.cpp)
 
+> **Update (2026-10-03):** the situation flipped back. The current PyPI
+> `pywhispercpp` 1.5.1 wheel ships **no `libggml-vulkan.so`** (CPU ggml
+> only), and its CPU path SIGILLs at `whisper_init` on the pre-AVX Pentium
+> G4560 test box (core dump right after the `whisper_init_with_params_no_state`
+> param logs, reproduced 2026-10-03). The source build below is required
+> again. `make install` runs it automatically when the Vulkan backend is
+> missing (`packaging/whisper_cpp/build_vulkan_linux.sh`: pinned to tag
+> `v1.5.1`, `GGML_VULKAN=1`, `SETUPTOOLS_SCM_PRETEND_VERSION` because a
+> shallow tag clone otherwise builds as version 0.0.0, plus the mandatory
+> `$ORIGIN` RPATH fix). Measured after that build on the RX 6700 XT: bench
+> 2s→0.24s, 10s→1.05s, 20s→1.96s, language detection 0.30s. The rest of
+> this section is kept for history.
+
 ## Start here: you probably do not need to build anything
 
 An earlier version of this document said the PyPI `pywhispercpp` wheel was

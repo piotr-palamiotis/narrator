@@ -26,13 +26,16 @@ full design rationale.
   initialized, the app says so and exits rather than silently switching to CPU.
 - **Windows**: microphone capture and Vulkan (via GPU vendor drivers) work
   out of the box; no extra system packages needed.
-- **No GPU build step is required.** The published `pywhispercpp` wheel
-  already ships the Vulkan ggml backend, so a plain `pip install -e .` gets
-  GPU acceleration (verified on a Radeon RX 6700 XT via RADV). You need the
-  Vulkan loader and driver ICD only -- `libvulkan1` plus
-  `mesa-vulkan-drivers` on AMD/Intel -- and *not* the `vulkan-tools`
-  diagnostic package. `packaging/whisper_cpp/README.md` covers source
-  builds, now only needed for a non-Vulkan ggml backend.
+- **pywhispercpp must be built from source with Vulkan.** The published
+  `pywhispercpp` wheel no longer ships the Vulkan ggml backend, and its
+  CPU-only ggml SIGILLs at `whisper_init` on pre-AVX CPUs (measured on a
+  Pentium G4560, 2026-10-03). `make install` builds and installs the
+  Vulkan-enabled wheel from the pinned `pywhispercpp` tag automatically
+  (`packaging/whisper_cpp/build_vulkan_linux.sh`), or run that script
+  manually inside an activated venv. The runtime still needs the Vulkan
+  loader and driver ICD only -- `libvulkan1` plus `mesa-vulkan-drivers` on
+  AMD/Intel -- and *not* the `vulkan-tools` diagnostic package.
+  `packaging/whisper_cpp/README.md` has the details.
 
 ## Setup (development)
 

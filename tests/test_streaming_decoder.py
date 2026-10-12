@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from narrator.asr.backend import _restrict_to_whitelist
 from narrator.asr.events import CaptionEventType
@@ -423,6 +424,61 @@ def test_cross_commit_guard_keeps_genuinely_new_word():
 
 
 # ---------------------------------------------------------------------------
+# long-utterance rollover (fresh whisper context mid-speech)
+# ---------------------------------------------------------------------------
+
+
+def test_utterance_rolls_over_at_max_utterance_ms():
+    """Continuous speech longer than max_utterance_ms is force-finalized and
+    the next speech frame starts a fresh utterance -- no silence required."""
+    config = AsrConfig(
+        step_ms=100, agreement_passes=1, end_silence_ms=5000,  # no silence path
+        max_utterance_ms=1000,  # 1s of speech rolls the utterance over
+        max_context_seconds=20,
+        prune_history_after_silence_seconds=5,
+        language_whitelist=["pl"],
+    )
+    decoder, clock, events = make_decoder(
+        ["jeden", "dwa", "trzy", "cztery"], config=config
+    )
+
+    decoder._vad.level = 1.0
+    finals_before = 0
+    for _ in range(60):  # 60 * 30ms = 1.8s of continuous speech
+        clock.advance(0.03)
+        decoder.feed(FRAME, run_decode_step=False)
+        finals_before = len([e for e in events if e.type == CaptionEventType.FINAL])
+
+    # At least one rollover finalization happened mid-speech and the window
+    # restarted with it (the utterance did not run on unbounded).
+    assert finals_before >= 1
+    assert decoder.rollover_count >= 1
+    assert decoder._window.duration_seconds < 1.0
+
+
+def test_no_rollover_below_max_utterance_ms():
+    """Short speech stays one utterance: no finalization while speech is
+    continuous and under the threshold."""
+    config = AsrConfig(
+        step_ms=100, agreement_passes=1, end_silence_ms=5000,
+        max_utterance_ms=10000,
+        max_context_seconds=20,
+        prune_history_after_silence_seconds=5,
+        language_whitelist=["pl"],
+    )
+    decoder, clock, events = make_decoder(["slow response"], config=config)
+
+    decoder._vad.level = 1.0
+    for _ in range(60):  # 1.8s of continuous speech, far under 10s
+        clock.advance(0.03)
+        decoder.feed(FRAME, run_decode_step=False)
+
+    assert not any(e.type == CaptionEventType.FINAL for e in events)
+    assert decoder.rollover_count == 0
+    assert decoder._window.duration_seconds > 1.5
+
+
+# ---------------------------------------------------------------------------
 # per-utterance language selection (language_whitelist)
 # ---------------------------------------------------------------------------
 
@@ -613,3 +669,258 @@ def test_ambiguous_finalize_keeps_previous_utterance_language():
     assert backend.language_calls[-1:] == ["en"]
     run_utterance(decoder, clock, config)  # still ambiguous: en again
     assert backend.language_calls[-1:] == ["en"]
+
+
+# ---------------------------------------------------------------------------
+# long utterances roll over instead of trimming: no word is lost
+# ---------------------------------------------------------------------------
+
+CHUNK = 8000  # 0.5 s of audio per word in the word-encoded fake
+
+
+class WordAudioBackend:
+    """Transcribes audio whose samples encode word ids: every 0.5 s chunk of
+    the source holds the constant (id + 1) / 1000. A word is heard when at
+    least half its chunk is in the window -- so a word cut by a window
+    boundary lands in exactly one of the two windows, like real speech."""
+
+    resolved_device_description = "CPU (fake)"
+
+    def __init__(self) -> None:
+        self.window_samples: list[int] = []
+
+    def detect_language(self, audio):
+        return ("pl", 0.99, 0.9)
+
+    def transcribe(self, audio, language=None, prompt=None):
+        self.window_samples.append(len(audio))
+        ids = np.rint(np.asarray(audio) * 1000).astype(int) - 1
+        values, first, counts = np.unique(ids, return_index=True, return_counts=True)
+        heard = [int(v) for f, v, c in sorted(zip(first, values, counts)) if v >= 0 and c >= CHUNK // 2]
+        return [(0.0, 1.0, " ".join(f"w{i}" for i in heard))] if heard else []
+
+
+def encoded_speech(seconds: float) -> np.ndarray:
+    n = int(seconds * 16000)
+    return ((np.arange(n) // CHUNK) + 1).astype(np.float32) / 1000.0
+
+
+def run_audio(decoder, clock, audio, speech_levels=None):
+    """Feed `audio` as 30 ms frames, drain-then-tick like the worker."""
+    for k, i in enumerate(range(0, len(audio), 480)):
+        if speech_levels is not None:
+            decoder._vad.level = speech_levels(k)
+        clock.advance(0.03)
+        decoder.feed(audio[i : i + 480], run_decode_step=False)
+        decoder.tick()
+
+
+def finals_of(events) -> list[str]:
+    return " ".join(e.text for e in events if e.type is CaptionEventType.FINAL).split()
+
+
+def test_long_speech_loses_no_words_across_rollovers():
+    """The regression the trimming design had: past max_context_seconds the
+    window was trimmed under the committed-word count, and the finalize
+    emitted only the tail -- seconds of speech silently vanished."""
+    config = AsrConfig(
+        step_ms=300, agreement_passes=2, end_silence_ms=600,
+        max_context_seconds=10.0, max_utterance_ms=25000, language_whitelist=["pl"],
+    )
+    events = []
+    clock = FakeClock()
+    decoder = StreamingDecoder(WordAudioBackend(), FakeVad(), config, on_event=events.append, clock=clock)
+    decoder._vad.level = 1.0
+    run_audio(decoder, clock, encoded_speech(31.0))  # 62 words of unbroken speech
+    decoder._vad.level = 0.0
+    run_audio(decoder, clock, np.zeros(16000, dtype=np.float32))
+
+    assert finals_of(events) == [f"w{i}" for i in range(62)]
+    assert decoder.rollover_count == 3  # at 10, 20 and 30 s
+
+
+def test_rollover_happens_at_the_smaller_cap():
+    config = AsrConfig(
+        step_ms=300, agreement_passes=1, end_silence_ms=600,
+        max_context_seconds=20.0, max_utterance_ms=4000, language_whitelist=["pl"],
+    )
+    clock = FakeClock()
+    backend = WordAudioBackend()
+    decoder = StreamingDecoder(backend, FakeVad(), config, on_event=lambda e: None, clock=clock)
+    decoder._vad.level = 1.0
+    run_audio(decoder, clock, encoded_speech(9.0))
+    assert decoder.rollover_count == 2
+    assert max(backend.window_samples) <= 4.05 * 16000  # the decode window never exceeds the cap
+
+
+def test_rollover_prefers_a_pause_once_the_window_is_mostly_full():
+    """A pause too short to end the utterance still makes a clean cut once
+    the window is 60% full; a pause before that changes nothing."""
+    config = AsrConfig(
+        step_ms=300, agreement_passes=1, end_silence_ms=2000,
+        max_context_seconds=10.0, language_whitelist=["pl"],
+    )
+    events = []
+    clock = FakeClock()
+    decoder = StreamingDecoder(WordAudioBackend(), FakeVad(), config, on_event=events.append, clock=clock)
+    rollover_at = []
+
+    def levels(frame_index: int) -> float:
+        t = frame_index * 0.03
+        quiet = 4.0 <= t < 4.3 or 7.0 <= t < 7.3  # two 300 ms pauses
+        if decoder.rollover_count and not rollover_at:
+            rollover_at.append(t)
+        return 0.0 if quiet else 1.0
+
+    run_audio(decoder, clock, encoded_speech(9.0), speech_levels=levels)
+    assert decoder.rollover_count == 1
+    assert 7.1 <= rollover_at[0] <= 7.3  # at the second pause (window > 6 s), not the first
+
+
+def test_language_lock_carries_across_a_rollover_but_not_a_pause():
+    config = AsrConfig(
+        step_ms=100, agreement_passes=1, end_silence_ms=300,
+        max_context_seconds=1.0, language_whitelist=["pl", "en"],
+    )
+    decoder, clock, _ = make_decoder(["słowo"] * 200, config=config)
+    backend = decoder._backend
+    decoder._vad.level = 1.0
+    for _ in range(84):  # 2.5 s of unbroken speech: two rollovers
+        clock.advance(0.03)
+        decoder.feed(FRAME, run_decode_step=False)
+        decoder.tick()
+    assert decoder.rollover_count == 2
+    assert backend.detect_calls == 1  # decided once, carried through both rollovers
+    feed_silence(decoder, 12)  # a real pause: the next speaker gets a fresh decision
+    decoder._vad.level = 1.0
+    for _ in range(20):
+        clock.advance(0.03)
+        decoder.feed(FRAME, run_decode_step=False)
+    feed_silence(decoder, 12)
+    assert backend.detect_calls == 2
+
+
+# ---------------------------------------------------------------------------
+# VAD pre-roll
+# ---------------------------------------------------------------------------
+
+
+def test_vad_preroll_prepends_audio_from_before_the_onset():
+    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=300, vad_preroll_ms=240, language_whitelist=["pl"])
+    decoder, clock, _ = make_decoder(["x"], config=config)
+    feed_silence(decoder, 20)
+    decoder._vad.level = 1.0
+    decoder.feed(FRAME, run_decode_step=False)
+    # 240 ms of pre-roll (8 frames) + the onset frame
+    assert decoder._window.duration_seconds == pytest.approx(0.27)
+
+
+def test_no_preroll_by_default():
+    decoder, clock, _ = make_decoder(["x"])
+    feed_silence(decoder, 20)
+    decoder._vad.level = 1.0
+    decoder.feed(FRAME, run_decode_step=False)
+    assert decoder._window.duration_seconds == pytest.approx(0.03)
+
+
+# ---------------------------------------------------------------------------
+# prompt carry-over
+# ---------------------------------------------------------------------------
+
+
+class PromptBackend(FakeBackend):
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.prompts: list[str | None] = []
+
+    def transcribe(self, audio, language=None, prompt=None):
+        self.prompts.append(prompt)
+        return super().transcribe(audio, language=language)
+
+
+def prompt_decoder(config, responses):
+    events = []
+    clock = FakeClock()
+    backend = PromptBackend(responses)
+    decoder = StreamingDecoder(backend, FakeVad(), config, on_event=events.append, clock=clock, min_decode_seconds=0.01)
+    return decoder, clock, backend, events
+
+
+def speak(decoder, clock, config, steps=1):
+    for _ in range(steps):
+        feed_decode_step(decoder, clock, config)
+    feed_silence(decoder, 12)  # end of utterance: the finalize decode
+
+
+def test_prompt_carries_earlier_captions_and_resets_on_wipe():
+    config = AsrConfig(
+        step_ms=100, agreement_passes=1, end_silence_ms=300, prompt_carryover_chars=12,
+        prune_history_after_silence_seconds=1.0, wipe_screen_after_silence_seconds=2.0,
+        language_whitelist=["pl"],
+    )
+    decoder, clock, backend, _ = prompt_decoder(
+        config, ["ala ma kota", "ala ma kota", "i psa też", "i psa też", "nowy", "nowy", "temat", "temat"]
+    )
+    speak(decoder, clock, config)  # utterance 1: no context yet
+    assert backend.prompts == [None, None]
+    speak(decoder, clock, config)  # utterance 2: utterance 1 as context
+    assert backend.prompts[2:] == ["ala ma kota", "ala ma kota"]
+    speak(decoder, clock, config)  # utterance 3: the last 12 chars, from a word start
+    assert backend.prompts[4:] == ["i psa też", "i psa też"]
+    clock.advance(3.0)  # a long lull: the screen wipes, the context goes with it
+    feed_silence(decoder, 1)
+    speak(decoder, clock, config)
+    assert backend.prompts[6:] == [None, None]
+
+
+def test_prompt_is_not_carried_into_another_language():
+    config = AsrConfig(
+        step_ms=100, agreement_passes=1, end_silence_ms=300, prompt_carryover_chars=100,
+        language_whitelist=["pl", "en"],
+    )
+    decoder, clock, backend, _ = prompt_decoder(config, ["dzień dobry"] + ["good morning"] * 5)
+    backend.detected_language = "pl"
+    speak(decoder, clock, config)
+    backend.detected_language = "en"
+    speak(decoder, clock, config)
+    assert all(p is None for p in backend.prompts)  # no Polish context for English speech
+    speak(decoder, clock, config)
+    assert backend.prompts[-1] == "good morning"
+
+
+def test_no_prompt_when_carryover_is_off():
+    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=300, language_whitelist=["pl"])
+    decoder, clock, backend, _ = prompt_decoder(config, ["raz"] * 4)
+    speak(decoder, clock, config)
+    speak(decoder, clock, config)
+    assert backend.prompts == [None] * len(backend.prompts)
+
+
+
+# ---------------------------------------------------------------------------
+# repetition collapse ignores case and punctuation, reaches long sentences
+# ---------------------------------------------------------------------------
+
+
+def test_collapse_ignores_case_and_punctuation_keeping_the_first_occurrence():
+    loop = "Zanim przebiegną tędy nowe jezdnie. zanim przebiegną tędy nowe jezdnie, zanim przebiegną tędy nowe jezdnie,".split()
+    assert _collapse_repetitions(loop) == "Zanim przebiegną tędy nowe jezdnie.".split()
+
+
+def test_collapse_catches_a_long_sentence_loop():
+    sentence = (
+        "Można umówić się z nią w kawiarni i nie wychodząc na lipcowy deszcz tuż obok kupić kwiaty."
+    ).split()  # 17 words, past the old 16-word limit
+    looped = ["kupić", "kwiaty."] + sentence * 3 + ["Można", "um"]
+    assert _collapse_repetitions(looped) == ["kupić", "kwiaty."] + sentence + ["Można", "um"]
+
+
+def test_cross_commit_guard_ignores_case_and_punctuation():
+    config = AsrConfig(step_ms=100, agreement_passes=1, end_silence_ms=300, language_whitelist=["pl"])
+    # utterance 1: decode step + finalize decode; utterance 2: one decode step
+    decoder, clock, events = make_decoder(["nowe jezdnie.", "nowe jezdnie.", "Jezdnie, i chodniki"], config=config)
+    feed_decode_step(decoder, clock, config)
+    feed_silence(decoder, 12)  # utterance 1 ends on "jezdnie."
+    feed_decode_step(decoder, clock, config)  # utterance 2 starts with "Jezdnie,"
+    finals = [e.text for e in events if e.type is CaptionEventType.FINAL]
+    assert finals[-1] == "i chodniki"

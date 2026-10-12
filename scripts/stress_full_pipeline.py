@@ -76,12 +76,16 @@ wer = _wer
 # PipeWire virtual mic
 # --------------------------------------------------------------------------
 
-def ensure_virtual_mic() -> None:
+def ensure_virtual_mic() -> subprocess.Popen | None:
+    """Start the PipeWire loopback (virtual mic) unless one already exists.
+    Returns the process when this call started it, so the caller can stop
+    it again: while it exists it is the desktop's DEFAULT audio source, so
+    leaving it behind silently changes the operator's microphone."""
     result = subprocess.run(["pw-cli", "ls", "Node"], capture_output=True, text=True)
     if SINK_NAME in result.stdout:
-        return
+        return None
     logger.info("starting virtual mic (%s -> %s)", SINK_NAME, SOURCE_NAME)
-    subprocess.Popen(
+    loopback = subprocess.Popen(
         [
             "pw-loopback", "-n", "Narrator Mic Sink",
             "--capture-props", f'media.class=Audio/Sink node.name={SINK_NAME} node.description="Narrator Mic Sink"',
@@ -91,6 +95,7 @@ def ensure_virtual_mic() -> None:
         stderr=subprocess.DEVNULL,
     )
     time.sleep(1.0)
+    return loopback
 
 
 def resolve_input_device() -> str:
@@ -294,6 +299,32 @@ def run_once(windows: list[ClipWindow], config_path: Path) -> dict:
         controller.stop()
 
 
+def _run_passes(args, overrides: dict) -> list[dict]:
+    device_name = resolve_input_device()
+    first_wav = CLIPS_DIR / "intro.wav"
+    if not first_wav.exists():
+        raise SystemExit("clips missing; run scripts/gen_test_clips.py first")
+    preflight_capture_plays_audio(device_name, first_wav)
+
+    windows = load_schedule(args.repeats, args.gap)
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    config_path = OUT_DIR / "stress_config.yaml"
+    write_config(config_path, overrides, args.language)
+
+    passes = []
+    for pass_index in range(args.passes):
+        logger.info("=== pass %d/%d ===", pass_index + 1, args.passes)
+        result = run_once(windows, config_path)
+        passes.append(result)
+        logger.info(
+            "pass %d: WER mean=%.3f, finalize latency mean=%ss, empty clips=%d",
+            pass_index + 1, result["wer_mean"], result["latency_mean_s"], result["clips_empty"],
+        )
+
+    return passes
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -322,28 +353,14 @@ def main() -> None:
     if args.end_silence_ms:
         overrides["end_silence_ms"] = args.end_silence_ms
 
-    ensure_virtual_mic()
-    device_name = resolve_input_device()
-    first_wav = CLIPS_DIR / "intro.wav"
-    if not first_wav.exists():
-        raise SystemExit("clips missing; run scripts/gen_test_clips.py first")
-    preflight_capture_plays_audio(device_name, first_wav)
-
-    windows = load_schedule(args.repeats, args.gap)
-
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    config_path = OUT_DIR / "stress_config.yaml"
-    write_config(config_path, overrides, args.language)
-
-    passes = []
-    for pass_index in range(args.passes):
-        logger.info("=== pass %d/%d ===", pass_index + 1, args.passes)
-        result = run_once(windows, config_path)
-        passes.append(result)
-        logger.info(
-            "pass %d: WER mean=%.3f, finalize latency mean=%ss, empty clips=%d",
-            pass_index + 1, result["wer_mean"], result["latency_mean_s"], result["clips_empty"],
-        )
+    loopback = ensure_virtual_mic()
+    try:
+        passes = _run_passes(args, overrides)
+    finally:
+        if loopback is not None:
+            logger.info("stopping the virtual mic this run started")
+            loopback.terminate()
+            loopback.wait(timeout=10)
 
     # Two determinism levels: exact transcript text (affected by whisper's
     # punctuation/casing jitter and by ms-level window-padding differences

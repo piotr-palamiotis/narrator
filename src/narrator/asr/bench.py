@@ -10,11 +10,15 @@ Design notes:
   * Inference params mirror backend.py's decode-time choices exactly
     (audio_ctx sized to the window, temperature_inc=0) so results transfer
     to the live pipeline.
-  * Windows are cut from the stress fixtures (scripts/test_clips/*.wav) when
-    present; otherwise a fixed deterministic pseudo-speech carrier is
-    synthesized, so the bench is runnable on any machine. Whisper's output
-    text on the synthetic carrier is irrelevant: the bench measures decode
-    *time*, which is dominated by window length, not by the exact words.
+  * Windows are cut from a real library excerpt when the caller passes one
+    (`audio_npy`, an int16 .npy from the autoconfigure cache), else from the
+    stress fixtures (scripts/test_clips/*.wav) when present; otherwise a
+    fixed deterministic pseudo-speech carrier is synthesized, so the bench
+    is runnable on any machine. Whisper's output text is irrelevant: the
+    bench measures decode *time*, dominated by window length.
+  * Language detection is timed too (`detect_seconds`): with a multi-entry
+    whitelist the decoder runs it once per utterance, and the streaming
+    replay (stream_sim) charges it to the worker like a decode.
   * For each window size we report the median of several reps (first rep
     discarded as warm-up), because a single-shot number on Vulkan includes
     one-time shader-compilation jitter.
@@ -72,35 +76,69 @@ def _synthetic_audio(seconds: float) -> np.ndarray:
     return audio.astype(np.float32)
 
 
-def _bench_model(model: str, device: str, windows_s: list[float]) -> dict:
+def _load_npy_audio(path: str) -> np.ndarray | None:
+    try:
+        return np.load(path).astype(np.float32) / 32768.0
+    except Exception:
+        logger.debug("could not load bench audio from %s", path)
+        return None
+
+
+def _bench_model(model: str, device: str, windows_s: list[float], audio_npy: str | None = None) -> dict:
     from narrator.asr.backend import WhisperBackend, audio_ctx_for_seconds
     from narrator.config.schema import AsrConfig
 
     config = AsrConfig(model=model, device=device, language_whitelist=["pl"])
+    print(f"[bench] loading model '{model}' on device '{device}'...", file=sys.stderr, flush=True)
     backend = WhisperBackend(config)
+    print(f"[bench] model loaded: {backend.resolved_device_description}", file=sys.stderr, flush=True)
 
-    audio = _load_real_audio()
+    audio = _load_npy_audio(audio_npy) if audio_npy else None
+    if audio is None:
+        audio = _load_real_audio()
     needed = max(windows_s) + 1.0
     if audio is None or len(audio) / SAMPLE_RATE < needed:
         audio = _synthetic_audio(needed)
+        print(f"[bench] using synthetic audio ({needed:.1f}s)", file=sys.stderr, flush=True)
+    else:
+        duration = len(audio) / SAMPLE_RATE
+        print(f"[bench] loaded {duration:.1f}s of real fixtures", file=sys.stderr, flush=True)
 
     results = {}
     for window_s in windows_s:
         samples = audio[: int(window_s * SAMPLE_RATE)]
+        print(f"[bench] warmup + timing {window_s:.1f}s window...", file=sys.stderr, flush=True)
         # warm-up rep: first Vulkan call pays one-time shader compilation
         backend.transcribe(samples)
         timings = []
-        for _ in range(_TIMED_REPS):
+        for rep in range(_TIMED_REPS):
             start = time.monotonic()
             backend.transcribe(samples)
-            timings.append(time.monotonic() - start)
+            elapsed = time.monotonic() - start
+            timings.append(elapsed)
+            print(f"[bench]   {window_s:.1f}s rep {rep + 1}/{_TIMED_REPS}: {elapsed:.3f}s", file=sys.stderr, flush=True)
         results[f"{window_s:.1f}s"] = round(statistics.median(timings), 3)
+        print(f"[bench]   {window_s:.1f}s median: {results[f'{window_s:.1f}s']:.3f}s", file=sys.stderr, flush=True)
+
+    # Language detection: a fixed-size slice regardless of window length
+    # (backend._LANGUAGE_DETECT_MAX_SECONDS), so one size suffices.
+    detect_audio = audio[: int(5.0 * SAMPLE_RATE)]
+    backend.detect_language(detect_audio)  # warm-up
+    detect_timings = []
+    for _ in range(_TIMED_REPS):
+        start = time.monotonic()
+        backend.detect_language(detect_audio)
+        detect_timings.append(time.monotonic() - start)
+    detect_seconds = round(statistics.median(detect_timings), 3)
+    print(f"[bench]   language detection median: {detect_seconds:.3f}s", file=sys.stderr, flush=True)
+    backend.close()
 
     return {
         "model": model,
         "device": device,
         "resolved_device": backend.resolved_device_description,
         "decode_seconds_by_window": results,
+        "detect_seconds": detect_seconds,
     }
 
 
@@ -109,13 +147,16 @@ def main() -> int:
         payload = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
         model = payload.get("model", "medium")
         device = payload.get("device", "auto")
-        windows = payload.get("windows_s", [2.0, 5.0, 10.0])
-        result = _bench_model(model, str(device), [float(w) for w in windows])
-        print("BENCH_JSON:" + json.dumps(result))
+        windows = payload.get("windows_s", [2.0, 5.0, 10.0, 20.0])
+        result = _bench_model(
+            model, str(device), [float(w) for w in windows], payload.get("audio_npy")
+        )
+        print("BENCH_JSON:" + json.dumps(result), flush=True)
         return 0
     except Exception as exc:
         # Single JSON error line on stdout; human-readable detail on stderr.
-        print("BENCH_JSON:" + json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
+        print(f"[bench] failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        print("BENCH_JSON:" + json.dumps({"error": f"{type(exc).__name__}: {exc}"}), flush=True)
         logger.exception("benchmark failed")
         return 1
 

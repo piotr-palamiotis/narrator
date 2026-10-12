@@ -1,6 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
+from narrator.config.loader import load_config, save_config
 from narrator.config.schema import CanvasConfig, LayoutConfig, RootConfig
 
 
@@ -105,10 +106,91 @@ def test_wipe_screen_after_silence_defaults_to_disabled():
         AsrConfig(wipe_screen_after_silence_seconds=-1.0)
 
 
+def test_max_utterance_may_be_below_max_context():
+    """The decoder rolls over at the smaller of the two, so any combination
+    is valid (the old cross-field rule no longer applies)."""
+    from narrator.config.schema import AsrConfig
+
+    config = RootConfig(asr=AsrConfig(max_context_seconds=30, max_utterance_ms=25000))
+    assert config.asr.max_utterance_ms == 25000
+
+
+def test_preroll_and_prompt_carryover_bounds():
+    from narrator.config.schema import AsrConfig
+
+    config = AsrConfig()
+    assert config.vad_preroll_ms == 0 and config.prompt_carryover_chars == 0
+    assert AsrConfig(vad_preroll_ms=250, prompt_carryover_chars=200).vad_preroll_ms == 250
+    with pytest.raises(ValidationError):
+        AsrConfig(vad_preroll_ms=-1)
+    with pytest.raises(ValidationError):
+        AsrConfig(prompt_carryover_chars=5000)
+
+
 def test_asr_gpu_device_accepts_explicit_index():
     from narrator.config.schema import AsrConfig
 
     assert AsrConfig(gpu_device=1).gpu_device == 1
+
+
+def test_autoconfigure_section_defaults_and_bounds():
+    from narrator.config.schema import AutoconfigureConfig
+
+    ac = AutoconfigureConfig()
+    assert ac.candidate_models[:2] == ["large-v3", "large-v3-turbo"]
+    assert ac.time_budget_minutes == pytest.approx(720.0)
+    assert ac.max_latency_s == pytest.approx(3.0)
+    assert (ac.screen_excerpts, ac.dev_excerpts, ac.holdout_excerpts) == (32, 96, 48)
+    assert ac.reference_languages == ["pl"]
+
+    # the screen set is the first part of the dev set
+    with pytest.raises(ValidationError):
+        AutoconfigureConfig(screen_excerpts=50, dev_excerpts=40)
+    # only searchable settings, each with at least one value
+    with pytest.raises(ValidationError):
+        AutoconfigureConfig(search_space={"font_size": [10]})
+    with pytest.raises(ValidationError):
+        AutoconfigureConfig(search_space={"step_ms": []})
+    with pytest.raises(ValidationError):
+        AutoconfigureConfig(reference_languages=["xx"])
+    assert AutoconfigureConfig(search_space={"step_ms": [400, 600]}).search_space == {"step_ms": [400, 600]}
+
+
+def test_autoconfigure_section_round_trips_and_ignores_retired_keys(tmp_path):
+    """Settings survive load -> save -> reload and drive autoconfigure's
+    Tuning; keys of the previous autoconfigure design in an existing
+    config.yaml (wer_floor, speed weights, ...) load without error."""
+    import yaml as yaml_mod
+
+    from narrator.asr.autoconfigure import Tuning
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml_mod.safe_dump(
+            {
+                "autoconfigure": {
+                    "max_latency_s": 2.0,
+                    "time_budget_minutes": 90,
+                    "wer_floor": 0.6,
+                    "speed_weight": 0.5,
+                    "real_excerpts": 4,
+                },
+                "asr": {"max_utterance_ms": 25000, "max_context_seconds": 20},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    loaded = load_config(config_path)
+    assert loaded.autoconfigure.max_latency_s == pytest.approx(2.0)
+    save_config(loaded, config_path)
+    reloaded = load_config(config_path)
+    assert reloaded.autoconfigure.time_budget_minutes == pytest.approx(90.0)
+
+    tuning = Tuning.from_config(reloaded)
+    assert tuning.max_latency_s == pytest.approx(2.0)
+    assert tuning.time_budget_minutes == pytest.approx(90.0)
+    assert tuning.slow_factor == pytest.approx(1.5)  # untouched fields keep defaults
 
 
 def test_asr_gpu_device_rejects_nonsense():
