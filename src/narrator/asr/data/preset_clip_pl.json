@@ -1,0 +1,43 @@
+{
+ "description": "Deterministic Polish speech for `narrator --pick-preset`: the six Piper fixtures of scripts/test_clips (voice pl_PL-darkman-medium, zero noise scales) resampled to 16 kHz mono and concatenated in manifest order, 0.5 s of silence first and 1.0 s after each clip.",
+ "sample_rate": 16000,
+ "duration_s": 34.346,
+ "segments": [
+  {
+   "id": "intro",
+   "start_s": 0.5,
+   "end_s": 2.706,
+   "reference": "Witajcie na dzisiejszym spotkaniu."
+  },
+  {
+   "id": "numbers",
+   "start_s": 3.706,
+   "end_s": 7.421,
+   "reference": "W roku 2000 miasto liczyło 15 tysięcy mieszkańców."
+  },
+  {
+   "id": "tech",
+   "start_s": 8.421,
+   "end_s": 12.38,
+   "reference": "Napisy na żywo powstają w oparciu o lokalny model rozpoznawania mowy."
+  },
+  {
+   "id": "punct",
+   "start_s": 13.38,
+   "end_s": 16.787,
+   "reference": "Czy to działa? Tak, działa bardzo dobrze!"
+  },
+  {
+   "id": "long",
+   "start_s": 17.787,
+   "end_s": 26.727,
+   "reference": "To zdanie jest znacznie dłuższe niż pozostałe, żeby sprawdzić, jak dekoder radzi sobie z dłuższą wypowiedzią bez przerwy pomiędzy słowami, gdy okno dekodera rośnie."
+  },
+  {
+   "id": "mixed",
+   "start_s": 27.727,
+   "end_s": 33.346,
+   "reference": "System działa na procesorze, na karcie graficznej, albo przełącza się na procesor awaryjnie."
+  }
+ ]
+}

@@ -17,7 +17,6 @@ import time
 from fractions import Fraction
 
 import numpy as np
-from cyndilib import FourCC, Sender, VideoSendFrame
 
 from narrator.config.schema import CanvasConfig, NdiConfig
 from narrator.render.canvas import CaptionRenderer
@@ -27,6 +26,11 @@ logger = logging.getLogger(__name__)
 
 class NdiCaptionSender:
     def __init__(self, config: NdiConfig, canvas: CanvasConfig) -> None:
+        # Imported here, not at module level: a missing cyndilib / NDI
+        # runtime then fails only the NDI output (AppController shows it as a
+        # problem), never the import of the whole app.
+        from cyndilib import FourCC, Sender, VideoSendFrame
+
         self._sender = Sender(ndi_name=config.source_name)
         self._video_frame = VideoSendFrame()
         self._video_frame.set_resolution(canvas.width_px, canvas.height_px)

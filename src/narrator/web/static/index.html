@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Narrator</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <h1 class="brand">Narrator</h1>
+  <div class="pills" aria-live="polite">
+    <span id="asr-pill" class="pill bad">ASR inactive</span>
+    <span id="backend" class="muted small"></span>
+    <span id="mode-pill" class="pill">Auto</span>
+    <span id="paused-pill" class="pill warn" hidden>Captions paused</span>
+    <span id="rec-pill" class="pill rec" hidden title="Recording audio and on-air captions">REC</span>
+    <span class="meter-wrap" title="Input level">
+      <span class="small muted">Mic</span>
+      <span class="meter"><span id="meter-bar" class="meter-bar"></span></span>
+    </span>
+    <span id="conn" class="pill bad">Offline</span>
+  </div>
+  <button id="help-btn" class="ghost" type="button" title="Keyboard shortcuts">?</button>
+</header>
+
+<section id="problems" class="problems" aria-label="Problems" aria-live="polite" hidden>
+  <div class="problems-head">
+    <h2 class="sub">Problems</h2>
+    <button type="button" id="recheck-btn" class="ghost small-btn">Check again</button>
+  </div>
+  <ul id="problem-list" class="problem-list"></ul>
+</section>
+
+<main class="layout">
+  <section class="panel live" aria-label="Live captions">
+    <div class="preview-box" id="preview-box">
+      <img id="preview" alt="Live caption preview">
+      <div id="guides" class="guides" hidden></div>
+    </div>
+    <div class="preview-meta">
+      <label class="small"><input type="checkbox" id="guides-toggle" checked> Margin guides</label>
+      <span id="preview-note" class="small muted"></span>
+    </div>
+
+    <div class="controls">
+      <div class="segmented" role="group" aria-label="Caption mode">
+        <button type="button" id="mode-auto" aria-pressed="true">Auto</button>
+        <button type="button" id="mode-manual" aria-pressed="false">Manual</button>
+      </div>
+      <button type="button" id="clear-btn" class="danger">Clear</button>
+      <button type="button" id="pause-btn">Pause captions</button>
+      <button type="button" id="rec-btn" disabled>Record</button>
+    </div>
+
+    <form class="manual" id="manual-form" autocomplete="off">
+      <input id="manual-entry" type="text" maxlength="2000" placeholder="Type a caption, Enter to send" aria-label="Manual caption">
+      <button type="submit">Send</button>
+    </form>
+    <p id="manual-hint" class="small muted"></p>
+
+    <h2 class="sub">On air</h2>
+    <div id="on-air" class="on-air" aria-live="polite"></div>
+
+    <h2 class="sub">What ASR hears</h2>
+    <ol id="feed" class="feed"></ol>
+  </section>
+
+  <section class="panel settings" aria-label="Settings">
+    <nav id="tabs" class="tabs" role="tablist"></nav>
+    <div id="banner" class="banner" hidden></div>
+    <div id="tab-panels" class="tab-panels"></div>
+    <ul id="error-summary" class="error-summary" hidden></ul>
+    <footer class="savebar">
+      <span id="dirty" class="small muted">No unsaved changes</span>
+      <span class="spacer"></span>
+      <button type="button" id="revert-btn" class="ghost" disabled>Revert</button>
+      <button type="button" id="save-btn" class="primary" disabled>Save</button>
+    </footer>
+  </section>
+</main>
+
+<div id="help" class="overlay" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="help-title">
+    <h2 id="help-title">Keyboard shortcuts</h2>
+    <table id="help-table" class="kbd-table"></table>
+    <p class="small muted">Shortcuts work anywhere on the page, also while typing (single keys such as
+      <kbd>?</kbd> are not taken from text fields). Change them on the <em>Web &amp; remote</em> tab.
+      Ctrl+N/T/W and other keys the browser keeps for itself cannot be used.</p>
+    <button type="button" id="help-close">Close</button>
+  </div>
+</div>
+<div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

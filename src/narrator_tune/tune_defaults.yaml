@@ -1,0 +1,28 @@
+# Settings for `narrator-tune configure` (make configure), which searches the
+# whisper model and decode settings (asr.*) under which narrator's live
+# captions best match the reference recordings in scripts/test_audio/, and
+# writes the winner into narrator's config.yaml. narrator itself never reads
+# this file. Schema: narrator_tune.config.TuneConfig. Created from the
+# template narrator_tune/tune_defaults.yaml on the first run.
+
+candidate_models: ["large-v3", "large-v3-turbo", "medium", "small", "base", "tiny"]
+# Models slower than this multiple of real time can't caption live here.
+slow_factor: 1.5
+# Wall-clock budget for new decoding (results are cached across runs).
+time_budget_minutes: 720
+# Max median delay from spoken word to caption (s); 0 = no cap.
+max_latency_s: 3.0
+# Evaluation sample: fixed-length excerpts spread across recordings.
+excerpt_seconds: 90
+screen_excerpts: 32
+dev_excerpts: 96
+holdout_excerpts: 48
+# Subtitle languages that are scored ("Title (Polish_ASR).srt").
+reference_languages: ["pl"]
+# Drop excerpts whose reference even offline large-v3 can't match.
+max_ceiling_wer: 0.85
+# Disk guards for the decoded-excerpt cache (var/tune/cache).
+min_free_disk_mb: 1024
+cache_max_mb: 1024
+# Optional value grids replacing the built-in ones, e.g. {step_ms: [400, 600]}.
+search_space: {}

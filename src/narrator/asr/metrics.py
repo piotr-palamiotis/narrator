@@ -1,6 +1,6 @@
 """Shared transcript scoring: normalization, WER, word-doubling detection,
 word alignment with an edit breakdown, plus the 16kHz mono WAV loader used
-by the autoconfigure bench/probe subprocesses (piper fixtures are 22.05kHz;
+by the narrator-tune bench/probe subprocesses (piper fixtures are 22.05kHz;
 the live pipeline resamples in the capture path, but direct file loading
 must resample itself).
 """

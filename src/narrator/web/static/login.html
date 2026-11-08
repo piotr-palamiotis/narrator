@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Narrator login</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<script src="/static/login.js" defer></script>
+</head>
+<body class="login-page">
+<main class="login">
+  <h1>Narrator</h1>
+  <p>Run <code>narrator --open-ui</code> on this machine to open the admin UI logged in, or paste this
+    run's login token. It is printed to the log at startup
+    (<code>journalctl --user -u narrator | grep "login token"</code>) and stored in
+    <code>var/web-token.json</code>.</p>
+  <p id="login-error" class="err" hidden>That token was not accepted (tokens change on every start).</p>
+  <form method="post" action="/auth">
+    <label for="token">Login token</label>
+    <input id="token" name="token" type="password" autocomplete="off" required autofocus>
+    <button type="submit" class="primary">Log in</button>
+  </form>
+</main>
+</body>
+</html>

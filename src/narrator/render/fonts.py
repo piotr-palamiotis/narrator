@@ -8,7 +8,9 @@ from pathlib import Path
 
 from PIL import ImageFont
 
-_FALLBACK_FONT = str(Path(__file__).resolve().parents[3] / "assets" / "fonts" / "NotoSans-Regular.ttf")
+from narrator.paths import bundled_assets_dir
+
+_FALLBACK_FONT = str(bundled_assets_dir() / "fonts" / "NotoSans-Regular.ttf")
 
 _font_cache: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
 

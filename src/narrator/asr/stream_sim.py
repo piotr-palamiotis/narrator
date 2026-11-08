@@ -8,7 +8,9 @@ the next tick (worker.py, StreamingDecoder.tick). Replaying audio in real
 time reproduces that, at one hour per hour of audio per configuration; the
 old quality probe did exactly that and timed out on every candidate.
 
-This module replays the same sequence on a VIRTUAL clock:
+It drives whichever decoder `asr.decoder` selects (local agreement or the
+segmenter; decoder_common.create_decoder) and replays the same sequence on
+a VIRTUAL clock:
   * the clock is audio time -- frame k is fully captured at (k+1) * 30 ms;
   * every backend call (decode or language detection) is charged a cost by
     a `DecodeCostModel` and occupies the worker: it starts at
@@ -17,7 +19,9 @@ This module replays the same sequence on a VIRTUAL clock:
     same as the live drain that follows it (same order, same decoder
     state) -- and `tick()` runs only once the worker is free again;
   * FINAL captions are stamped with the completion time of the call that
-    produced them: when the audience would have seen them.
+    produced them: when the audience would have seen them. PARTIALs are
+    recorded the same way (as word counts), for the first-visible-text
+    delay -- with partials, words are on screen before their FINAL.
 
 With a fitted cost model the replay is deterministic -- identical inputs
 give identical captions, so two configurations are compared without GPU
@@ -35,8 +39,9 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from narrator.asr.asr_backend import AsrBackend
+from narrator.asr.decoder_common import create_decoder
 from narrator.asr.events import CaptionEvent, CaptionEventType
-from narrator.asr.streaming_decoder import StreamingDecoder
 from narrator.asr.vad import SileroVad
 from narrator.config.schema import AsrConfig
 
@@ -56,14 +61,29 @@ class DecodeCostModel:
     the call returns, so charging it keeps the replay deterministic.
     Language detection is the constant `detect_s` (it always runs on a
     fixed-size slice, backend.py).
+
+    The segmenter makes two kinds of decode: a FINAL of a closed segment
+    and a peek (PARTIAL) of an open one -- both whole-segment decodes, so
+    both a function of segment length. The `peek_*` terms, when fitted
+    from enough measured peeks, cost peeks separately; unset, a peek costs
+    what a decode of the same length does.
     """
 
     base_s: float
     per_audio_s: float
     detect_s: float = 0.0
     per_word_s: float = 0.0
+    peek_base_s: float | None = None
+    peek_per_audio_s: float | None = None
+    peek_per_word_s: float | None = None
 
-    def decode_seconds(self, window_seconds: float, words: int = 0) -> float:
+    def decode_seconds(self, window_seconds: float, words: int = 0, peek: bool = False) -> float:
+        if peek and self.peek_base_s is not None:
+            return (
+                self.peek_base_s
+                + (self.peek_per_audio_s or 0.0) * window_seconds
+                + (self.peek_per_word_s or 0.0) * words
+            )
         return self.base_s + self.per_audio_s * window_seconds + self.per_word_s * words
 
     def typical_decode_seconds(self) -> float:
@@ -72,7 +92,12 @@ class DecodeCostModel:
         return self.decode_seconds(10.0, 25)
 
     @classmethod
-    def fit_calls(cls, calls: list[tuple[float, int, float]], detect_s: float) -> "DecodeCostModel":
+    def fit_calls(
+        cls,
+        calls: list[tuple[float, int, float]],
+        detect_s: float,
+        peek_calls: list[tuple[float, int, float]] = (),
+    ) -> "DecodeCostModel":
         """Least-squares fit of (window seconds, words emitted, seconds)
         triples measured on real streaming decodes, coefficients kept
         non-negative (a term that fits negative is dropped and the rest
@@ -84,14 +109,21 @@ class DecodeCostModel:
         (the probe warms up before timed decodes)."""
         if len(calls) < 3:
             raise ValueError("need at least 3 measured decode calls to fit a cost model")
-        x = np.array([[1.0, w, n] for w, n, _ in calls], dtype=np.float64)
-        y = np.array([t for _, _, t in calls], dtype=np.float64)
-        coef = _nonnegative_lstsq(x, y)
+        coef = _fit_triples(calls)
+        peek: dict[str, float] = {}
+        if len(peek_calls) >= MIN_PEEK_CALLS_TO_FIT:
+            pc = _fit_triples(peek_calls)
+            peek = {
+                "peek_base_s": round(float(pc[0]), 3),
+                "peek_per_audio_s": round(float(pc[1]), 4),
+                "peek_per_word_s": round(float(pc[2]), 4),
+            }
         return cls(
             base_s=round(float(coef[0]), 3),
             per_audio_s=round(float(coef[1]), 4),
             detect_s=round(max(detect_s, 0.0), 3),
             per_word_s=round(float(coef[2]), 4),
+            **peek,
         )
 
     @classmethod
@@ -129,21 +161,43 @@ class DecodeCostModel:
         )
 
     def to_dict(self) -> dict[str, float]:
-        return {
+        data = {
             "base_s": self.base_s,
             "per_audio_s": self.per_audio_s,
             "detect_s": self.detect_s,
             "per_word_s": self.per_word_s,
         }
+        # Only when fitted: an unchanged dict keeps cached results' keys.
+        for name in ("peek_base_s", "peek_per_audio_s", "peek_per_word_s"):
+            if getattr(self, name) is not None:
+                data[name] = getattr(self, name)
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "DecodeCostModel":
+        optional = {
+            name: float(data[name])
+            for name in ("peek_base_s", "peek_per_audio_s", "peek_per_word_s")
+            if data.get(name) is not None
+        }
         return cls(
             base_s=float(data["base_s"]),
             per_audio_s=float(data["per_audio_s"]),
             detect_s=float(data.get("detect_s", 0.0)),
             per_word_s=float(data.get("per_word_s", 0.0)),
+            **optional,
         )
+
+
+# Peeks are only costed separately once this many were measured.
+MIN_PEEK_CALLS_TO_FIT = 10
+
+
+def _fit_triples(calls) -> np.ndarray:
+    """Non-negative least squares of seconds ~ 1 + window + words."""
+    x = np.array([[1.0, w, n] for w, n, _ in calls], dtype=np.float64)
+    y = np.array([t for _, _, t in calls], dtype=np.float64)
+    return _nonnegative_lstsq(x, y)
 
 
 def _nonnegative_lstsq(x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -179,7 +233,7 @@ class _TimedBackend:
     stamped with.
     """
 
-    def __init__(self, backend, clock: VirtualClock, cost: DecodeCostModel | None, measured: bool) -> None:
+    def __init__(self, backend: AsrBackend, clock: VirtualClock, cost: DecodeCostModel | None, measured: bool) -> None:
         if cost is None and not measured:
             raise ValueError("a cost model is required unless measured=True")
         self._backend = backend
@@ -195,7 +249,9 @@ class _TimedBackend:
         # (window seconds, words emitted, wall seconds) per decode, measured
         # mode only: the data a cost model is calibrated from
         self.measured_calls: list[tuple[float, int, float]] = []
+        self.measured_peek_calls: list[tuple[float, int, float]] = []
         self.measured_detect: list[float] = []
+        self.peek_calls = 0
 
     @property
     def resolved_device_description(self) -> str:
@@ -219,6 +275,29 @@ class _TimedBackend:
         if self._measured:
             self.measured_calls.append((round(window, 3), words, round(wall, 4)))
         self.decode_calls += 1
+        language = kwargs.get("language")
+        if language:
+            self.languages[str(language)] += 1
+        return result
+
+    def decode_segment(self, audio: np.ndarray, *args, peek: bool = False, **kwargs):
+        """The segmenter's whole-segment decode, charged as a peek or a
+        final (see DecodeCostModel)."""
+        started = time.monotonic()
+        result = self._backend.decode_segment(audio, *args, peek=peek, **kwargs)
+        wall = time.monotonic() - started
+        window = len(audio) / SAMPLE_RATE
+        words = len(result.text.split())
+        modeled = self._cost.decode_seconds(window, words, peek=peek) if self._cost else 0.0
+        self._charge(modeled, wall)
+        if self._measured:
+            (self.measured_peek_calls if peek else self.measured_calls).append(
+                (round(window, 3), words, round(wall, 4))
+            )
+        if peek:
+            self.peek_calls += 1
+        else:
+            self.decode_calls += 1
         language = kwargs.get("language")
         if language:
             self.languages[str(language)] += 1
@@ -251,6 +330,12 @@ class SimResult:
     # measured mode only: per-call timings (see _TimedBackend)
     calls: list[tuple[float, int, float]] = field(default_factory=list)
     detects: list[float] = field(default_factory=list)
+    # PARTIALs as (emit time, index of the FINAL they precede, word count):
+    # word k of that FINAL was first visible at the earliest partial with
+    # more than k words (the first-visible-text delay).
+    partials: list[tuple[float, int, int]] = field(default_factory=list)
+    peek_calls: int = 0  # segmenter peeks (partial decodes)
+    peek_timings: list[tuple[float, int, float]] = field(default_factory=list)  # measured mode
 
     @property
     def busy_fraction(self) -> float:
@@ -272,6 +357,9 @@ class SimResult:
             "languages": dict(self.languages),
             "rollovers": self.rollovers,
             **({"calls": [list(c) for c in self.calls], "detects": self.detects} if self.calls else {}),
+            **({"partials": [[round(t, 3), i, n] for t, i, n in self.partials]} if self.partials else {}),
+            **({"peek_calls": self.peek_calls} if self.peek_calls else {}),
+            **({"peek_timings": [list(c) for c in self.peek_timings]} if self.peek_timings else {}),
         }
 
     @classmethod
@@ -286,11 +374,32 @@ class SimResult:
             rollovers=int(data.get("rollovers", 0)),
             calls=[(float(w), int(n), float(t)) for w, n, t in data.get("calls", [])],
             detects=[float(t) for t in data.get("detects", [])],
+            partials=[(float(t), int(i), int(n)) for t, i, n in data.get("partials", [])],
+            peek_calls=int(data.get("peek_calls", 0)),
+            peek_timings=[(float(w), int(n), float(t)) for w, n, t in data.get("peek_timings", [])],
         )
+
+    def first_visible_times(self) -> list[list[float]]:
+        """Per FINAL, when each of its words first appeared on screen: the
+        earliest preceding PARTIAL (since the previous FINAL) that reached
+        that word position, else the FINAL itself. Positions are counted in
+        whitespace words; without partials this is the FINAL emit time."""
+        by_final: dict[int, list[tuple[float, int]]] = {}
+        for t, index, count in self.partials:
+            by_final.setdefault(index, []).append((t, count))
+        out: list[list[float]] = []
+        for index, (emitted_at, text) in enumerate(self.finals):
+            steps = sorted(by_final.get(index, []))
+            times = []
+            for position in range(len(text.split())):
+                seen = [t for t, count in steps if count > position]
+                times.append(min(seen[0], emitted_at) if seen else emitted_at)
+            out.append(times)
+        return out
 
 
 def simulate_stream(
-    backend,
+    backend: AsrBackend,
     config: AsrConfig,
     audio: np.ndarray,
     cost: DecodeCostModel | None = None,
@@ -300,21 +409,27 @@ def simulate_stream(
     sample_rate: int = SAMPLE_RATE,
     frame_ms: int = FRAME_MS,
 ) -> SimResult:
-    """Replay `audio` (mono float32) through a fresh StreamingDecoder as the
-    live worker would have processed it, on the virtual clock.
+    """Replay `audio` (mono float32) through a fresh decoder (the one
+    `config.decoder` selects) as the live worker would have processed it, on
+    the virtual clock.
 
     After the audio, silence is fed long enough to cross end_silence_ms so
-    the trailing utterance finalizes exactly as when a speaker stops.
+    the trailing utterance finalizes exactly as when a speaker stops (a
+    decoder with `flush()` -- the segmenter -- then closes whatever is still
+    open, e.g. a hybrid/fixed segment short of its duration).
     """
     clock = VirtualClock()
     timed = _TimedBackend(backend, clock, cost, measured)
     finals: list[tuple[float, str]] = []
+    partials: list[tuple[float, int, int]] = []
 
     def on_event(event: CaptionEvent) -> None:
         if event.type is CaptionEventType.FINAL and event.text.strip():
             finals.append((timed.completed_at, event.text.strip()))
+        elif event.type is CaptionEventType.PARTIAL and event.text.strip():
+            partials.append((timed.completed_at, len(finals), len(event.text.split())))
 
-    decoder = StreamingDecoder(
+    decoder = create_decoder(
         timed,
         vad if vad is not None else SileroVad(threshold=config.vad_threshold),
         config,
@@ -339,6 +454,9 @@ def simulate_stream(
     # Let a decode still in flight at the end complete before reading out.
     clock.now = max(clock.now, timed.busy_until) + frame_seconds
     decoder.tick()
+    flush = getattr(decoder, "flush", None)
+    if flush is not None:
+        flush()
 
     return SimResult(
         finals=finals,
@@ -350,4 +468,7 @@ def simulate_stream(
         rollovers=int(getattr(decoder, "rollover_count", 0)),
         calls=timed.measured_calls,
         detects=timed.measured_detect,
+        partials=partials,
+        peek_calls=timed.peek_calls,
+        peek_timings=timed.measured_peek_calls,
     )

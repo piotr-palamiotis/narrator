@@ -34,6 +34,8 @@ def make_controller() -> tuple[AppController, FakeRenderer]:
     controller._renderer = renderer
     controller._caption_mode = "auto"
     controller.resolved_asr_backend = "unresolved"
+    controller._transcript = None
+    controller._transcript_lock = threading.Lock()
     return controller, renderer
 
 
@@ -198,6 +200,8 @@ def make_lifecycle_controller(monkeypatch, processes):
     controller._asr_spawn_time = 0.0
     controller._consecutive_quick_crashes = 0
     controller._audio_queue = None
+    controller._transcript = None
+    controller._transcript_lock = threading.Lock()
     controller._event_queue = None
     # stop() support (the crash-loop policy path calls it)
     controller._stopped = False
@@ -287,13 +291,10 @@ def test_supervisor_ignores_a_worker_detached_for_restart(monkeypatch):
     assert len(spawned) == 1, "supervisor must not spawn while a restart is in flight"
 
 
-def test_crash_loop_terminates_app_instead_of_forcing_cpu(monkeypatch):
-    """The configured device is final by policy. The old behavior -- forcing
-    CPU after 3 quick crashes -- silently downgraded a GPU config the operator
-    explicitly chose. Now the supervisor stops the app with an explanation."""
-    dead = FakeProcess()
-    dead.alive = False
-    dead.exitcode = -6
+def test_crash_loop_halts_asr_but_keeps_the_app_running(monkeypatch):
+    """Failure policy (2026-10-17): after 3 quick crashes the supervisor
+    halts ASR -- no respawn, no app stop, and never a silent switch to CPU.
+    (It used to stop the app, exit 1; before that it forced CPU.)"""
     controller, spawned = make_lifecycle_controller(monkeypatch, [FakeProcess(), FakeProcess()])
     controller._consecutive_quick_crashes = 2  # one more quick crash trips it
     with controller._asr_lock:
@@ -303,14 +304,25 @@ def test_crash_loop_terminates_app_instead_of_forcing_cpu(monkeypatch):
 
     supervisor = threading.Thread(target=controller._supervise_asr_loop, daemon=True)
     supervisor.start()
-    supervisor.join(timeout=10)
+    deadline = time.monotonic() + 10
+    while not controller._asr_halted and time.monotonic() < deadline:
+        time.sleep(0.05)
+    time.sleep(1.5)  # a further supervisor pass must not respawn either
 
-    assert not supervisor.is_alive(), "supervisor must exit after tripping the breaker"
-    assert controller._stopped, "app must be stopped, not downgraded to CPU"
-    assert controller._stop_event.is_set()
-    # No force-CPU state exists anymore; a fresh spawn with the same device
-    # config is what stop() teardown implies.
-    assert controller._config.asr.device != AsrDevice.CPU
+    assert controller._asr_halted
+    assert supervisor.is_alive(), "the supervisor keeps running (a fix restarts ASR)"
+    assert not controller._stopped and not controller._stop_event.is_set(), "the app must stay up"
+    assert controller._asr_process is None
+    assert len(spawned) == 1, "no respawn after the halt"
+    assert controller._config.asr.unit != "cpu", "the unit is never changed by the app"
+
+    # A config change / the operator's Retry is a fresh attempt.
+    controller._restart_asr_process()
+    assert not controller._asr_halted
+    assert controller._consecutive_quick_crashes == 0
+    assert len(spawned) == 2
+    controller._stop_event.set()
+    supervisor.join(timeout=5)
 
 
 def test_drain_audio_queue_drops_stale_frames():
@@ -327,3 +339,21 @@ def test_drain_audio_queue_drops_stale_frames():
 
     assert drained == 3
     assert controller._audio_queue.empty()
+
+
+def test_asr_finals_go_to_the_transcript_in_both_caption_modes():
+    controller, renderer = make_controller()
+
+    class FakeTranscript:
+        def __init__(self):
+            self.texts = []
+
+        def add_final(self, event):
+            self.texts.append(event.text)
+
+    controller._transcript = FakeTranscript()
+    controller._handle_caption_event(CaptionEvent(CaptionEventType.FINAL, "auto"))
+    controller._handle_caption_event(CaptionEvent(CaptionEventType.PARTIAL, "not this"))
+    controller._caption_mode = "manual"
+    controller._handle_caption_event(CaptionEvent(CaptionEventType.FINAL, "manual"))
+    assert controller._transcript.texts == ["auto", "manual"]

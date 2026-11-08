@@ -1,6 +1,6 @@
 """Benchmark one ASR model on the local hardware and print JSON to stdout.
 
-Run inside a *subprocess* by narrator.asr.autoconfigure so a native crash or
+Run inside a *subprocess* by narrator_tune.autoconfigure so a native crash or
 a multi-minute model load cannot take down the orchestrator (same isolation
 reason the ASR worker is a process, not a thread). All stderr/log output is
 discarded by the caller; only the final `BENCH_JSON:`-prefixed line is
@@ -11,7 +11,7 @@ Design notes:
     (audio_ctx sized to the window, temperature_inc=0) so results transfer
     to the live pipeline.
   * Windows are cut from a real library excerpt when the caller passes one
-    (`audio_npy`, an int16 .npy from the autoconfigure cache), else from the
+    (`audio_npy`, an int16 .npy from the narrator-tune cache), else from the
     stress fixtures (scripts/test_clips/*.wav) when present; otherwise a
     fixed deterministic pseudo-speech carrier is synthesized, so the bench
     is runnable on any machine. Whisper's output text is irrelevant: the
@@ -84,13 +84,15 @@ def _load_npy_audio(path: str) -> np.ndarray | None:
         return None
 
 
-def _bench_model(model: str, device: str, windows_s: list[float], audio_npy: str | None = None) -> dict:
-    from narrator.asr.backend import WhisperBackend, audio_ctx_for_seconds
+def _bench_model(
+    model: str, unit: str, windows_s: list[float], audio_npy: str | None = None, unit_identity: str = ""
+) -> dict:
+    from narrator.asr.asr_backend import create_backend
     from narrator.config.schema import AsrConfig
 
-    config = AsrConfig(model=model, device=device, language_whitelist=["pl"])
-    print(f"[bench] loading model '{model}' on device '{device}'...", file=sys.stderr, flush=True)
-    backend = WhisperBackend(config)
+    config = AsrConfig(model=model, unit=unit, unit_identity=unit_identity, language_whitelist=["pl"])
+    print(f"[bench] loading model '{model}' on unit '{unit}'...", file=sys.stderr, flush=True)
+    backend = create_backend(config)
     print(f"[bench] model loaded: {backend.resolved_device_description}", file=sys.stderr, flush=True)
 
     audio = _load_npy_audio(audio_npy) if audio_npy else None
@@ -135,7 +137,9 @@ def _bench_model(model: str, device: str, windows_s: list[float], audio_npy: str
 
     return {
         "model": model,
-        "device": device,
+        "unit": unit,
+        # The unit's kind, under the name narrator-tune's cached benches use.
+        "device": config.unit_kind,
         "resolved_device": backend.resolved_device_description,
         "decode_seconds_by_window": results,
         "detect_seconds": detect_seconds,
@@ -146,10 +150,18 @@ def main() -> int:
     try:
         payload = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
         model = payload.get("model", "medium")
-        device = payload.get("device", "auto")
+        unit = payload.get("unit")
+        if unit is None:  # an older caller: asr.device + asr.gpu_device
+            from narrator.asr.units import unit_from_legacy
+
+            unit = unit_from_legacy(payload.get("device", "auto"), payload.get("gpu_device", "auto"))
         windows = payload.get("windows_s", [2.0, 5.0, 10.0, 20.0])
         result = _bench_model(
-            model, str(device), [float(w) for w in windows], payload.get("audio_npy")
+            model,
+            str(unit),
+            [float(w) for w in windows],
+            payload.get("audio_npy"),
+            str(payload.get("unit_identity", "")),
         )
         print("BENCH_JSON:" + json.dumps(result), flush=True)
         return 0

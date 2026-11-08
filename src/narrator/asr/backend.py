@@ -1,4 +1,4 @@
-"""whisper.cpp binding + GPU backend detection/selection/fallback.
+"""whisper.cpp binding + GPU backend detection/selection.
 
 Uses `pywhispercpp` (a pybind11 wrapper around whisper.cpp's C API) as the
 backend: `Model(name, context_params={"use_gpu": ...})` loads/keeps the model
@@ -7,196 +7,70 @@ resident, and `Model.transcribe()` runs inference on an in-memory numpy array
 needs (see streaming_decoder.py), unlike a CLI-subprocess-per-chunk or HTTP
 server approach which would reload the model every call.
 
-GPU support, verified empirically on this project's target hardware
-(Radeon RX 6700 XT / RADV, Mesa 25.2):
+The binding comes from a source build (packaging/whisper_cpp/
+build_vulkan_linux.sh: pywhispercpp v1.5.1's bindings over whisper.cpp
+v1.9.5, GGML_VULKAN=1, CPU backend compiled -march=native). The PyPI wheel
+is not usable here: it ships no Vulkan backend, and its CPU path SIGILLs at
+whisper_init on pre-AVX CPUs such as the Pentium G4560 test box. See
+packaging/whisper_cpp/README.md.
 
-  * The prebuilt `pywhispercpp` wheel on PyPI (1.5.1) **already ships a
-    Vulkan backend** -- it installs `libggml-vulkan.so` alongside
-    `libggml-cpu.so`, and `use_gpu=True` really does run inference on the
-    discrete GPU with no rebuild. An earlier revision of this file claimed a
-    from-source rebuild with `GGML_VULKAN=1` was required; that is not true
-    for current wheels and the claim has been removed rather than left to
-    mislead deployment.
-
-  * Those same wheels are built for **baseline x86-64**: disassembly of
-    `libggml-cpu.so`, `libggml-base.so`, `libwhisper.so` and
-    `libggml-vulkan.so` finds zero AVX/AVX2/FMA/VEX-encoded instructions.
-    They therefore load and run on pre-AVX CPUs (verified on a Pentium
-    G4560, which has only up to SSE4.2), so an explicitly configured CPU
-    device (asr.device: cpu) is safe everywhere and no CPU-specific build is
-    needed for deployment.
-
-Device detection is done by calling into `libvulkan.so.1` directly with
-ctypes rather than shelling out to the `vulkaninfo` CLI. `vulkaninfo` ships
-in the *vulkan-tools* package, which is a developer/diagnostic package and is
-routinely absent on machines that have a perfectly working Vulkan runtime
-(the ICD + `libvulkan.so.1` come from the driver package instead). The old
-CLI-based probe therefore reported "no Vulkan devices" on a machine with a
-working RX 6700 XT, producing a spurious warning and an unhelpful "Vulkan
-(GPU)" status label with no adapter name.
+GPU enumeration lives in vulkan_devices.py and the processing-unit list in
+units.py (asr.unit, todo C6); this module resolves the configured unit when
+the worker loads the model. The interface the decoders use is
+asr_backend.AsrBackend; WhisperBackend is its whisper.cpp implementation.
 """
 from __future__ import annotations
 
-import ctypes
 import logging
-from dataclasses import dataclass
+import os
+import re
+import time
 
 import numpy as np
 
-from narrator.config.schema import AsrConfig, AsrDevice
+from narrator.asr.asr_backend import (  # noqa: F401  (re-exported: older imports)
+    AsrBackend,
+    DevicePolicyError,
+    ModelLoadError,
+    SegmentResult,
+    SegmentToken,
+    WordTime,
+)
+from narrator.asr.vocabulary import build_initial_prompt
+from narrator.asr.vulkan_devices import (  # noqa: F401  (re-exported: older imports)
+    GpuSelectionError,
+    VulkanDevice,
+    select_gpu_index,
+    vulkan_devices as _vulkan_devices,
+)
+from narrator.config.schema import AsrConfig
 
 logger = logging.getLogger(__name__)
 
-# Vulkan constants (vulkan_core.h). Only the handful we need.
-_VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1
-_VK_SUCCESS = 0
-_VK_MAX_PHYSICAL_DEVICE_NAME_SIZE = 256
-_VK_PHYSICAL_DEVICE_TYPE_CPU = 4
-_VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU = 2
 
-_DEVICE_TYPE_NAMES = {
-    0: "other",
-    1: "integrated",
-    2: "discrete",
-    3: "virtual",
-    4: "cpu",
-}
+def _asr_build():
+    """The installed pywhispercpp build (package metadata only; a module
+    function so tests can fake it)."""
+    from narrator.asr import units as unit_mod
 
-# VkPhysicalDeviceProperties is ~824 bytes and ends with two large nested
-# structs (limits, sparseProperties) we never read. Rather than model those
-# field-for-field, hand Vulkan an over-sized buffer and slice the leading
-# scalar fields out by offset: apiVersion/driverVersion/vendorID/deviceID are
-# 4 bytes each (16 total), then deviceType (4), then deviceName.
-_PROPERTIES_BUFFER_SIZE = 2048
-_DEVICE_TYPE_OFFSET = 16
-_DEVICE_NAME_OFFSET = 20
+    return unit_mod.LocalProbes().asr_build()
 
 
-@dataclass(frozen=True)
-class VulkanDevice:
-    """One GPU as whisper.cpp/ggml will index it (see `_vulkan_devices`)."""
+def _cuda_devices():
+    """NVIDIA cards from nvidia-smi, PCI order ([] / None: unknown)."""
+    from narrator.asr import units as unit_mod
 
-    index: int
-    name: str
-    device_type: int
-
-    @property
-    def is_discrete(self) -> bool:
-        return self.device_type == _VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
-
-    def __str__(self) -> str:
-        kind = _DEVICE_TYPE_NAMES.get(self.device_type, str(self.device_type))
-        return f"{self.name} [{kind}]"
+    return unit_mod.LocalProbes().cuda_devices()
 
 
-class _VkInstanceCreateInfo(ctypes.Structure):
-    _fields_ = [
-        ("sType", ctypes.c_uint32),
-        ("pNext", ctypes.c_void_p),
-        ("flags", ctypes.c_uint32),
-        ("pApplicationInfo", ctypes.c_void_p),
-        ("enabledLayerCount", ctypes.c_uint32),
-        ("ppEnabledLayerNames", ctypes.c_void_p),
-        ("enabledExtensionCount", ctypes.c_uint32),
-        ("ppEnabledExtensionNames", ctypes.c_void_p),
-    ]
-
-
-def _vulkan_devices() -> list[VulkanDevice]:
-    """Enumerate Vulkan GPUs through `libvulkan.so.1` via ctypes.
-
-    Returns devices in ggml's own indexing order, which is what
-    `context_params["gpu_device"]` selects against. ggml's Vulkan backend
-    skips `VK_PHYSICAL_DEVICE_TYPE_CPU` adapters (software rasterizers such
-    as llvmpipe) when it builds its device list, so this filters them out
-    too -- otherwise a machine with llvmpipe installed would produce indices
-    here that don't line up with the ones whisper.cpp actually uses.
-
-    Any failure (no loader, no ICD, driver error) returns an empty list:
-    callers treat that as "couldn't confirm a GPU", not a hard "no GPU",
-    since whisper.cpp's own init remains the source of truth.
-    """
-    try:
-        lib = ctypes.CDLL("libvulkan.so.1")
-    except OSError:
-        try:
-            lib = ctypes.CDLL("vulkan-1.dll")  # Windows loader name
-        except OSError:
-            logger.debug("Vulkan loader not found; cannot enumerate GPUs")
-            return []
-
-    instance = ctypes.c_void_p()
-    create_info = _VkInstanceCreateInfo(sType=_VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO)
-    try:
-        if lib.vkCreateInstance(ctypes.byref(create_info), None, ctypes.byref(instance)) != _VK_SUCCESS:
-            logger.debug("vkCreateInstance failed; treating as no Vulkan devices")
-            return []
-    except (AttributeError, OSError):
-        logger.debug("Vulkan loader present but vkCreateInstance unusable")
-        return []
-
-    try:
-        count = ctypes.c_uint32(0)
-        if lib.vkEnumeratePhysicalDevices(instance, ctypes.byref(count), None) != _VK_SUCCESS:
-            return []
-        if count.value == 0:
-            return []
-        handles = (ctypes.c_void_p * count.value)()
-        if lib.vkEnumeratePhysicalDevices(instance, ctypes.byref(count), handles) != _VK_SUCCESS:
-            return []
-
-        devices: list[VulkanDevice] = []
-        for handle in handles:
-            buffer = ctypes.create_string_buffer(_PROPERTIES_BUFFER_SIZE)
-            lib.vkGetPhysicalDeviceProperties(handle, buffer)
-            raw = buffer.raw
-            device_type = int.from_bytes(
-                raw[_DEVICE_TYPE_OFFSET : _DEVICE_TYPE_OFFSET + 4], "little"
-            )
-            name = (
-                raw[_DEVICE_NAME_OFFSET : _DEVICE_NAME_OFFSET + _VK_MAX_PHYSICAL_DEVICE_NAME_SIZE]
-                .split(b"\0")[0]
-                .decode("utf-8", "replace")
-            )
-            if device_type == _VK_PHYSICAL_DEVICE_TYPE_CPU:
-                continue  # ggml skips software rasterizers; keep indices aligned
-            devices.append(VulkanDevice(index=len(devices), name=name, device_type=device_type))
-        return devices
-    finally:
-        try:
-            lib.vkDestroyInstance(instance, None)
-        except (AttributeError, OSError):
-            pass
+# CUDA numbers devices fastest-first by default; nvidia-smi (and so the
+# cuda:<n> unit ids) uses PCI bus order. Set before the CUDA runtime starts.
+_CUDA_DEVICE_ORDER_ENV = "CUDA_DEVICE_ORDER"
 
 
 def _vulkan_device_names() -> list[str]:
     """Backwards-compatible helper: just the adapter names, in ggml order."""
     return [device.name for device in _vulkan_devices()]
-
-
-def select_gpu_index(devices: list[VulkanDevice], configured: int | str) -> int:
-    """Resolve `asr.gpu_device` against the enumerated devices.
-
-    "auto" prefers the first discrete GPU, because the common failure mode is
-    a workstation whose integrated adapter enumerates first: whisper.cpp
-    would then default to `gpu_device=0` and run the model on the iGPU, which
-    is dramatically slower but fails silently (it still "uses the GPU").
-    """
-    if configured != "auto":
-        index = int(configured)
-        if devices and not any(device.index == index for device in devices):
-            logger.warning(
-                "asr.gpu_device=%d is not among the %d enumerated Vulkan device(s); "
-                "passing it to whisper.cpp anyway",
-                index,
-                len(devices),
-            )
-        return index
-
-    for device in devices:
-        if device.is_discrete:
-            return device.index
-    return 0
 
 
 # Roughly 200 tokens is far more than a max_context_seconds-sized window of
@@ -228,6 +102,84 @@ _LANGUAGE_DETECT_MAX_SECONDS = 2.0
 # length; a low-probability lock is exactly how Cyrillic Polish captions
 # happen. Returned probability is whisper's softmax over languages.
 _LANGUAGE_PROB_THRESHOLD = 0.5
+
+# ggml-vulkan's graph optimizer (node reordering for GPU concurrency) runs
+# on the CPU for every graph, i.e. for every decoded token. On the slow
+# Pentium G4560 host that costs more than it saves: measured on the
+# RTX 3070, large-v3 decode 12.6 ms/token with it vs 8.5 ms/token without
+# (whisper.cpp v1.9.5; v1.8.5: 9.2 vs 8.5), identical text. Disabled for
+# the worker process unless the environment already sets the variable;
+# NARRATOR_VK_GRAPH_OPTIMIZE=1 keeps ggml's default (on).
+_VK_GRAPH_OPTIMIZE_ENV = "GGML_VK_DISABLE_GRAPH_OPTIMIZE"
+
+# DTW alignment-head presets by model family (quantization suffixes such as
+# "-q5_0" are ignored); whisper.cpp's enum names.
+_DTW_PRESETS = {
+    "tiny": "WHISPER_AHEADS_TINY",
+    "tiny.en": "WHISPER_AHEADS_TINY_EN",
+    "base": "WHISPER_AHEADS_BASE",
+    "base.en": "WHISPER_AHEADS_BASE_EN",
+    "small": "WHISPER_AHEADS_SMALL",
+    "small.en": "WHISPER_AHEADS_SMALL_EN",
+    "medium": "WHISPER_AHEADS_MEDIUM",
+    "medium.en": "WHISPER_AHEADS_MEDIUM_EN",
+    "large-v1": "WHISPER_AHEADS_LARGE_V1",
+    "large-v2": "WHISPER_AHEADS_LARGE_V2",
+    "large-v3": "WHISPER_AHEADS_LARGE_V3",
+    "large-v3-turbo": "WHISPER_AHEADS_LARGE_V3_TURBO",
+}
+_QUANT_SUFFIX_RE = re.compile(r"-q\d(_\d|_k)?$")
+
+
+def dtw_preset_name(model: str) -> str | None:
+    """whisper.cpp's alignment-head preset for `model` (a name or a path to
+    ggml-<name>.bin), or None when the model family is unknown."""
+    name = model.rsplit("/", 1)[-1]
+    if name.startswith("ggml-") and name.endswith(".bin"):
+        name = name[len("ggml-") : -len(".bin")]
+    return _DTW_PRESETS.get(_QUANT_SUFFIX_RE.sub("", name))
+
+
+def words_from_tokens(
+    tokens: list[tuple[bytes, float, float, float]],
+    *,
+    window_seconds: float,
+    strip_brackets: bool,
+) -> list[WordTime]:
+    """Group a decode's text tokens `(utf-8 bytes, t0, t1, t_dtw)` -- seconds,
+    negative = unknown -- into whitespace-separated words with times.
+
+    A word starts at a token with a leading space, so the words are those of
+    the decode's text split on whitespace, as the caption's words are
+    ("spotkaniu." is one word in both). The start is the DTW time of its
+    first token when known, else whisper's token-timestamp estimate; the end
+    is its last token's t1. Times are clamped to the window (whisper's last
+    timestamp can run past the audio). With `strip_brackets`, words inside a
+    [bracketed annotation] are dropped, as the caption text drops them.
+    """
+    words: list[list] = []  # [bytes, start, end]
+    for raw, t0, t1, t_dtw in tokens:
+        start = t_dtw if t_dtw >= 0 else t0
+        if raw.startswith(b" ") or not words:
+            words.append([raw.lstrip(b" "), start, t1])
+        else:
+            words[-1][0] += raw
+            words[-1][2] = t1
+    result: list[WordTime] = []
+    in_bracket = False
+    for raw, start, end in words:
+        text = raw.decode("utf-8", "replace").strip()
+        if not text:
+            continue
+        if strip_brackets:
+            if in_bracket or text.startswith("["):
+                in_bracket = "]" not in text
+                continue
+        start = min(max(start, 0.0), window_seconds)
+        end = min(max(end, start), window_seconds)
+        result.append(WordTime(text, start, end))
+    return result
+
 
 _FULL_AUDIO_CTX = 1500  # whisper's native 30s encoder context
 _MIN_AUDIO_CTX = 256
@@ -261,6 +213,131 @@ def _restrict_to_whitelist(
     return best_code, best_prob, best_prob - runner_up_prob
 
 
+# whisper's timestamp tokens are 20ms apart (<|0.00|>, <|0.02|>, ...).
+_TIMESTAMP_TOKEN_SECONDS = 0.02
+# Floor for the duration a timestamp ratio is measured against. The encoder
+# context never shrinks below _MIN_AUDIO_CTX (~5s, see audio_ctx_for_seconds),
+# so on a sub-second window a legitimate end timestamp can land seconds past
+# the audio; measuring against at least 1s keeps short windows from being
+# rejected for that alone.
+_TIMESTAMP_RATIO_MIN_SECONDS = 1.0
+
+_BRACKETED_ANNOTATION_RE = re.compile(r"\[[^\]]*\]")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def strip_bracketed_annotations(text: str) -> str:
+    """Remove whisper's [bracketed] sound annotations ("[oklaski]",
+    "[muzyka]", "[wypowiedź w języku ukraińskim]"), tidying the spaces left
+    behind."""
+    if "[" not in text:
+        return text
+    return _WHITESPACE_RE.sub(" ", _BRACKETED_ANNOTATION_RE.sub(" ", text)).strip()
+
+
+def decode_reject_reason(
+    tokens: list[tuple[int, float]],
+    *,
+    eot: int,
+    timestamp_begin: int,
+    audio_seconds: float,
+    min_mean_token_p: float,
+    max_timestamp_ratio: float,
+) -> str | None:
+    """Why a decode's hypothesis should be discarded, or None to keep it.
+
+    The two quality gates obs-localvocal applies to every inference
+    (whisper-processing.cpp), over the decode's `(token_id, probability)`
+    list: text tokens are ids below `eot`; ids from `timestamp_begin` up
+    are timestamps, `_TIMESTAMP_TOKEN_SECONDS` apart; the specials in
+    between are ignored.
+
+      * timestamp ratio: a timestamp later than `max_timestamp_ratio` times
+        the real audio length means whisper is "transcribing" audio that
+        does not exist -- a hallucination/repetition loop.
+      * mean token probability below `min_mean_token_p`: whisper was
+        guessing (noise, music, applause decoded as words).
+
+    A gate at 0 is off. An empty hypothesis is never rejected (nothing to
+    drop).
+    """
+    if max_timestamp_ratio > 0:
+        duration = max(audio_seconds, _TIMESTAMP_RATIO_MIN_SECONDS)
+        last = max((tid for tid, _ in tokens if tid >= timestamp_begin), default=None)
+        if last is not None:
+            ratio = (last - timestamp_begin) * _TIMESTAMP_TOKEN_SECONDS / duration
+            if ratio > max_timestamp_ratio:
+                return f"timestamp ratio {ratio:.2f} > {max_timestamp_ratio:.2f}"
+    if min_mean_token_p > 0:
+        probabilities = [p for tid, p in tokens if tid < eot]
+        if probabilities:
+            mean = sum(probabilities) / len(probabilities)
+            if mean < min_mean_token_p:
+                return f"mean token p {mean:.2f} < {min_mean_token_p:.2f}"
+    return None
+
+
+# Segment decoding (decode_segment, the segmenter's decode; obs-localvocal's
+# run_whisper_inference). Whisper misbehaves on very short inputs: a segment
+# under 1 s is centred in 1.01 s of faint white noise, every segment gets
+# 10 ms of silence on each side, and one under 50 ms is not decoded at all.
+_SEGMENT_MIN_SECONDS = 0.05
+_SEGMENT_SHORT_SECONDS = 1.0
+_SEGMENT_PAD_TO_SECONDS = 1.01
+_SEGMENT_EDGE_SECONDS = 0.01
+_SEGMENT_PAD_NOISE = 0.01
+
+
+def pad_segment(audio: np.ndarray, sample_rate: int = 16000) -> np.ndarray | None:
+    """The decode input for a segment (see the constants above), or None
+    when the segment is too short to decode. The noise is seeded by the
+    segment length, so a replay pads identically."""
+    n = len(audio)
+    if n < _SEGMENT_MIN_SECONDS * sample_rate:
+        return None
+    audio = np.asarray(audio, dtype=np.float32)
+    if n < _SEGMENT_SHORT_SECONDS * sample_rate:
+        target = int(round(_SEGMENT_PAD_TO_SECONDS * sample_rate))
+        rng = np.random.default_rng(n)
+        padded = rng.uniform(-_SEGMENT_PAD_NOISE, _SEGMENT_PAD_NOISE, target).astype(np.float32)
+        offset = (target - n) // 2
+        padded[offset : offset + n] = audio
+        audio = padded
+    edge = np.zeros(int(round(_SEGMENT_EDGE_SECONDS * sample_rate)), dtype=np.float32)
+    return np.concatenate([edge, audio, edge])
+
+
+def filter_segment_tokens(
+    tokens: list[SegmentToken], *, eot: int, drop_trailing_period: bool
+) -> list[SegmentToken]:
+    """The caption tokens of a decode: special and timestamp tokens (ids from
+    `eot` up -- read from the model, never a hard-coded 50256, since
+    large-v3's vocabulary differs) are dropped, and with
+    `drop_trailing_period` so is a lone "." token right before the end (a
+    segment cut mid-speech is not a sentence end) -- or an ellipsis ("...",
+    "…"), which whisper ends such cuts with as often (measured on test.mp3
+    with medium: "Użyjemy..." at a 7 s cut). [bracketed] annotations span
+    several tokens, so they are stripped from the joined text."""
+    kept = [t for t in tokens if t.id < eot]
+    if drop_trailing_period and kept and _is_period_token(kept[-1].text):
+        kept = kept[:-1]
+    return kept
+
+
+def _is_period_token(text: str) -> bool:
+    text = text.strip()
+    return bool(text) and all(ch in ".…" for ch in text)
+
+
+def segment_text(tokens: list[SegmentToken], *, strip_brackets: bool) -> str:
+    """Caption text of the kept tokens: their bytes joined and decoded once,
+    [bracketed] annotations optionally stripped, whitespace tidied."""
+    text = b"".join(t.raw or t.text.encode("utf-8") for t in tokens).decode("utf-8", "replace")
+    if strip_brackets:
+        text = strip_bracketed_annotations(text)
+    return _WHITESPACE_RE.sub(" ", text).strip()
+
+
 def audio_ctx_for_seconds(window_seconds: float) -> int:
     """Encoder context length (in mel frames) sufficient for `window_seconds`.
 
@@ -278,82 +355,215 @@ def audio_ctx_for_seconds(window_seconds: float) -> int:
     return max(_MIN_AUDIO_CTX, min(_FULL_AUDIO_CTX, exact + _AUDIO_CTX_MARGIN))
 
 
-class DevicePolicyError(RuntimeError):
-    """The configured ASR device could not be used or stopped working.
+class WhisperBackend(AsrBackend):
+    """whisper.cpp (pywhispercpp) on the configured processing unit
+    (asr.unit: cpu, cuda:<n>, vulkan:<n>, or auto). The AsrBackend
+    implementation."""
 
-    Raised instead of silently falling back to CPU. The configured device is
-    final by policy: a transient failure (the previous worker generation not
-    yet having released the GPU, a driver hiccup) must surface as a worker
-    crash the supervisor can see -- not as an invisible downgrade that leaves
-    the operator's "GPU" config running 10x slower on CPU with a GUI
-    indicator claiming all is well.
-    """
-
-
-class WhisperBackend:
     def __init__(self, config: AsrConfig) -> None:
         self._config = config
         self._model = None
         self._resolved_device_description = "unresolved"
         self._gpu_index = 0
+        # The unit it runs on ("vulkan:0", "cpu"), once resolved.
+        self.resolved_unit: str | None = None
+        # Decodes discarded by the quality gates, by gate (diagnostics).
+        self.rejected_decodes: dict[str, int] = {}
+        # Event vocabulary, prepended to every decode's prompt. Starts as the
+        # inline asr.vocabulary; the worker sets the resolved list (inline +
+        # named list) and updates it live (set_vocabulary).
+        self._vocabulary: list[str] = list(config.vocabulary)
+        # Words of the latest transcribe() with their times in seconds of
+        # its input (see words_from_tokens); the StreamingDecoder stamps
+        # FINALs with them. Empty after a rejected or empty decode.
+        self.last_word_times: list[WordTime] = []
+        self._dtw = False
         self._init_model()
 
     def _init_model(self) -> None:
-        want_gpu = self._config.device in (AsrDevice.AUTO, AsrDevice.VULKAN)
-        if want_gpu:
+        from narrator.asr import units as unit_mod
+        from narrator.asr.catalog import entry_for
+
+        kind, index = unit_mod.parse_unit(self._config.unit)
+        if kind == unit_mod.AUTO:
+            # The recommended unit, among the kinds this model runs on
+            # (narrator.asr.units: CUDA > discrete Vulkan GPU > CPU > iGPU).
+            # Probed here, in the worker, which loads the GPU driver anyway.
+            found = unit_mod.discover_units(unit_mod.LocalProbes())
+            chosen = unit_mod.recommended_unit(found, entry_for(self._config.model).units)
+            if chosen is None:
+                reasons = "; ".join(f"{u.id}: {u.reason}" for u in found if u.reason)
+                raise DevicePolicyError(f"asr.unit auto: no usable processing unit ({reasons or 'none found'})")
+            logger.info("asr.unit auto resolved to %s (%s)", chosen.id, chosen.name)
+            kind, index = chosen.kind, chosen.index
+        if kind in (unit_mod.CUDA, unit_mod.VULKAN):
+            # One GPU backend per build (build_vulkan_linux.sh, ASR_GPU), so
+            # whisper.cpp's gpu_device counts only that backend's devices. A
+            # unit of the other kind would land on whatever device has that
+            # index in this build (or on the CPU): refuse it instead.
+            build = _asr_build()
+            has = build.has_cuda if kind == unit_mod.CUDA else build.has_vulkan
+            if build.installed and not has:
+                label = "CUDA" if kind == unit_mod.CUDA else "Vulkan"
+                raise DevicePolicyError(
+                    f"asr.unit {kind}:{index} needs a {label} build of whisper.cpp, and the installed "
+                    f"pywhispercpp {build.version} has none (rebuild: make asr-backend ASR_GPU={kind})"
+                )
+        if kind == unit_mod.CUDA:
+            self._init_cuda(index)
+            return
+        if kind == unit_mod.VULKAN:
             devices = _vulkan_devices()
             if devices:
                 logger.info(
                     "Vulkan devices: %s",
-                    ", ".join(f"{d.index}={d}" for d in devices),
+                    ", ".join(f"vulkan:{d.index}={d}" for d in devices),
                 )
-            elif self._config.device == AsrDevice.VULKAN:
+            else:
                 logger.warning(
-                    "asr.device=vulkan but no Vulkan device could be enumerated; "
-                    "attempting GPU init anyway since whisper.cpp's own detection is authoritative"
+                    "asr.unit=vulkan:%s but no Vulkan device could be enumerated; "
+                    "attempting GPU init anyway since whisper.cpp's own detection is authoritative",
+                    index,
                 )
-            self._gpu_index = select_gpu_index(devices, self._config.gpu_device)
+            self._gpu_index = select_gpu_index(devices, index)
+            selected = next((d for d in devices if d.index == self._gpu_index), None)
+            recorded = self._config.unit_identity
+            if recorded and selected is not None and self._config.unit_kind == unit_mod.VULKAN:
+                unit = unit_mod.ProcessingUnit(
+                    f"vulkan:{selected.index}", unit_mod.VULKAN, selected.index, selected.name, "", selected.pci_bus_id
+                )
+                if not unit.matches_identity(recorded):
+                    # The indices shifted (a card added or removed): running
+                    # on whatever is at this index now would be a silent
+                    # switch to another card. The operator decides (C8).
+                    raise GpuSelectionError(
+                        f"asr.unit vulkan:{selected.index} is recorded as {recorded!r}, but that index is now "
+                        f"{unit.identity!r}"
+                    )
             try:
                 self._model = self._load_model(use_gpu=True)
-                selected = next((d for d in devices if d.index == self._gpu_index), None)
                 label = str(selected) if selected is not None else f"GPU {self._gpu_index}"
                 self._resolved_device_description = f"Vulkan ({label})"
+                self.resolved_unit = f"vulkan:{self._gpu_index}"
                 logger.info("ASR backend: %s", self._resolved_device_description)
                 return
+            except ModelLoadError:
+                raise  # not a device problem: say so, not "GPU init failed"
             except Exception as exc:
-                # The configured device is final. Silently falling back to CPU
+                # The configured unit is final. Silently falling back to CPU
                 # here is what turned an operator's GPU config into a CPU
                 # worker with zero feedback (and left a GUI indicator saying
                 # everything was fine). Surface it; the supervisor decides
-                # what a failed device means (config policy, or app exit).
+                # what a failed unit means (crash loop -> ASR halted, problem shown).
                 raise DevicePolicyError(
-                    f"GPU backend init failed on {self._config.device.value}: {exc}"
+                    f"GPU backend init failed on {self._config.unit}: {exc}"
                 ) from exc
 
         self._model = self._load_model(use_gpu=False)
         self._resolved_device_description = "CPU"
+        self.resolved_unit = unit_mod.CPU
+        logger.info("ASR backend: %s", self._resolved_device_description)
+
+    def _init_cuda(self, index: int) -> None:
+        """Load on CUDA card `index` (nvidia-smi's index = PCI order)."""
+        from narrator.asr import units as unit_mod
+
+        os.environ.setdefault(_CUDA_DEVICE_ORDER_ENV, "PCI_BUS_ID")
+        devices = _cuda_devices()
+        selected = None
+        if devices:
+            logger.info("CUDA devices: %s", ", ".join(f"cuda:{d.index}={d.name}" for d in devices))
+            selected = next((d for d in devices if d.index == index), None)
+            if selected is None:
+                # whisper.cpp would load on the CPU without an error.
+                raise GpuSelectionError(
+                    f"asr.unit cuda:{index} is not present (CUDA cards: "
+                    f"{', '.join(f'cuda:{d.index}' for d in devices)})"
+                )
+            recorded = self._config.unit_identity
+            if recorded and self._config.unit_kind == unit_mod.CUDA:
+                unit = unit_mod.ProcessingUnit(
+                    f"cuda:{index}", unit_mod.CUDA, index, selected.name, "discrete", selected.pci_bus_id
+                )
+                if not unit.matches_identity(recorded):
+                    raise GpuSelectionError(
+                        f"asr.unit cuda:{index} is recorded as {recorded!r}, but that index is now {unit.identity!r}"
+                    )
+        else:
+            logger.warning(
+                "asr.unit=cuda:%s but nvidia-smi listed no card; attempting CUDA init anyway", index
+            )
+        self._gpu_index = index
+        try:
+            self._model = self._load_model(use_gpu=True)
+        except ModelLoadError:
+            raise
+        except Exception as exc:
+            # The configured unit is final (no CPU fallback), as for Vulkan.
+            raise DevicePolicyError(f"GPU backend init failed on cuda:{index}: {exc}") from exc
+        label = selected.name if selected is not None else f"GPU {index}"
+        self._resolved_device_description = f"CUDA ({label})"
+        self.resolved_unit = f"cuda:{index}"
         logger.info("ASR backend: %s", self._resolved_device_description)
 
     def _load_model(self, use_gpu: bool):
+        if use_gpu and os.environ.get("NARRATOR_VK_GRAPH_OPTIMIZE") != "1":
+            # Read by ggml-vulkan at device init (see _VK_GRAPH_OPTIMIZE_ENV).
+            os.environ.setdefault(_VK_GRAPH_OPTIMIZE_ENV, "1")
+        import _pywhispercpp as pw
         from pywhispercpp.model import Model  # imported lazily: heavy native extension
 
-        # flash_attn is forced off here: whisper.cpp's Vulkan flash-attention
-        # kernel is known to crash with an illegal instruction (SIGILL, i.e.
-        # multiprocessing exitcode -4) on a number of GPU/driver combinations,
-        # which kills the ASR worker process outright -- no Python exception
-        # is raised for us to catch and fall back from, so the only fix is to
-        # never select that code path in the first place.
-        return Model(
-            self._config.model,
-            context_params={
-                "use_gpu": use_gpu,
-                "flash_attn": False,
-                "gpu_device": self._gpu_index if use_gpu else 0,
-            },
+        # flash_attn is opt-in (asr.flash_attn): whisper.cpp's Vulkan
+        # flash-attention kernel is known to crash with an illegal
+        # instruction (SIGILL, i.e. multiprocessing exitcode -4) on a number
+        # of GPU/driver combinations, which kills the ASR worker process
+        # outright -- no Python exception is raised for us to catch, so the
+        # only protection is not selecting that code path by default. A crash
+        # loop then halts ASR and shows a problem (app_controller, narrator.health).
+        # Models live in <repo>/models (narrator.paths); one already in the
+        # legacy user cache is reused rather than downloaded again.
+        from narrator.paths import model_load_args
+
+        model_name, models_dir = model_load_args(self._config.model)
+        # flash_attn is always passed: whisper.cpp >= 1.8 defaults it to ON.
+        flash_attn = bool(self._config.flash_attn and use_gpu)
+        context_params = {
+            "use_gpu": use_gpu,
+            "flash_attn": flash_attn,
+            "gpu_device": self._gpu_index if use_gpu else 0,
+        }
+        self._dtw = False
+        if self._config.dtw_word_timestamps:
+            preset = dtw_preset_name(self._config.model)
+            if flash_attn:
+                logger.warning("asr.dtw_word_timestamps is ignored while asr.flash_attn is on (whisper.cpp limitation)")
+            elif preset is None:
+                logger.warning(
+                    "asr.dtw_word_timestamps: no alignment-head preset for model %r; using token timestamps",
+                    self._config.model,
+                )
+            else:
+                context_params["dtw_token_timestamps"] = True
+                context_params["dtw_aheads_preset"] = getattr(pw.whisper_alignment_heads_preset, preset)
+                self._dtw = True
+        model = Model(
+            model_name,
+            models_dir=models_dir,
+            context_params=context_params,
             print_progress=False,
             print_realtime=False,
             no_context=True,
         )
+        # pywhispercpp does not raise for a model it cannot get: it logs
+        # "Invalid model name", leaves model_path None and builds a context
+        # around whisper.cpp's NULL -- the first decode then crashes natively.
+        # Fail here, with a message the problems panel can show.
+        if getattr(model, "model_path", "") is None:
+            raise ModelLoadError(
+                f"model {self._config.model!r} could not be loaded: it is not a local model file "
+                "and not a downloadable whisper.cpp model name"
+            )
+        return model
 
     @property
     def resolved_device_description(self) -> str:
@@ -431,20 +641,13 @@ class WhisperBackend:
             logger.exception("language detection failed")
             return None
 
-    def transcribe(
-        self,
-        audio: np.ndarray,
-        sample_rate: int = 16000,
-        language: str | None = None,
-        prompt: str | None = None,
-    ) -> list[tuple[float, float, str]]:
-        """Run one decode pass over `audio` (mono float32 @16kHz). Returns a
-        list of (start_seconds, end_seconds, text) segments. `prompt` is text
-        whisper treats as what was said just before this audio (context for
-        names, spelling, style); None decodes from a blank context. A failure
-        raises DevicePolicyError -- the configured device is final, there is
-        no silent CPU fallback.
-        """
+    def set_vocabulary(self, vocabulary: list[str]) -> None:
+        """Replace the event vocabulary used in the prompt (hot-reload)."""
+        self._vocabulary = list(vocabulary)
+
+    def _decode_kwargs(self, audio: np.ndarray, sample_rate: int, language: str | None, prompt: str | None) -> dict:
+        """whisper decode parameters for one call over `audio` (shared by
+        transcribe and decode_segment)."""
         # Explicit per-call override (a language the StreamingDecoder locked
         # for this utterance) wins; otherwise the whitelist decides per call:
         # empty = let whisper detect (language=None), single/multiple = the
@@ -480,13 +683,38 @@ class WhisperBackend:
             # Always set explicitly: pywhispercpp keeps decode params between
             # calls, so a prompt from an earlier call would otherwise leak
             # into this one. ("" clears it; the binding rejects None.)
-            "initial_prompt": prompt or "",
+            # The vocabulary hint goes first, then the carry-over `prompt`,
+            # sized to whisper's prompt budget (build_initial_prompt).
+            "initial_prompt": build_initial_prompt(self._vocabulary, prompt),
+            # Per-token t0/t1 (whisper's timestamp heuristic, computed after
+            # the decode -- the text is unchanged and the cost is within
+            # noise): the word times of last_word_times / decode_segment's
+            # tokens. Without it every token's t0/t1 is -1.
+            "token_timestamps": True,
         }
         if language is not None:
             kwargs["language"] = language
         else:
             kwargs["language"] = self._detect_language(audio)[0]
 
+        return kwargs
+
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        sample_rate: int = 16000,
+        language: str | None = None,
+        prompt: str | None = None,
+    ) -> list[tuple[float, float, str]]:
+        """Run one decode pass over `audio` (mono float32 @16kHz). Returns a
+        list of (start_seconds, end_seconds, text) segments. `prompt` is text
+        whisper treats as what was said just before this audio (context for
+        names, spelling, style); None decodes from a blank context. A failure
+        raises DevicePolicyError -- the configured device is final, there is
+        no silent CPU fallback.
+        """
+        kwargs = self._decode_kwargs(audio, sample_rate, language, prompt)
+        self.last_word_times = []
         try:
             segments = self._model.transcribe(audio, **kwargs)
         except Exception as exc:
@@ -496,6 +724,134 @@ class WhisperBackend:
             # exception propagates; the supervisor restarts the worker and, if
             # the device is genuinely gone, exits the app rather than whisper.
             raise DevicePolicyError(
-                f"GPU inference failed on {self._config.device.value}: {exc}"
+                f"GPU inference failed on {self._config.unit}: {exc}"
             ) from exc
-        return [(seg.t0 / 100.0, seg.t1 / 100.0, seg.text.strip()) for seg in segments]
+        reason = self._reject_reason(len(audio) / sample_rate)
+        if reason is not None:
+            gate = reason.split(" ", 1)[0]
+            self.rejected_decodes[gate] = self.rejected_decodes.get(gate, 0) + 1
+            logger.debug("decode rejected (%s): %r", reason, " ".join(seg.text for seg in segments))
+            return []
+        strip = self._config.strip_bracketed_annotations
+        result = []
+        for seg in segments:
+            text = strip_bracketed_annotations(seg.text) if strip else seg.text.strip()
+            result.append((seg.t0 / 100.0, seg.t1 / 100.0, text))
+        self.last_word_times = self._read_word_times(len(audio) / sample_rate)
+        return result
+
+    def _read_word_times(self, window_seconds: float) -> list[WordTime]:
+        """The latest decode's words with times (words_from_tokens), read
+        from the whisper context's token data. Never fails a decode: on any
+        error the caller just has no word times."""
+        try:
+            import _pywhispercpp as pw
+
+            ctx = self._model._ctx
+            eot = pw.whisper_token_eot(ctx)
+            tokens = []
+            for i in range(pw.whisper_full_n_segments(ctx)):
+                for j in range(pw.whisper_full_n_tokens(ctx, i)):
+                    data = pw.whisper_full_get_token_data(ctx, i, j)
+                    if data.id >= eot:
+                        continue
+                    t_dtw = data.t_dtw / 100.0 if self._dtw else -1.0
+                    tokens.append((pw.whisper_token_to_bytes(ctx, data.id), data.t0 / 100.0, data.t1 / 100.0, t_dtw))
+            return words_from_tokens(
+                tokens, window_seconds=window_seconds, strip_brackets=self._config.strip_bracketed_annotations
+            )
+        except Exception:
+            logger.debug("could not read word timestamps", exc_info=True)
+            return []
+
+    def decode_segment(
+        self,
+        audio: np.ndarray,
+        *,
+        prompt: str | None = None,
+        language: str | None = None,
+        drop_trailing_period: bool = False,
+        peek: bool = False,
+        sample_rate: int = 16000,
+    ) -> SegmentResult:
+        """Decode one whole segment once (the segmenter's decode; a port of
+        obs-localvocal's run_whisper_inference): pad it (pad_segment), run
+        whisper with the same latency-bounding parameters as transcribe,
+        read the tokens from the whisper context, drop special tokens (and
+        optionally a trailing lone "."), strip [bracketed] annotations, and
+        apply the quality gates. `peek` marks a partial (an open segment
+        re-decoded for display); it changes nothing here but the log line,
+        and lets stream_sim charge peeks and finals separately.
+        A failure raises DevicePolicyError, as transcribe does."""
+        started = time.monotonic()
+        padded = pad_segment(audio, sample_rate)
+        if padded is None:
+            return SegmentResult(text="", language=language)
+        kwargs = self._decode_kwargs(padded, sample_rate, language, prompt)
+        try:
+            self._model.transcribe(padded, **kwargs)
+        except Exception as exc:
+            raise DevicePolicyError(f"GPU inference failed on {self._config.unit}: {exc}") from exc
+        import _pywhispercpp as pw  # the native module behind pywhispercpp.model
+
+        ctx = self._model._ctx
+        eot = pw.whisper_token_eot(ctx)
+        raw: list[SegmentToken] = []
+        for i in range(pw.whisper_full_n_segments(ctx)):
+            for j in range(pw.whisper_full_n_tokens(ctx, i)):
+                data = pw.whisper_full_get_token_data(ctx, i, j)
+                piece = pw.whisper_token_to_bytes(ctx, data.id) if data.id < eot else b""
+                raw.append(
+                    SegmentToken(
+                        id=data.id,
+                        text=piece.decode("utf-8", "replace"),
+                        p=float(data.p),
+                        t0=max(data.t0, 0) / 100.0,
+                        t1=max(data.t1, 0) / 100.0,
+                        raw=piece,
+                    )
+                )
+        decode_language = kwargs.get("language")
+        reason = decode_reject_reason(
+            [(t.id, t.p) for t in raw],
+            eot=eot,
+            timestamp_begin=pw.whisper_token_beg(ctx),
+            audio_seconds=len(audio) / sample_rate,
+            min_mean_token_p=self._config.min_mean_token_p,
+            max_timestamp_ratio=self._config.max_timestamp_ratio,
+        )
+        elapsed = time.monotonic() - started
+        if reason is not None:
+            gate = reason.split(" ", 1)[0]
+            self.rejected_decodes[gate] = self.rejected_decodes.get(gate, 0) + 1
+            logger.debug("segment %s rejected (%s)", "peek" if peek else "decode", reason)
+            return SegmentResult(text="", language=decode_language, decode_seconds=elapsed, rejected=reason)
+        kept = filter_segment_tokens(raw, eot=eot, drop_trailing_period=drop_trailing_period)
+        text = segment_text(kept, strip_brackets=self._config.strip_bracketed_annotations)
+        return SegmentResult(text=text, tokens=tuple(kept), language=decode_language, decode_seconds=elapsed)
+
+    def _reject_reason(self, audio_seconds: float) -> str | None:
+        """Apply the quality gates (see decode_reject_reason) to the decode
+        that just ran. Token data is read from the whisper context directly:
+        pywhispercpp's Segment carries only text and timings. (`_ctx` is
+        pywhispercpp's private handle; the binding is pinned to 1.5.1 by
+        build_vulkan_linux.sh.)"""
+        config = self._config
+        if config.min_mean_token_p <= 0 and config.max_timestamp_ratio <= 0:
+            return None
+        import _pywhispercpp as pw  # the native module behind pywhispercpp.model
+
+        ctx = self._model._ctx
+        tokens = []
+        for i in range(pw.whisper_full_n_segments(ctx)):
+            for j in range(pw.whisper_full_n_tokens(ctx, i)):
+                data = pw.whisper_full_get_token_data(ctx, i, j)
+                tokens.append((data.id, data.p))
+        return decode_reject_reason(
+            tokens,
+            eot=pw.whisper_token_eot(ctx),
+            timestamp_begin=pw.whisper_token_beg(ctx),
+            audio_seconds=audio_seconds,
+            min_mean_token_p=config.min_mean_token_p,
+            max_timestamp_ratio=config.max_timestamp_ratio,
+        )

@@ -38,7 +38,9 @@ from pathlib import Path
 import numpy as np
 import onnxruntime as ort
 
-_MODEL_PATH = Path(__file__).resolve().parents[3] / "assets" / "vad" / "silero_vad.onnx"
+from narrator.paths import bundled_assets_dir
+
+_MODEL_PATH = bundled_assets_dir() / "vad" / "silero_vad.onnx"
 _WINDOW_SAMPLES = 512  # required by the Silero v5 graph at 16kHz
 _CONTEXT_SAMPLES = 64  # required left-context for the same graph's causal convs
 _SAMPLE_RATE = 16000
@@ -85,6 +87,17 @@ class SileroVad:
     def reset(self) -> None:
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
         self._pending = np.zeros(0, dtype=np.float32)
+        self._context = np.zeros(_CONTEXT_SAMPLES, dtype=np.float32)
+        self._quiet_windows = 0
+
+    def reset_state(self) -> None:
+        """Fresh LSTM state and left context, keeping the sample alignment
+        (buffered samples stay). The segmenter calls this on every
+        transition into non-speech -- obs-localvocal's rule (it resets
+        whenever the previous chunk was non-speech) -- so drift cannot carry
+        from one speech stretch into the next; the quiet-window reset above
+        stays as the backstop for long non-speech stretches."""
+        self._state = np.zeros((2, 1, 128), dtype=np.float32)
         self._context = np.zeros(_CONTEXT_SAMPLES, dtype=np.float32)
         self._quiet_windows = 0
 

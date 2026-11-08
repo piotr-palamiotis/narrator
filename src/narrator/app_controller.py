@@ -1,5 +1,6 @@
 """Wires audio capture, the ASR worker process, rendering, NDI sending, config
-hot-reload, and (optionally) the GUI into one running application.
+hot-reload into one running application; the web admin UI (narrator.web)
+attaches to it from main.
 
 Concurrency model (see the plan's threading table):
   - audio capture: sounddevice callback thread (inside MicCapture)
@@ -10,9 +11,31 @@ Concurrency model (see the plan's threading table):
   - an event-drain thread applies CaptionEvents from the worker to the renderer
   - render + NDI send: fixed-fps thread (narrator.ndi.sender.run_render_send_loop)
   - config watcher: watchdog thread, applied via one atomic swap path
+  - session recording (narrator.recording, optional): the feed thread hands
+    each frame to a bounded non-blocking queue drained by a writer thread;
+    a maintenance thread runs the disk guard, retention purge and the
+    low-priority draft subprocess
+  - web UI (optional, attached by main): one thread running its own asyncio
+    loop (narrator.web.server). It only reads controller state and calls the
+    operator actions; caption events reach it through `ui_events`, a bounded
+    drop-oldest deque, so a slow browser can never stall these threads.
+  - setup checks (narrator.health.HealthMonitor): one thread running the
+    static checks at start, on config change, on request and periodically;
+    the problems it reports are read by status_snapshot().
+  - processing-unit usage (narrator.health.usage.UnitUsageMonitor): one
+    thread sampling every unit's load at ~1 Hz (plus an nvidia-smi loop
+    process while the usage is being read); status_snapshot() reads its
+    last result.
+
+Failure policy (user decision 2026-10-17): nothing that goes wrong stops the
+app, and the app never changes the unit, backend or model by itself. A part
+that fails (ASR worker crash-looping, audio capture or NDI output failing to
+start) is left stopped and reported as a problem with fix actions; the
+operator's fix (apply_fix) or a config change restarts only that part.
 """
 from __future__ import annotations
 
+import collections
 import logging
 import multiprocessing as mp
 import queue
@@ -21,17 +44,35 @@ import time
 from pathlib import Path
 
 from narrator.asr.events import CaptionEvent, CaptionEventType
+from narrator.asr.text_settings import TextSettings, asr_config_without_text, text_settings_from_config
+from narrator.asr.vocabulary import VOCABULARY_DIRNAME
 from narrator.asr.worker import run_asr_worker
 from narrator.audio.capture import MicCapture
+from narrator.audio.factory import create_capture
+from narrator.audio.ndi_capture import NdiAudioCapture
+from narrator.captions.blocklist import apply_blocklist, blocklist_from_config
+from narrator.captions.transcript import TranscriptWriter
 from narrator.config.loader import ConfigWatcher
-from narrator.config.schema import AsrDevice, RootConfig
+from narrator.config.schema import AsrDevice, RootConfig, TranscriptConfig
+from narrator.health import problems as health_problems
+from narrator.health.checks import RuntimeState
+from narrator.health.monitor import HealthMonitor
+from narrator.health.usage import UnitUsageMonitor
 from narrator.ndi.sender import NdiCaptionSender, run_render_send_loop
+from narrator.recording.manager import RecordingManager
+from narrator.recording.session import RecordingError
 from narrator.render.canvas import CaptionRenderer
 
 logger = logging.getLogger(__name__)
 
 _ASR_RESTART_BACKOFF_SECONDS = 2.0
 _ASR_RESTART_BACKOFF_MAX_SECONDS = 30.0
+
+
+def _device_class(unit_kind: str) -> AsrDevice:
+    """asr.unit's kind as the coarse AsrDevice the recording draft
+    scheduler compares against recording.draft_device (cpu vs a GPU)."""
+    return {"cpu": AsrDevice.CPU, "auto": AsrDevice.AUTO}.get(unit_kind, AsrDevice.VULKAN)
 
 # How long to let an ASR worker shut down cooperatively before escalating.
 # Generous because the worker can be inside a multi-second decode, or loading
@@ -43,14 +84,44 @@ _ASR_FORCE_STOP_SECONDS = 5.0
 # A worker that dies within this many seconds of starting is considered a
 # "quick crash" (as opposed to dying after having run fine for a while, e.g.
 # because the operator edited the ASR config). After this many quick crashes
-# in a row, the supervisor stops the app: the configured device is final by
-# policy, and silently falling back to CPU would hide a broken GPU setup
-# behind a 10x slowdown -- see _supervise_asr_loop.
+# in a row, the supervisor halts ASR: no more respawns, an "ASR stopped"
+# problem with fix actions instead. The rest of the app keeps running, and
+# the unit is never changed behind the operator's back (a silent CPU
+# fallback would hide a broken GPU setup behind a 10x slowdown) -- see
+# _supervise_asr_loop.
 _QUICK_CRASH_WINDOW_SECONDS = 15.0
-_QUICK_CRASHES_BEFORE_EXIT = 3
+_QUICK_CRASHES_BEFORE_HALT = 3
+
+# Caption events kept for the web UI's live feed. A deque with maxlen drops
+# the oldest entry on overflow and its append is atomic, so the event-drain
+# thread can never block on (or be slowed by) a stalled browser.
+_UI_EVENT_BACKLOG = 256
+
+
+class FeatureUnavailableError(RuntimeError):
+    """An operator action that exists in the UI/API but is not built yet."""
 
 
 class AppController:
+    # Class-level defaults so controllers built with __new__ (the unit tests)
+    # still have them; instances shadow them on first assignment.
+    asr_restart_count: int = 0  # deliberate restarts (config changes)
+    asr_crash_count: int = 0  # worker deaths the supervisor restarted
+    asr_last_exit_code: int | None = None
+    _captions_paused: bool = False
+    _web = None  # narrator.web.server.WebServer, attached by main
+    ui_events: "collections.deque | None" = None
+    _started_at: float | None = None
+    _recordings: RecordingManager | None = None  # session recording (narrator.recording)
+    _asr_busy_value = None  # mp.Value("d") the current worker publishes its busy fraction into
+    _health: HealthMonitor | None = None  # setup checks (narrator.health)
+    _unit_usage: UnitUsageMonitor | None = None  # live load of every processing unit
+    # Failure state the setup checks report (see the module docstring):
+    _asr_halted: bool = False  # ASR crash-looped; no respawn until a fix/config change
+    asr_last_error: str | None = None  # the dying worker's own explanation (ERROR event)
+    _audio_error: str | None = None  # audio capture failed to start
+    _ndi_error: str | None = None  # NDI output failed to start
+
     def __init__(self, config_path: Path) -> None:
         # Must precede every mp.Queue/mp.Event creation below: those bind to
         # the current start-method context, and mixing contexts (a fork-
@@ -63,7 +134,7 @@ class AppController:
 
         self._renderer: CaptionRenderer | None = None
         self._sender: NdiCaptionSender | None = None
-        self._mic: MicCapture | None = None
+        self._mic: MicCapture | NdiAudioCapture | None = None  # either source; same surface
 
         self._audio_queue: mp.Queue = mp.Queue(maxsize=200)
         self._event_queue: mp.Queue = mp.Queue()
@@ -98,23 +169,71 @@ class AppController:
         self._consecutive_quick_crashes: int = 0
 
         # "auto": captions come from the ASR worker, as before. "manual": the
-        # operator types captions in the GUI instead -- ASR events other than
+        # operator types captions in the web UI instead -- ASR events other than
         # STATUS are ignored while manual, so a stray partial/final/clear from
         # the (still-running) worker can't clobber manually-entered text. See
         # set_caption_mode/submit_manual_text/clear_captions.
         self._caption_mode: str = "auto"
 
+        # Optional transcript file of ASR FINALs (transcript.enabled). Fed
+        # from the event-drain thread, swapped on config change.
+        self._transcript: TranscriptWriter | None = None
+        self._transcript_lock = threading.Lock()
+
+        # Every CaptionEvent (plus whether it reached the screen), for the web
+        # UI's live feed; see _UI_EVENT_BACKLOG.
+        self.ui_events = collections.deque(maxlen=_UI_EVENT_BACKLOG)
+
+    @property
+    def config(self) -> RootConfig | None:
+        """The live config snapshot (swapped atomically on reload)."""
+        return self._config
+
+    @property
+    def config_path(self) -> Path:
+        return self._config_path
+
+    @property
+    def renderer(self) -> CaptionRenderer | None:
+        return self._renderer
+
+    def attach_web(self, web) -> None:
+        """Register the web UI server so config changes reach it and stop()
+        shuts it down first (no requests during teardown)."""
+        self._web = web
+
     def start(self) -> None:
+        self._started_at = time.monotonic()
         self._watcher = ConfigWatcher(self._config_path, self._on_config_changed)
         self._config = self._watcher.start()
         logging.basicConfig(level=self._config.app.log_level)
 
         self._renderer = CaptionRenderer(self._config.canvas, self._config.layout, self._config.style)
+        self._open_transcript(self._config.transcript)
+        self._recordings = RecordingManager(
+            lambda: self._config,
+            asr_load=self._asr_load,
+            vocabulary=lambda: list(self._text_settings(self._config).vocabulary),
+            on_change=self._update_recording_indicator,
+        )
+        self._recordings.start_background()
+        self._health = HealthMonitor(lambda: self._config, self.runtime_state)
+        # Neither raises: a failure is kept as a problem (see _ndi_error /
+        # _audio_error) and the app starts without that part.
         self._start_ndi_stream()
         self._start_audio_capture()
 
         with self._asr_lock:
             self._spawn_asr_process()
+        self._health.start()
+        self._unit_usage = UnitUsageMonitor(self._health.env, lambda: self._config)
+        self._unit_usage.start()
+
+        if self._config.recording.record_on_start:
+            try:
+                self._recordings.start()
+            except RecordingError as exc:
+                logger.error("recording.record_on_start: recording did not start: %s", exc)
 
         self._spawn_thread(self._drain_events_loop)
         self._spawn_thread(self._supervise_asr_loop)
@@ -132,7 +251,18 @@ class AppController:
         tearing down the rest of the app.
         """
         self._ndi_stop_event = threading.Event()
-        self._sender = NdiCaptionSender(self._config.ndi, self._config.canvas)
+        try:
+            self._sender = NdiCaptionSender(self._config.ndi, self._config.canvas)
+        except Exception as exc:
+            # No NDI runtime / sender failure: the rest of the app (ASR,
+            # web UI preview, manual captions, recording) keeps running.
+            logger.error("NDI output could not start: %s", exc)
+            self._sender = None
+            self._ndi_thread = None
+            self._ndi_error = str(exc) or type(exc).__name__
+            self._request_health_check()
+            return
+        self._ndi_error = None
         ndi_stop_event = self._ndi_stop_event
         sender = self._sender
         fps = self._config.ndi.fps
@@ -143,7 +273,7 @@ class AppController:
         self._ndi_thread.start()
 
     def _restart_ndi_stream(self) -> None:
-        logger.info("ndi/canvas config changed; restarting NDI stream")
+        logger.info("restarting NDI stream")
         old_stop_event, old_thread, old_sender = self._ndi_stop_event, self._ndi_thread, self._sender
         if old_stop_event is not None:
             old_stop_event.set()
@@ -152,6 +282,7 @@ class AppController:
         if old_sender is not None:
             old_sender.close()
         self._start_ndi_stream()
+        self._request_health_check()
 
     def _start_audio_capture(self) -> None:
         """(Re)creates mic capture and its feed thread against the current
@@ -160,17 +291,33 @@ class AppController:
         -- see `_on_config_changed` -- without tearing down the rest of the app.
         """
         self._audio_stop_event = threading.Event()
-        self._mic = MicCapture(self._config.audio.device, self._config.audio.frame_ms)
-        self._mic.start()
-        mic, audio_stop_event = self._mic, self._audio_stop_event
+        try:
+            # `audio.device` of the form "ndi:<source>" selects NdiAudioCapture.
+            mic = create_capture(self._config.audio, own_ndi_name=self._config.ndi.source_name)
+            mic.start()
+        except Exception as exc:
+            # Missing device, wrong channels, PortAudio trouble: no audio
+            # input, everything else keeps running; the problem panel offers
+            # Retry / another input.
+            logger.error("audio input could not start: %s", exc)
+            self._mic = None
+            self._audio_thread = None
+            self._audio_error = str(exc) or type(exc).__name__
+            self._request_health_check()
+            return
+        self._audio_error = None
+        self._mic = mic
+        audio_stop_event = self._audio_stop_event
         self._audio_thread = threading.Thread(
             target=lambda: self._feed_audio_loop(mic, audio_stop_event),
             daemon=True,
         )
         self._audio_thread.start()
 
-    def _restart_audio_capture(self) -> None:
-        logger.info("audio config changed; restarting audio capture")
+    def _restart_audio_capture(self, rescan: bool = False) -> None:
+        """`rescan` (the operator's Retry fix) makes PortAudio list devices
+        again first, so a microphone plugged in since startup is found."""
+        logger.info("restarting audio capture")
         old_stop_event, old_thread, old_mic = self._audio_stop_event, self._audio_thread, self._mic
         if old_stop_event is not None:
             old_stop_event.set()
@@ -178,7 +325,15 @@ class AppController:
             old_thread.join(timeout=5)
         if old_mic is not None:
             old_mic.stop()
+        if rescan:
+            try:
+                from narrator.audio.devices import rescan_devices
+
+                rescan_devices()
+            except Exception as exc:
+                logger.warning("audio device rescan failed: %s", exc)
         self._start_audio_capture()
+        self._request_health_check()
 
     def _drain_audio_queue(self) -> int:
         """Empty the shared audio queue; returns the number of frames dropped.
@@ -203,6 +358,10 @@ class AppController:
         """Start a new ASR worker generation. Caller must hold `_asr_lock`."""
         asr_config = self._config.asr
         stop_event = mp.Event()
+        # Per generation, like the stop event: live text-settings updates
+        # (vocabulary, snapping, blocklist) for this worker only.
+        control_queue = mp.Queue()
+        busy_value = mp.Value("d", -1.0)  # decode busy fraction, -1 = not measured yet
         process = mp.Process(
             target=run_asr_worker,
             args=(
@@ -211,13 +370,19 @@ class AppController:
                 self._event_queue,
                 stop_event,
                 self._config.app.log_level,
+                self._text_settings(self._config),
+                control_queue,
+                busy_value,
             ),
             daemon=True,
         )
         process.start()
         self._asr_process = process
         self._asr_stop_event = stop_event
+        self._asr_control_queue = control_queue
+        self._asr_busy_value = busy_value
         self._asr_spawn_time = time.monotonic()
+        self._asr_halted = False
 
     @staticmethod
     def _set_mp_start_method() -> None:
@@ -287,9 +452,13 @@ class AppController:
         with self._asr_lock:
             old_process, old_stop_event = self._asr_process, self._asr_stop_event
             self._asr_process, self._asr_stop_event = None, None
-            # A deliberate restart is a fresh attempt, not a continuation of
-            # whatever crash streak preceded it.
+            # A deliberate restart (config change, the operator's Retry) is
+            # a fresh attempt, not a continuation of whatever crash streak
+            # preceded it -- and it lifts a halt.
             self._consecutive_quick_crashes = 0
+            self._asr_halted = False
+            self.asr_last_error = None
+            self.resolved_asr_backend = "unresolved"
 
         self._shut_down_asr_process(old_process, old_stop_event)
 
@@ -303,9 +472,20 @@ class AppController:
             if self._stop_event.is_set():
                 return
             self._spawn_asr_process()
+            self.asr_restart_count += 1
 
-    def _feed_audio_loop(self, mic: MicCapture, stop_event: threading.Event) -> None:
+    def _feed_audio_loop(self, mic: MicCapture | NdiAudioCapture, stop_event: threading.Event) -> None:
         for frame in mic.frames(timeout=0.5, stop_event=stop_event):
+            recordings = self._recordings
+            if recordings is not None:
+                # Non-blocking (bounded queue, drop + count when full): the
+                # exact frame whisper is about to receive.
+                recordings.feed(frame)
+            if self._asr_halted:
+                # No worker reads the queue while ASR is halted. Feeding it
+                # would keep its pipe full, and a full mp.Queue pipe blocks
+                # the queue's feeder thread -- and with it interpreter exit.
+                continue
             try:
                 self._audio_queue.put_nowait(frame)
             except queue.Full:
@@ -327,17 +507,36 @@ class AppController:
             self._handle_caption_event(event)
 
     def _handle_caption_event(self, event: CaptionEvent) -> None:
-        # STATUS is always applied so the GUI's backend indicator stays live
-        # even while manual mode is ignoring transcription output.
+        # STATUS is always applied so the web UI's backend indicator stays
+        # live even while manual mode is ignoring transcription output.
         if event.type == CaptionEventType.STATUS:
             self.resolved_asr_backend = event.text
+            self.asr_last_error = None  # this generation loaded fine
             logger.info("ASR backend resolved: %s", event.text)
+            self._publish_ui_event(event, applied=True)
             return
-        if self._caption_mode != "auto":
+        if event.type == CaptionEventType.ERROR:
+            # The worker's last words before it exits; the supervisor sees
+            # the exit, the problem panel shows this text.
+            self.asr_last_error = event.text
+            return
+        # The transcript records what the ASR heard, in either caption mode.
+        if event.type == CaptionEventType.FINAL:
+            with self._transcript_lock:
+                if self._transcript is not None:
+                    self._transcript.add_final(event)
+        # Paused works like manual mode: the worker keeps running (resuming
+        # is instant), its output just doesn't reach the screen.
+        applied = self._caption_mode == "auto" and not self._captions_paused
+        self._publish_ui_event(event, applied=applied)
+        if not applied:
             return
         if event.type == CaptionEventType.FINAL:
-            self._renderer.set_partial_preview("")
+            # Replaces the open partial atomically (CaptionRenderer).
             self._renderer.append_final_text(event.text)
+            recordings = self._recordings
+            if recordings is not None:
+                recordings.on_air_final(event)  # live.srt: what went on air
         elif event.type == CaptionEventType.PARTIAL:
             self._renderer.set_partial_preview(event.text)
         elif event.type == CaptionEventType.WIPE:
@@ -350,11 +549,27 @@ class AppController:
             # must never wipe what the audience is currently reading: CLEAR
             # only prunes caption lines that are no longer visible under the
             # current layout settings. A real screen wipe is operator-
-            # initiated (clear_captions <- Ctrl/N or the GUI's Clear button)
+            # initiated (clear_captions <- the web UI's Clear button/shortcut)
             # or comes in as WIPE after wipe_screen_after_silence_seconds.
             dropped = self._renderer.prune_history()
             if dropped:
                 logger.debug("pruned %d off-screen caption line(s) after silence", dropped)
+
+    def _publish_ui_event(self, event: CaptionEvent, applied: bool) -> None:
+        events = self.ui_events
+        if events is not None:
+            events.append((event.type.value, event.text, applied))
+
+    def _open_transcript(self, config: TranscriptConfig) -> None:
+        """Close the current transcript (if any) and, when enabled, start a
+        new session file."""
+        with self._transcript_lock:
+            if self._transcript is not None:
+                self._transcript.close()
+                self._transcript = None
+            if config.enabled:
+                self._transcript = TranscriptWriter(config)
+                logger.info("writing transcript to %s", self._transcript.path)
 
     def set_caption_mode(self, mode: str) -> None:
         """Switches between "auto" (ASR-driven) and "manual" (operator-typed)
@@ -366,19 +581,246 @@ class AppController:
             raise ValueError(f"invalid caption mode: {mode!r}")
         self._caption_mode = mode
 
+    @property
+    def caption_mode(self) -> str:
+        return self._caption_mode
+
+    @property
+    def captions_paused(self) -> bool:
+        return self._captions_paused
+
+    def set_captions_paused(self, paused: bool) -> None:
+        """Pause/resume ASR captions. Like manual mode, the ASR worker keeps
+        running and only its output is ignored while paused, so resuming is
+        instant; what is on screen stays (Clear is separate). Manual captions
+        are unaffected. The transcript keeps recording."""
+        paused = bool(paused)
+        if paused and not self._captions_paused and self._renderer is not None:
+            self._renderer.set_partial_preview("")  # no stale partial frozen on air
+        self._captions_paused = paused
+        logger.info("captions %s", "paused" if paused else "resumed")
+
+    @property
+    def recordings(self) -> RecordingManager | None:
+        return self._recordings
+
+    @property
+    def recording_available(self) -> bool:
+        recordings = self._recordings
+        return recordings is not None and recordings.available
+
+    @property
+    def recording(self) -> bool:
+        recordings = self._recordings
+        return recordings is not None and recordings.recording
+
+    def set_recording(self, enabled: bool) -> None:
+        """Session recording on/off (web UI, shortcut, control API, OSC).
+        Raises RecordingError when it cannot start (low disk space)."""
+        recordings = self._recordings
+        if recordings is None or not recordings.available:
+            raise FeatureUnavailableError(
+                "recording is not available (FLAC writing needs the 'soundfile' package)"
+            )
+        recordings.set_recording(enabled)
+
+    def _update_recording_indicator(self) -> None:
+        """The optional on-air dot in the NDI output (recording.on_air_dot)."""
+        renderer, config = self._renderer, self._config
+        if renderer is not None and config is not None:
+            renderer.set_recording_indicator(self.recording and config.recording.on_air_dot)
+
+    def _asr_load(self) -> dict:
+        """Live ASR load for the draft scheduler: is the worker alive, its
+        decode busy fraction (None until measured), and its device."""
+        process, value, config = self._asr_process, self._asr_busy_value, self._config
+        busy = None
+        if value is not None and value.value >= 0:
+            busy = float(value.value)
+        return {
+            "active": process is not None and process.is_alive(),
+            "busy": busy,
+            "device": _device_class(config.asr.unit_kind) if config is not None else None,
+        }
+
+    def refresh_text_settings(self) -> None:
+        """Re-send the worker's text settings, e.g. after a saved vocabulary
+        list file changed (the config itself did not)."""
+        if self._config is not None:
+            self._push_text_settings(self._config)
+
+    def status_snapshot(self) -> dict:
+        """Read-only state for the web UI / control API. Lock-free: every
+        field is a single attribute read (the mic is re-read each call,
+        since _restart_audio_capture swaps the capture object)."""
+        process = self._asr_process
+        mic = self._mic
+        renderer = self._renderer
+        started = self._started_at
+        recordings = self._recordings
+        busy_value = self._asr_busy_value
+        usage = self._unit_usage
+        units = usage.snapshot() if usage is not None else {}
+        try:
+            on_air = list(renderer.visible_lines()) if renderer is not None else []
+        except Exception:  # a concurrent reflow; next poll catches up
+            on_air = []
+        return {
+            "caption_mode": self._caption_mode,
+            "captions_paused": self._captions_paused,
+            "recording": self.recording,
+            "recording_available": self.recording_available,
+            "recording_info": recordings.status() if recordings is not None else None,
+            "asr_busy": (
+                round(busy_value.value, 3) if busy_value is not None and busy_value.value >= 0 else None
+            ),
+            "asr_active": process is not None and process.is_alive(),
+            "asr_halted": self._asr_halted,
+            "asr_backend": self.resolved_asr_backend,
+            "asr_restarts": self.asr_restart_count,
+            "asr_crashes": self.asr_crash_count,
+            "asr_last_exit_code": self.asr_last_exit_code,
+            "mic_level": float(mic.level) if mic is not None else 0.0,
+            "on_air": on_air,
+            "uptime_s": None if started is None else round(time.monotonic() - started, 1),
+            "audio_running": mic is not None,
+            "ndi_running": self._sender is not None,
+            "problems": [p.to_dict() for p in self.problems()],
+            # Every processing unit with its live usage (narrator.health.usage).
+            "units": units.get("units", []),
+            "unit_recommended": units.get("recommended"),
+            "unit_resolved": units.get("resolved"),
+        }
+
+    # ------------------------------------------------------------ setup checks
+
+    def runtime_state(self) -> RuntimeState:
+        """What the setup checks need from the running app (attribute reads
+        only; called from the health thread and the web UI's snapshot)."""
+        process = self._asr_process
+        mic = self._mic
+        ndi_source = status = detail = None
+        age = 0.0
+        if isinstance(mic, NdiAudioCapture):
+            ndi_source = mic.source_name
+            status, detail = mic.status, mic.status_detail
+            age = time.monotonic() - mic.status_since
+        return RuntimeState(
+            asr_alive=process is not None and process.is_alive(),
+            asr_halted=self._asr_halted,
+            asr_crash_streak=getattr(self, "_consecutive_quick_crashes", 0),
+            asr_last_exit_code=self.asr_last_exit_code,
+            asr_last_error=self.asr_last_error,
+            audio_running=mic is not None,
+            audio_error=self._audio_error,
+            ndi_audio_source=ndi_source,
+            ndi_audio_status=status,
+            ndi_audio_status_age_s=age,
+            ndi_audio_detail=detail,
+            ndi_output_error=self._ndi_error,
+        )
+
+    def problems(self) -> list:
+        """Current problems (narrator.health.Problem), most severe first."""
+        health = self._health
+        return health.problems() if health is not None else []
+
+    def _request_health_check(self, invalidate: bool = False) -> None:
+        health = self._health
+        if health is not None:
+            health.request_check(invalidate=invalidate)
+
+    def apply_fix(self, action: str) -> None:
+        """Apply one fix action from the problems panel (the operator's
+        click; nothing calls this on its own). Only fixes some current
+        problem offers are accepted -- "Use CPU instead" exists only where
+        the checks found the CPU backend usable. Restarts only the affected
+        part. Blocking (joins threads/processes): call it off the web loop.
+        Raises ValueError for an unknown action, LookupError for one no
+        problem offers right now."""
+        if not health_problems.is_server_fix(action):
+            raise ValueError(f"unknown fix action: {action!r}")
+        health = self._health
+        # Validate against a fresh pass, not the last periodic one: a stale
+        # result could still offer "Use CPU" after the build changed.
+        current = health.check_now(invalidate=True) if health is not None else []
+        if action == health_problems.FIX_RECHECK:
+            return
+        if action not in health_problems.offered_fixes(current):
+            raise LookupError(f"fix {action!r} is not offered by any current problem")
+        logger.info("operator fix: %s", action)
+        if action == health_problems.FIX_ASR_RETRY:
+            self._restart_asr_process()
+        elif action == health_problems.FIX_ASR_USE_CPU:
+            self._write_asr_unit("cpu", "")
+        elif action == health_problems.FIX_ASR_PIN_UNIT:
+            unit = self._find_unit(self._config.asr.unit)
+            if unit is None:
+                raise LookupError(f"asr.unit {self._config.asr.unit} is not on this machine")
+            self._write_asr_unit(unit.id, unit.identity)
+        elif action.startswith(health_problems.FIX_ASR_UNIT_PREFIX):
+            unit = self._find_unit(action.removeprefix(health_problems.FIX_ASR_UNIT_PREFIX))
+            if unit is None:
+                raise LookupError(f"{action}: that unit is not on this machine")
+            self._write_asr_unit(unit.id, unit.identity)
+        elif action == health_problems.FIX_AUDIO_RETRY:
+            self._restart_audio_capture(rescan=True)
+        elif action == health_problems.FIX_NDI_RETRY:
+            self._restart_ndi_stream()
+        if self._health is not None:
+            # In this thread, so the answer to the click already reflects it.
+            self._health.check_now(invalidate=True)
+
+    def _find_unit(self, unit_id: str):
+        """The processing unit `unit_id` on this machine (the setup checks'
+        cached probes), None when absent."""
+        from narrator.asr.units import find_unit
+
+        health = self._health
+        if health is None:
+            return None
+        return find_unit(health.env.units(), unit_id)
+
+    def _write_asr_unit(self, unit: str, identity: str) -> None:
+        """Change asr.unit (+ its recorded identity) in config.yaml like a
+        web UI Save: the config file stays the single source of truth, and
+        the watcher applies it (an asr change restarts only the ASR worker).
+        Only an operator's fix click gets here."""
+        from narrator.config.loader import load_config, save_config
+
+        current = load_config(self._config_path)
+        update = {"unit": unit, "unit_identity": identity}
+        updated = current.model_copy(update={"asr": current.asr.model_copy(update=update)})
+        save_config(RootConfig.model_validate(updated.model_dump(mode="json")), self._config_path)
+        logger.info("asr.unit set to %s by the operator (problems panel)", unit)
+
+    def _text_settings(self, config: RootConfig) -> TextSettings:
+        """The ASR worker's live text settings; the named vocabulary list is
+        read from <config dir>/vocabulary/."""
+        config_path = getattr(self, "_config_path", None)
+        vocabulary_dir = config_path.parent / VOCABULARY_DIRNAME if config_path is not None else None
+        return text_settings_from_config(config, vocabulary_dir)
+
     def submit_manual_text(self, text: str) -> None:
         """Appends operator-typed text as a finalized caption line. Intended
         for use while caption_mode == "manual", same as an ASR FINAL event.
+        The caption blocklist applies here too (a guard against typos).
         """
+        config = getattr(self, "_config", None)
+        if config is not None:
+            text = apply_blocklist(text, blocklist_from_config(config.captions))
         text = text.strip()
         if not text or self._renderer is None:
             return
         self._renderer.set_partial_preview("")
         self._renderer.append_final_text(text)
+        recordings = self._recordings
+        if recordings is not None:
+            recordings.on_air_text(text)
 
     def clear_captions(self) -> None:
         """Clears the on-screen caption buffer. Works in either caption mode
-        -- backs both the GUI's Clear button and its clear keyboard shortcut.
+        -- backs the web UI's Clear button, its shortcut and the control API.
         """
         if self._renderer is not None:
             self._renderer.clear()
@@ -386,14 +828,17 @@ class AppController:
     def _supervise_asr_loop(self) -> None:
         while not self._stop_event.is_set():
             # Snapshot under the lock. `_asr_process` is None precisely while a
-            # deliberate restart is in flight, which is how an intentional
-            # stop is distinguished from a crash without a separate flag.
+            # deliberate restart is in flight (or ASR is halted), which is how
+            # an intentional stop is distinguished from a crash without a
+            # separate flag.
             with self._asr_lock:
                 process = self._asr_process
                 spawn_time = self._asr_spawn_time
             if process is not None and not process.is_alive():
                 exit_code = process.exitcode
                 if not self._stop_event.is_set():
+                    self.asr_crash_count += 1
+                    self.asr_last_exit_code = exit_code
                     uptime = time.monotonic() - spawn_time
                     if uptime < _QUICK_CRASH_WINDOW_SECONDS:
                         self._consecutive_quick_crashes += 1
@@ -401,35 +846,39 @@ class AppController:
                         self._consecutive_quick_crashes = 0
 
                     logger.error(
-                        "ASR worker process died (exit code %s) after %.1fs; restarting "
-                        "(%d consecutive quick crash%s)",
+                        "ASR worker process died (exit code %s) after %.1fs "
+                        "(%d consecutive quick crash%s)%s",
                         exit_code,
                         uptime,
                         self._consecutive_quick_crashes,
                         "" if self._consecutive_quick_crashes == 1 else "es",
+                        f": {self.asr_last_error}" if self.asr_last_error else "",
                     )
-                    # Crash-loop policy: terminate the app rather than fall
-                    # back to CPU. The old behavior forced CPU after 3 quick
-                    # crashes -- which silently downgraded a GPU config the
-                    # operator explicitly chose, exactly what DevicePolicyError
-                    # elsewhere exists to prevent. The configured device is
-                    # final: if the worker cannot start on it repeatedly, the
-                    # app must stop and say why, not run at a fraction of the
-                    # performance the operator believes they have.
-                    if (
-                        self._consecutive_quick_crashes >= _QUICK_CRASHES_BEFORE_EXIT
-                        and self._config.asr.device != AsrDevice.CPU
-                    ):
-                        logger.error(
-                            "ASR worker crashed %d times in a row shortly after starting "
-                            "(configured device=%s); stopping the app. The configured "
-                            "device is final by policy -- fix the device/driver or set "
-                            "asr.device to 'cpu' explicitly.",
-                            _QUICK_CRASHES_BEFORE_EXIT,
-                            self._config.asr.device.value,
-                        )
-                        self.stop()
-                        break
+                    # Crash-loop policy: halt ASR, keep the app. Restarting
+                    # forever is pointless (the unit/model/build is broken),
+                    # stopping the app would take NDI output, manual captions
+                    # and the web UI down with it, and falling back to CPU
+                    # would silently change the unit the operator chose. The
+                    # problems panel says why and offers fixes; a fix or an
+                    # asr config change starts a fresh generation.
+                    if self._consecutive_quick_crashes >= _QUICK_CRASHES_BEFORE_HALT:
+                        process.join(timeout=_ASR_FORCE_STOP_SECONDS)
+                        with self._asr_lock:
+                            if self._asr_process is process:
+                                self._asr_process, self._asr_stop_event = None, None
+                                self._asr_halted = True
+                                self.resolved_asr_backend = "stopped"
+                        if self._asr_halted:
+                            logger.error(
+                                "ASR stopped: the worker crashed %d times in a row shortly after starting "
+                                "(asr.unit=%s, model=%s). The app keeps running without ASR captions; "
+                                "fix it from the web UI's problems panel or by changing the asr config.",
+                                self._consecutive_quick_crashes,
+                                self._config.asr.unit,
+                                self._config.asr.model,
+                            )
+                            self._request_health_check(invalidate=True)
+                        continue
 
                     backoff = min(
                         _ASR_RESTART_BACKOFF_SECONDS * (2 ** max(self._consecutive_quick_crashes - 1, 0)),
@@ -460,17 +909,52 @@ class AppController:
             self._renderer.update_config(new_config.canvas, new_config.layout, new_config.style)
             if new_config.ndi != old_config.ndi or new_config.canvas != old_config.canvas:
                 self._restart_ndi_stream()
-            if new_config.asr != old_config.asr:
+            if new_config.asr != old_config.asr and asr_config_without_text(
+                new_config.asr
+            ) == asr_config_without_text(old_config.asr):
+                # Only vocabulary/snap changed: applied live, no model reload.
+                self._push_text_settings(new_config)
+            elif new_config.asr != old_config.asr:
+                # Also the way out of a halted ASR: a fresh generation with
+                # a clean crash streak (_restart_asr_process).
                 logger.info("asr config changed; restarting ASR worker")
-                if new_config.asr.device != old_config.asr.device:
-                    # A deliberate device change is a fresh attempt: clear the
-                    # crash-loop counter so the newly-chosen device gets an
-                    # un-penalized try (three crashes on the OLD device must
-                    # not immediately terminate the app on the new one).
-                    self._consecutive_quick_crashes = 0
                 self._restart_asr_process()
+            elif new_config.captions != old_config.captions:
+                self._push_text_settings(new_config)
             if new_config.audio != old_config.audio:
                 self._restart_audio_capture()
+            if new_config.transcript != old_config.transcript:
+                self._open_transcript(new_config.transcript)
+            if self._recordings is not None:
+                if new_config.asr != old_config.asr:
+                    self._recordings.note_asr_change(new_config)
+                if new_config.recording != old_config.recording:
+                    self._update_recording_indicator()
+        # Re-run the setup checks against the new config (on their thread).
+        self._request_health_check(invalidate=True)
+        web = self._web
+        if web is not None:
+            # Outside the config lock: a bind/port change restarts the web
+            # listener, which must not hold up the next config swap.
+            web.on_config_changed(old_config, new_config)
+
+    def _push_text_settings(self, config: RootConfig) -> None:
+        """Send new text settings to the running worker (vocabulary,
+        snapping, blocklist all apply from its next decode step). A worker
+        spawned later reads them from the config anyway."""
+        control_queue = getattr(self, "_asr_control_queue", None)
+        if control_queue is None:
+            return
+        logger.info("vocabulary/blocklist changed; updating ASR worker live")
+        control_queue.put(self._text_settings(config))
+
+    @property
+    def stop_requested(self) -> bool:
+        """True once stop() has begun; headless mode uses it to exit. Since
+        the 2026-10-17 failure policy no code path in the app calls stop()
+        on its own (an ASR crash loop halts ASR only), so in practice this
+        follows a signal."""
+        return self._stopped
 
     def stop(self) -> None:
         """Idempotent: safe to call more than once (e.g. a signal handler
@@ -484,6 +968,12 @@ class AppController:
             self._stopped = True
 
         self._stop_event.set()
+        if self._web is not None:
+            self._web.stop()
+        if self._health is not None:
+            self._health.stop()
+        if self._unit_usage is not None:
+            self._unit_usage.stop()
         if self._ndi_stop_event is not None:
             self._ndi_stop_event.set()
         if self._audio_stop_event is not None:
@@ -503,12 +993,27 @@ class AppController:
             self._ndi_thread.join(timeout=5)
         if self._audio_thread is not None:
             self._audio_thread.join(timeout=5)
+        if self._audio_queue is not None:
+            # Nothing reads the audio queue any more: drop what is buffered
+            # and do not let interpreter exit wait for its feeder thread to
+            # flush into a pipe nobody drains (seen: a SIGTERM that never
+            # finished, the feeder blocked in a pipe write).
+            self._drain_audio_queue()
+            cancel = getattr(self._audio_queue, "cancel_join_thread", None)
+            if cancel is not None:
+                cancel()
+        if self._recordings is not None:
+            # After the feed thread: the last frames are in. Flushes audio and
+            # live.srt; a running draft is stopped and queued for next time.
+            self._recordings.shutdown()
         if self._sender is not None:
             self._sender.close()
         current = threading.current_thread()
         for thread in self._threads:
-            # The supervisor can be the caller (crash-loop policy): joining
-            # itself raises "cannot join current thread" and would abort
-            # teardown midway, leaving the worker/N mic/sender uncleaned.
+            # Never join the calling thread ("cannot join current thread"
+            # would abort teardown midway, leaving the worker/mic/sender
+            # uncleaned) -- the supervisor used to call stop() itself.
             if thread is not current and thread.is_alive():
                 thread.join(timeout=5)
+        # After the event-drain thread is gone: flush the cue being gathered.
+        self._open_transcript(TranscriptConfig(enabled=False))

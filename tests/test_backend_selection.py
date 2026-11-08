@@ -8,6 +8,7 @@ import pytest
 from narrator.asr.backend import (
     VulkanDevice,
     audio_ctx_for_seconds,
+    GpuSelectionError,
     select_gpu_index,
 )
 
@@ -38,11 +39,15 @@ def test_explicit_index_overrides_auto_preference():
     assert select_gpu_index([IGPU, RX], 0) == 0
 
 
-def test_explicit_out_of_range_index_is_passed_through(caplog):
-    """whisper.cpp's own init is authoritative, so an unrecognized index is
-    warned about but still forwarded rather than silently rewritten."""
-    assert select_gpu_index([IGPU], 7) == 7
-    assert "not among" in caplog.text
+def test_explicit_out_of_range_index_is_refused():
+    """whisper.cpp would quietly run the model on the CPU for a missing
+    index, so the backend refuses it instead (the configured unit is final)."""
+    with pytest.raises(GpuSelectionError, match="vulkan:7"):
+        select_gpu_index([IGPU], 7)
+
+
+def test_explicit_index_is_passed_through_when_nothing_enumerated():
+    assert select_gpu_index([], 3) == 3
 
 
 @pytest.mark.parametrize(

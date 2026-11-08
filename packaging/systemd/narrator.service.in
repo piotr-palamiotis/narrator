@@ -1,0 +1,52 @@
+# narrator systemd USER service -- template. `make install` renders it with
+# the repo's absolute path (@REPO@) into ~/.config/systemd/user/narrator.service.
+# Do not edit the rendered copy; edit this file and re-run `make install`
+# (or `make service`).
+#
+# A user service, not a system one: PipeWire/PulseAudio (the microphone) runs
+# per user session, and the Vulkan render node only needs the user in the
+# render/video groups. `loginctl enable-linger $USER` (done by make install)
+# starts it at boot without a login.
+#
+# Logs: journalctl --user -u narrator -f   (or `make logs`)
+# Control: the web UI at http://127.0.0.1:8765 (web.port); `narrator --open-ui`
+# opens it logged in. --headless only means "never open a browser".
+[Unit]
+Description=narrator live captions (NDI)
+Wants=network-online.target
+After=network-online.target pipewire.service pipewire-pulse.service
+# At most 5 starts per 5 minutes, then systemd gives up (a process that dies
+# at startup must not restart-loop forever); `systemctl --user reset-failed
+# narrator` after fixing it.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO@
+ExecStart=@REPO@/.venv/bin/narrator --headless --config @REPO@/config/config.yaml
+Environment=PYTHONUNBUFFERED=1
+# Restart only on failure; a SIGTERM/`systemctl stop` shutdown exits 0.
+# Since 2026-10-17 the app never exits because of a setup problem: a broken
+# GPU/driver, missing model, mic or NDI runtime, or an ASR worker crash loop
+# leave it running (NDI output, web UI, manual captions) with the problem
+# shown in the web UI, and a fix there restarts only the affected part. So a
+# "failure" here is only the main process itself dying: an unhandled
+# exception at startup (e.g. an unreadable config.yaml), a native crash, or
+# the OOM killer. The delay grows from RestartSec to RestartMaxDelaySec over
+# RestartSteps restarts.
+Restart=on-failure
+RestartSec=3
+RestartSteps=5
+RestartMaxDelaySec=60
+# SIGTERM runs the app's normal shutdown (NDI, ASR worker, audio, transcript
+# flush); releasing a large model on the GPU can take a few seconds.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+# stdout/stderr go to the journal.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=narrator
+
+[Install]
+WantedBy=default.target

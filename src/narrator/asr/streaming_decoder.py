@@ -23,15 +23,16 @@ long utterance (measured on the reference library: utterances past 20s
 carry 40-65% of documentary narration). End-of-utterance silence detection
 remains the primary bound in the common case.
 
-Two optional aids, both off by default (`narrator --autoconfigure` measures
+Two optional aids, both off by default (`narrator-tune configure` measures
 whether they help): `vad_preroll_ms` prepends the audio from just before the
 VAD fired (Silero needs a window or two to cross its threshold, so first
 syllables get clipped), and `prompt_carryover_chars` hands whisper the tail
 of the already-captioned text as its prompt (context for names and
 spelling across utterances; cleared by a screen wipe or a language change).
 
-Decode hypotheses are passed through `_collapse_repetitions` before agreement
-comparison and commit: streaming re-decode is prone to immediate phrase
+Decode hypotheses are passed through the operator's `text_filters`
+(case-insensitive regex find-and-replace, from obs-localvocal) and then
+`_collapse_repetitions` before agreement comparison and commit: streaming re-decode is prone to immediate phrase
 repetitions ("niż niż") that survive into captions otherwise. See that
 function for the tradeoff this makes.
 """
@@ -39,47 +40,40 @@ from __future__ import annotations
 
 import logging
 import time
-import unicodedata
 from collections import deque
 from collections.abc import Callable
 
 import numpy as np
 
-from narrator.asr.backend import DevicePolicyError, WhisperBackend
+from narrator.asr.asr_backend import AsrBackend, DevicePolicyError
+from narrator.asr.decoder_common import (  # noqa: F401  (re-exported: older imports use this module)
+    LANGUAGE_LOCK_MIN_SECONDS as _LANGUAGE_LOCK_MIN_SECONDS,
+    LANGUAGE_MIN_MARGIN as _LANGUAGE_MIN_MARGIN,
+    SOFT_ROLLOVER_FRACTION as _SOFT_ROLLOVER_FRACTION,
+    SOFT_ROLLOVER_PAUSE_MS as _SOFT_ROLLOVER_PAUSE_MS,
+    VAD_WINDOW_MS as _VAD_WINDOW_MS,
+    BoundaryGuard,
+    HypothesisText,
+    LanguageLock,
+    SilenceTimers,
+    _collapse_indices,
+    _collapse_repetitions,
+    _repetition_key,
+    align_word_times,
+)
 from narrator.asr.events import CaptionEvent, CaptionEventType
+from narrator.asr.text_settings import TextSettings
 from narrator.asr.vad import SileroVad
 from narrator.audio.ring_buffer import AudioWindow
 from narrator.config.schema import AsrConfig
 
 logger = logging.getLogger(__name__)
 
-_VAD_WINDOW_MS = 32.0  # fixed by the Silero graph's 512-sample-at-16kHz requirement
 _MIN_DECODE_SECONDS = 0.3  # skip decode steps on near-empty windows
 _OVERRUN_WARN_FACTOR = 2.0  # warn once a decode step takes >2x the configured step
 _OVERRUN_WARN_INTERVAL_SECONDS = 10.0
-# Language selection is a per-utterance decision over the configured
-# whitelist (backend.detect_language returns the best allowed language plus
-# the probability MARGIN to the runner-up). Two gates keep a marginal
-# decision from being locked as if it were sure:
-#   length: short slices misdetect (large-v3: 0.4s slices get 1-in-7 wrong;
-#   >=1.5s detects correctly), so nothing locks before the window holds
-#   this much audio -- decode steps are skipped until then, and the
-#   post-lock decode covers the whole window at once.
-#   margin: when the top two candidates are close (a 3-language split can
-#   sit near 33/33/33), the decision is deferred and the growing window is
-#   re-detected every step -- which is the "build confidence up" effect:
-#   each step sees more speech until the gap is decisive. At force-finalize
-#   an ambiguous result keeps the PREVIOUS utterance's language (a wrong-but
-#   -consistent caption beats a coin flip that mixes languages mid-speech);
-#   with no history, the top candidate is used anyway (suppressing the
-#   finalize decode would drop audible speech the operator can hear).
-_LANGUAGE_LOCK_MIN_SECONDS = 1.5
-_LANGUAGE_MIN_MARGIN = 0.15
-# Long-utterance rollover (see the module docstring): once the window holds
-# this fraction of the cap, the first pause at least this long ends the
-# utterance -- between-word gaps are ~0-100ms, between phrases 150ms+.
-_SOFT_ROLLOVER_FRACTION = 0.6
-_SOFT_ROLLOVER_PAUSE_MS = 160.0
+# The language lock's gates (length, margin) and the rollover rule's
+# constants live in decoder_common, shared with the segmenter.
 
 
 def _tail_words(text: str, max_chars: int) -> str:
@@ -99,71 +93,6 @@ def _common_prefix_length(a: list[str], b: list[str]) -> int:
     return i
 
 
-def _repetition_key(word: str) -> str:
-    """A word as repetition detection compares it: case and punctuation
-    ignored, because whisper's loops vary both -- measured on the reference
-    library, "Zanim przebiegną tędy nowe jezdnie, zanim przebiegną tędy nowe
-    jezdnie," survived an exact-token comparison."""
-    return "".join(ch for ch in word.lower() if not unicodedata.category(ch).startswith("P"))
-
-
-def _collapse_indices(keys: list[str], max_phrase_len: int) -> list[int]:
-    """Indices into `keys` that survive collapsing immediately repeated
-    phrases (the first occurrence is kept), run to a fixpoint for phrase
-    lengths 1..max_phrase_len."""
-    kept = list(range(len(keys)))
-    changed = True
-    while changed:
-        changed = False
-        for n in range(1, max_phrase_len + 1):
-            if 2 * n > len(kept):
-                break
-            current = [keys[i] for i in kept]
-            out: list[int] = []
-            i = 0
-            while i < len(kept):
-                if i + 2 * n <= len(kept) and current[i : i + n] == current[i + n : i + 2 * n]:
-                    out.extend(kept[i : i + n])
-                    i += 2 * n
-                    changed = True
-                else:
-                    out.append(kept[i])
-                    i += 1
-            kept = out
-    return kept
-
-
-def _collapse_repetitions(words: list[str], max_phrase_len: int = 32) -> list[str]:
-    """Collapse immediately repeated phrases: "niż niż" -> "niż",
-    "modele modele rozpoznawania" -> "modele rozpoznawania",
-    "z do nie z do nie" -> "z do nie", and whole-sentence loops.
-
-    Whisper's streaming decode (a growing window re-decoded every step) is
-    prone to repeating an n-gram across a window boundary; left in, the
-    duplication reaches the committed caption. Measured on the stress
-    harness: word/short-phrase repeats accounted for roughly a third of the
-    residual streaming WER on clips whose offline transcription was clean,
-    and large-v3's greedy decoding additionally produces whole-sentence
-    repetition loops (the same sentence emitted several times inside a
-    single hypothesis, until the token cap) -- whisper.cpp has no
-    no_repeat_ngram_size knob and beam search is unusable in pywhispercpp
-    1.5.1, so the text layer is the only place this can be broken.
-
-    Repeats are detected on `_repetition_key` (case and punctuation
-    ignored) and the first occurrence's original words are kept. Phrases up
-    to 32 words: a 17-word sentence loop was measured on the reference
-    library, past the old 16-word limit.
-
-    Tradeoffs, made deliberately: a speaker genuinely repeating a word for
-    emphasis ("tak, tak") or a short phrase is merged into one instance, and
-    a genuinely repeated long sentence (chorus lines, read-backs) likewise
-    shows once. For a live lower-third that is the right side of the trade
-    -- a stuck repetition loop is far more visible than a lost emphasis.
-    """
-    keys = [_repetition_key(w) for w in words]
-    return [words[i] for i in _collapse_indices(keys, max_phrase_len)]
-
-
 def _agreed_prefix_length(hypotheses: list[list[str]]) -> int:
     """Length of the prefix shared identically by every hypothesis in the list
     -- the standard "local agreement" measure: a word is confirmed once it has
@@ -179,18 +108,23 @@ def _agreed_prefix_length(hypotheses: list[list[str]]) -> int:
 class StreamingDecoder:
     def __init__(
         self,
-        backend: WhisperBackend,
+        backend: AsrBackend,
         vad: SileroVad,
         config: AsrConfig,
         on_event: Callable[[CaptionEvent], None],
         sample_rate: int = 16000,
         clock: Callable[[], float] = time.monotonic,
         min_decode_seconds: float = _MIN_DECODE_SECONDS,
+        text_settings: TextSettings | None = None,
     ) -> None:
         self._backend = backend
         self._vad = vad
         self._config = config
         self._on_event = on_event
+        # Text filters, vocabulary snapping, blocklist, repetition collapse
+        # (decoder_common.HypothesisText; snapping/blocklist hot-reload via
+        # set_text_settings).
+        self._text = HypothesisText(config, text_settings)
         self._window = AudioWindow(sample_rate=sample_rate)
         self._sample_rate = sample_rate
         self._clock = clock
@@ -199,25 +133,16 @@ class StreamingDecoder:
         self._in_speech = False
         self._silence_ms_accum = 0.0
         self._last_decode_monotonic = 0.0
-        self._last_speech_monotonic: float | None = None
-        self._pruned_since_silence = True
-        self._wiped_since_silence = True
+        self._silence_timers = SilenceTimers(config, on_event, on_wipe=self._on_wipe)
 
         self._recent_hypotheses: list[list[str]] = []  # last `agreement_passes` hypotheses
         self._committed_word_count = 0
-        self._last_final_last_key: str | None = None  # cross-commit repetition guard (see _drop_repeated_boundary)
-        # Per-utterance language lock: None until detection clears both the
-        # length and margin gates (see the constants' comment). One decision
-        # per utterance -- per-step detection flaps between acoustically
-        # similar languages (measured: Polish intermittently heard as
-        # Ukrainian), producing mixed-language captions.
-        self._locked_language: str | None = None
-        # Language of the previous utterance: an ambiguous finalize keeps
-        # this instead of coin-flipping (see _finalize_utterance).
-        self._last_utterance_language: str | None = None
-        # Language carried across a long-utterance rollover (the same
-        # continuous speech); expires if a real pause follows.
-        self._rollover_language: str | None = None
+        self._boundary = BoundaryGuard()  # cross-commit repetition guard (see _drop_repeated_boundary)
+        # Per-utterance language lock (decoder_common.LanguageLock): None
+        # until detection clears both the length and margin gates; the
+        # previous utterance's language is the ambiguous-finalize fallback;
+        # a rollover carries the lock, a real pause re-arms it.
+        self._language = LanguageLock(backend, config)
         self._last_overrun_warning = float("-inf")
         # Rollovers so far (diagnostics: autoconfigure reports them).
         self.rollover_count = 0
@@ -229,6 +154,18 @@ class StreamingDecoder:
         self._prompt_text = ""
         self._prompt_language: str | None = None
         self._utterance_text: list[str] = []  # FINAL texts of the current utterance
+        # Audio position bookkeeping, so FINALs can say when their words were
+        # spoken (CaptionEvent.start/end): samples fed so far, the clock at
+        # the latest feed (the worker drains frames right as they arrive, so
+        # the newest fed sample is "now"), and where the window starts.
+        self._fed_samples = 0
+        self._frame_start_sample = 0
+        self._feed_clock = 0.0
+        self._utterance_start_sample = 0
+        # (start, end) seconds into the window for each word of the latest
+        # hypothesis, from the backend's word timestamps; None = unknown
+        # (FINAL times then fall back to the proportional estimate).
+        self._word_times: list[tuple[float, float]] | None = None
 
         self._on_event(CaptionEvent(CaptionEventType.STATUS, backend.resolved_device_description))
 
@@ -242,17 +179,18 @@ class StreamingDecoder:
         that separation matters. The default keeps the original
         ingest-and-maybe-decode behavior for direct callers.
         """
+        self._frame_start_sample = self._fed_samples
+        self._fed_samples += len(frame)
         probabilities = self._vad.process(frame)
         now = self._clock()
+        self._feed_clock = now
 
         for probability in probabilities:
             if probability >= self._config.vad_threshold:
                 if not self._in_speech:
                     self._start_utterance()
                 self._silence_ms_accum = 0.0
-                self._last_speech_monotonic = now
-                self._pruned_since_silence = False
-                self._wiped_since_silence = False
+                self._silence_timers.speech(now)
             else:
                 self._silence_ms_accum += _VAD_WINDOW_MS
 
@@ -280,10 +218,9 @@ class StreamingDecoder:
             if self._silence_ms_accum >= self._config.end_silence_ms:
                 # A real pause after a rollover: whoever speaks next is a new
                 # utterance and gets a fresh language decision.
-                self._rollover_language = None
+                self._language.on_pause()
             self._remember_preroll(frame)
-            self._maybe_emit_prune(now)
-            self._maybe_emit_wipe(now)
+            self._silence_timers.idle(now)
 
     def _should_roll_over(self) -> bool:
         cap_seconds = min(self._config.max_utterance_ms / 1000.0, self._config.max_context_seconds)
@@ -326,6 +263,7 @@ class StreamingDecoder:
     def _start_utterance(self) -> None:
         self._in_speech = True
         self._window.clear()
+        self._utterance_start_sample = self._frame_start_sample - self._preroll_samples
         # VAD pre-roll: the audio from just before the VAD fired.
         for frame in self._preroll:
             self._window.append(frame)
@@ -341,49 +279,28 @@ class StreamingDecoder:
         # yet). One decision per utterance keeps each caption in a single
         # language. Speech continuing straight after a rollover keeps its
         # language: it is the same speech, cut only to bound decode cost.
-        self._locked_language = self._rollover_language
-        self._rollover_language = None
-        # `self._last_final_last_key` deliberately persists across utterances:
+        self._language.start()
+        # The boundary guard deliberately persists across utterances:
         # a stutter at an utterance boundary would otherwise produce adjacent
         # FINALs ending/starting with the same word.
 
     def _ensure_language_locked(self, force: bool = False) -> None:
-        """Resolve the decode language for the current utterance, once.
+        """Resolve the decode language for the current utterance, once
+        (decoder_common.LanguageLock.ensure). Until it locks, decode steps
+        are skipped: output in an unverified language would be garbage we'd
+        have to suppress anyway, and the post-lock decode covers the whole
+        window at once -- so the deferred decision costs latency only on
+        genuinely ambiguous audio."""
+        self._language.ensure(self._window.samples, self._window.duration_seconds, force=force)
 
-        Locks when the window holds `_LANGUAGE_LOCK_MIN_SECONDS` of audio AND
-        detection clears the margin gate (`_LANGUAGE_MIN_MARGIN` between the
-        top two allowed candidates). Until then decode steps are skipped:
-        output in an unverified language would be garbage we'd have to
-        suppress anyway, and the post-lock decode covers the whole window at
-        once -- so the deferred decision costs latency only on genuinely
-        ambiguous audio. `force` (the finalize path) drops the length
-        requirement; the margin gate degrades to 'keep the previous
-        utterance's language on ambiguity' there (see _finalize_utterance).
-        """
-        if self._locked_language is not None:
-            return
-        # Single-entry whitelist: the language is known from config, no
-        # detection, no waiting -- this is the permanent-forced mode.
-        if len(self._config.language_whitelist) == 1:
-            self._locked_language = self._config.language_whitelist[0]
-            return
-        if not force and self._window.duration_seconds < _LANGUAGE_LOCK_MIN_SECONDS:
-            return
-        result = self._backend.detect_language(self._window.samples)
-        if result is None:
-            return  # detection error; retry on a later step / at finalize
-        language, probability, margin = result
-        # The margin gate applies at force too: finalize handles ambiguity by
-        # keeping the previous utterance's language (see _finalize_utterance).
-        if margin < _LANGUAGE_MIN_MARGIN:
-            logger.debug(
-                "language detection ambiguous (%s @ %.2f, margin %.2f); collecting more audio",
-                language,
-                probability,
-                margin,
-            )
-            return
-        self._locked_language = language
+    # The language state, by the names the tests (and older code) know.
+    @property
+    def _locked_language(self) -> str | None:
+        return self._language.locked
+
+    @property
+    def _last_utterance_language(self) -> str | None:
+        return self._language.previous
 
     def _run_decode_step(self, now: float) -> None:
         self._last_decode_monotonic = now
@@ -415,8 +332,8 @@ class StreamingDecoder:
             return
         self._note_decode_duration(time.monotonic() - started, window_seconds)
 
-        text = " ".join(seg_text for _, _, seg_text in segments if seg_text).strip()
-        words = _collapse_repetitions(text.split())
+        words = self._hypothesis_words(segments)
+        self._word_times = align_word_times(words, getattr(self._backend, "last_word_times", None))
 
         self._recent_hypotheses.append(words)
         if len(self._recent_hypotheses) > self._config.agreement_passes:
@@ -427,7 +344,7 @@ class StreamingDecoder:
             if agreed_len > self._committed_word_count:
                 new_words = self._drop_repeated_boundary(words, self._committed_word_count, agreed_len)
                 if new_words:
-                    self._emit_final(" ".join(new_words))
+                    self._emit_final(" ".join(new_words), self._committed_word_count, agreed_len, len(words))
                 self._committed_word_count = agreed_len
 
         if self._config.show_partial_captions:
@@ -466,44 +383,32 @@ class StreamingDecoder:
         # only when the lock hasn't landed during the utterance, which the
         # margin gate makes rare.
         if self._window.duration_seconds >= self._min_decode_seconds:
-            self._ensure_language_locked(force=True)
-            # An ambiguous finalize (margin never cleared): keep the previous
-            # utterance's language rather than coin-flip -- a wrong-but-
-            # consistent caption beats one that mixes languages mid-speech.
-            # With no history (first utterance), use the top candidate anyway:
-            # dropping the window would hide speech the operator can hear.
-            if self._locked_language is None:
-                if self._last_utterance_language is not None:
-                    self._locked_language = self._last_utterance_language
-                    logger.info(
-                        "language still ambiguous at finalize; keeping previous utterance's language %s",
-                        self._locked_language,
-                    )
-                else:
-                    result = self._backend.detect_language(self._window.samples)
-                    if result is None:
-                        logger.warning(
-                            "language detection failed at finalize; dropping %.1fs window",
-                            self._window.duration_seconds,
-                        )
-                        self._in_speech = False
-                        self._window.clear()
-                        self._recent_hypotheses = []
-                        self._committed_word_count = 0
-                        self._silence_ms_accum = 0.0
-                        self._utterance_text = []
-                        return
-                    self._locked_language = result[0]
+            # An ambiguous finalize (margin never cleared) keeps the previous
+            # utterance's language rather than coin-flip; with no history
+            # (first utterance) the top candidate is used anyway -- dropping
+            # the window would hide speech the operator can hear.
+            if self._language.for_finalize(self._window.samples, self._window.duration_seconds) is None:
+                logger.warning(
+                    "language detection failed at finalize; dropping %.1fs window",
+                    self._window.duration_seconds,
+                )
+                self._in_speech = False
+                self._window.clear()
+                self._recent_hypotheses = []
+                self._committed_word_count = 0
+                self._silence_ms_accum = 0.0
+                self._utterance_text = []
+                return
             window_seconds = self._window.duration_seconds
             started = time.monotonic()
             try:
                 segments = self._backend.transcribe(self._window.samples, **self._decode_kwargs())
                 self._note_decode_duration(time.monotonic() - started, window_seconds)
-                text = " ".join(seg_text for _, _, seg_text in segments if seg_text).strip()
-                words = _collapse_repetitions(text.split())
+                words = self._hypothesis_words(segments)
+                self._word_times = align_word_times(words, getattr(self._backend, "last_word_times", None))
                 remaining = self._drop_repeated_boundary(words, self._committed_word_count, len(words))
                 if remaining:
-                    self._emit_final(" ".join(remaining))
+                    self._emit_final(" ".join(remaining), self._committed_word_count, len(words), len(words))
             except Exception:
                 logger.exception("Final decode pass failed for utterance")
 
@@ -511,9 +416,7 @@ class StreamingDecoder:
         self._in_speech = False
         # Next utterance starts fresh; remember this one's language for the
         # ambiguity fallback above (and, after a rollover, to continue in).
-        self._last_utterance_language = self._locked_language
-        self._rollover_language = self._locked_language if rollover else None
-        self._locked_language = None
+        self._language.finish(rollover)
         self._window.clear()
         self._recent_hypotheses = []
         self._committed_word_count = 0
@@ -555,58 +458,56 @@ class StreamingDecoder:
             self._config.step_ms,
         )
 
-    def _emit_final(self, text: str) -> None:
+    def set_text_settings(self, settings: TextSettings) -> None:
+        """Apply new vocabulary-snap/blocklist settings (live: the worker
+        calls this on a hot-reload; the next decode step uses them). The
+        prompt vocabulary is the backend's (AsrBackend.set_vocabulary)."""
+        self._text.set_text_settings(settings)
+
+    def _hypothesis_words(self, segments: list[tuple[float, float, str]]) -> list[str]:
+        """One decode's segments as hypothesis words (decoder_common.
+        HypothesisText: text filters, snapping, blocklist, repetition
+        collapse -- all before agreement)."""
+        return self._text.words(" ".join(seg_text for _, _, seg_text in segments if seg_text))
+
+    def _emit_final(self, text: str, first_word: int, end_word: int, hypothesis_words: int) -> None:
+        """Emit words [first_word, end_word) of a `hypothesis_words`-word
+        hypothesis as a FINAL, stamped with when they were spoken: from
+        whisper's word timestamps of that decode when the backend reports
+        them (AsrBackend.last_word_times; token-timestamp heuristic, or
+        DTW with asr.dtw_word_timestamps), else words are placed
+        proportionally over the window's speech (the window minus its
+        trailing silence). Measured on Piper clips with known pauses
+        (word-boundary error, mean): proportional 0.4 s (small) / 2.0 s
+        (large-v3, inflated by repetition loops), token timestamps
+        0.14 / 0.25 s, DTW 0.15 / 0.07 s."""
         self._utterance_text.append(text)
-        self._on_event(CaptionEvent(CaptionEventType.FINAL, text))
+        times = self._word_times
+        if times is not None and len(times) == hypothesis_words and end_word > first_word:
+            start_offset = times[first_word][0] * self._sample_rate
+            end_offset = max(times[end_word - 1][1] * self._sample_rate, start_offset)
+        else:
+            speech_samples = max(
+                0.0, len(self._window.samples) - self._silence_ms_accum * self._sample_rate / 1000.0
+            )
+            per_word = speech_samples / max(hypothesis_words, 1)
+            start_offset = per_word * first_word
+            end_offset = per_word * end_word
+        start = self._sample_clock(self._utterance_start_sample + start_offset)
+        end = self._sample_clock(self._utterance_start_sample + end_offset)
+        self._on_event(CaptionEvent(CaptionEventType.FINAL, text, start=start, end=end))
+
+    def _sample_clock(self, sample: float) -> float:
+        """The decoder clock at which audio sample `sample` was fed."""
+        return self._feed_clock - (self._fed_samples - sample) / self._sample_rate
 
     def _drop_repeated_boundary(self, words: list[str], start: int, end: int) -> list[str]:
-        """Newly-committed words for one FINAL, minus a leading word that
-        duplicates the utterance's previous FINAL's last word.
+        """Newly-committed words [start, end) for one FINAL, minus a leading
+        word that duplicates the previous FINAL's last word
+        (decoder_common.BoundaryGuard)."""
+        return self._boundary.apply(words[start:end])
 
-        `_collapse_repetitions` only sees one decode hypothesis at a time, so
-        it cannot catch a repetition that straddles two commits -- the window
-        tail re-decoded at the start of the next window emits the same word
-        twice in adjacent FINALs ("... 15" then "15 tysięcy ..."). This
-        compares against `self._last_final_last_key`, maintained here, with
-        the same case/punctuation-blind key as `_collapse_repetitions`.
-        """
-        new_words = words[start:end]
-        if new_words and _repetition_key(new_words[0]) == self._last_final_last_key:
-            new_words = new_words[1:]
-        if new_words:
-            self._last_final_last_key = _repetition_key(new_words[-1])
-        return new_words
-
-    def _maybe_emit_prune(self, now: float) -> None:
-        """Idle past `prune_history_after_silence_seconds`: CLEAR, which drops
-        only caption lines that are already invisible under layout.max_lines
-        (memory hygiene -- memory is also bounded by the buffer's history cap,
-        so this is not load-bearing for memory). The display is untouched.
-        """
-        if self._pruned_since_silence or self._last_speech_monotonic is None:
-            return
-        idle_seconds = now - self._last_speech_monotonic
-        if idle_seconds >= self._config.prune_history_after_silence_seconds:
-            self._on_event(CaptionEvent(CaptionEventType.CLEAR))
-            self._pruned_since_silence = True
-
-    def _maybe_emit_wipe(self, now: float) -> None:
-        """Idle past `wipe_screen_after_silence_seconds`: WIPE, a true screen
-        clear, same as the operator's Ctrl+N. 0 disables it -- the default,
-        because stale captions are usually better than blank ones and the
-        operator knows their venue. Nonzero exists for broadcasts where a
-        very old sentence would misattribute to unrelated new speech.
-        """
-        if (
-            self._config.wipe_screen_after_silence_seconds <= 0
-            or self._wiped_since_silence
-            or self._last_speech_monotonic is None
-        ):
-            return
-        idle_seconds = now - self._last_speech_monotonic
-        if idle_seconds >= self._config.wipe_screen_after_silence_seconds:
-            self._on_event(CaptionEvent(CaptionEventType.WIPE))
-            self._wiped_since_silence = True
-            # The screen starts over, and so does the context.
-            self._prompt_text = ""
-            self._prompt_language = None
+    def _on_wipe(self) -> None:
+        """A silence WIPE cleared the screen: the prompt context goes too."""
+        self._prompt_text = ""
+        self._prompt_language = None

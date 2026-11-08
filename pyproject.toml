@@ -12,24 +12,37 @@ dependencies = [
     "scipy>=1.12",
     "pillow>=10.2",
     "onnxruntime>=1.17",
-    # 1.5.1 is the version verified to ship a Vulkan-enabled ggml backend
-    # (libggml-vulkan.so) in its prebuilt wheels, which is what makes GPU
-    # acceleration work with no source build. Older wheels were CPU-only, so
-    # this floor is deliberate rather than incidental.
+    # The PyPI wheel is CPU-only (and SIGILLs on pre-AVX CPUs); `make
+    # install` replaces it with a Vulkan source build of the 1.5.1 bindings
+    # over whisper.cpp 1.9.5 (packaging/whisper_cpp/build_vulkan_linux.sh,
+    # version 1.5.1+whispercpp.1.9.5). backend.py reads token data through
+    # the 1.5.1 binding's private context handle, so keep the floor.
     "pywhispercpp>=1.5.1",
     "cyndilib>=0.0.9",
     "platformdirs>=4.0",
-    "sv-ttk>=2.6",
-    "pystray>=0.19",
+    # The web admin UI (narrator.web): HTTP + WebSocket server on its own
+    # thread/event loop; replaces the Tk GUI (sv-ttk, pystray).
+    "aiohttp>=3.9",
+    # Session recording (narrator.recording): audio.flac is written with
+    # libsndfile, which the soundfile wheels bundle (no system package).
+    "soundfile>=0.12",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
 ]
+# narrator-tune (src/narrator_tune), the offline tuning tool: installed by
+# `make configure`, not by `make install`; the app never imports it. It
+# runs on narrator's own dependencies; jiwer is for the eval scripts that
+# accompany it (scripts/stream_eval.py, scripts/eval_transcript.py).
+tune = [
+    "jiwer>=3.0",
+]
 
 [project.scripts]
 narrator = "narrator.main:main"
+narrator-tune = "narrator_tune.cli:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
@@ -39,4 +52,5 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-narrator = ["config/defaults.yaml"]
+narrator = ["config/defaults.yaml", "config/presets.yaml", "asr/data/*", "captions/data/*.txt", "web/static/*"]
+narrator_tune = ["tune_defaults.yaml"]

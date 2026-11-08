@@ -5,17 +5,32 @@ Recompositing is skipped when neither the visible caption lines nor the
 layout/style config have changed since the last call -- the render+NDI loop
 still sends a frame every tick (see narrator.ndi.sender), it just resends the
 cached bytes instead of redoing the (relatively expensive) Pillow drawing.
+
+Caption state changes (a FINAL replacing the open partial, pacing reveals)
+and frame reads happen under one lock, so the render thread never sees a
+half-applied update -- e.g. neither the partial nor the FINAL that
+replaces it, or both. With `layout.pacing` on, text passes through a
+CaptionPacer (narrator.captions.pacer) on its way to the buffer.
 """
 from __future__ import annotations
 
-from PIL import Image
+import threading
+import time
+
+from PIL import Image, ImageDraw
 
 from narrator.captions.buffer import CaptionBuffer
 from narrator.captions.layout import compute_line_geometry, line_y_positions
-from narrator.captions.wrap import wrap_text
+from narrator.captions.pacer import CaptionPacer
 from narrator.config.schema import CanvasConfig, LayoutConfig, StyleConfig, parse_rgba
 from narrator.render.fonts import PillowFontMetrics, PillowTextWidth, load_font
 from narrator.render.style import composite_line
+
+# The optional recording dot (recording.on_air_dot): top-right corner, sized
+# from the canvas height like everything else here.
+_REC_DOT_COLOR = (230, 30, 30, 230)
+_REC_DOT_DIAMETER_PCT = 1.6
+_REC_DOT_MARGIN_PCT = 1.5
 
 _metrics = PillowFontMetrics()
 _text_width = PillowTextWidth()
@@ -31,7 +46,25 @@ class CaptionRenderer:
         self._cached_frame: Image.Image | None = None
         self._cached_lines: tuple[str, ...] | None = None
         self._partial_preview: str = ""
+        self._recording_indicator = False
+        self._lock = threading.RLock()
+        self._clock = time.monotonic
+        self._pacer: CaptionPacer | None = None
+        self._apply_pacing()
         self._apply_geometry()
+
+    def _apply_pacing(self) -> None:
+        """Start/stop/switch the pacer for `layout.pacing`; text it still
+        holds is shown at once when pacing goes off or changes mode."""
+        mode = getattr(self._layout_cfg.pacing, "value", self._layout_cfg.pacing)
+        if self._pacer is not None and self._pacer.mode == mode:
+            return
+        if self._pacer is not None:
+            commits, tail = self._pacer.flush()
+            for text in commits:
+                self._buffer.append_final_text(text)
+            self._partial_preview = tail
+        self._pacer = CaptionPacer(mode) if mode != "off" else None
 
     def _apply_geometry(self) -> None:
         self._geometry = compute_line_geometry(self._canvas_cfg, self._layout_cfg, self._style_cfg, _metrics)
@@ -46,11 +79,20 @@ class CaptionRenderer:
         self._cached_lines = None
 
     def update_config(self, canvas: CanvasConfig, layout: LayoutConfig, style: StyleConfig) -> None:
-        self._canvas_cfg, self._layout_cfg, self._style_cfg = canvas, layout, style
-        self._apply_geometry()
+        with self._lock:
+            self._canvas_cfg, self._layout_cfg, self._style_cfg = canvas, layout, style
+            self._apply_pacing()
+            self._apply_geometry()
 
     def append_final_text(self, text: str) -> None:
-        self._buffer.append_final_text(text)
+        """Commit a FINAL; it replaces the open partial in the same step (no
+        frame shows both, or neither)."""
+        with self._lock:
+            if self._pacer is not None:
+                self._pacer.push_final(text)
+                return
+            self._buffer.append_final_text(text)
+            self._partial_preview = ""
 
     def prune_history(self) -> int:
         """Drop committed caption lines that can no longer be displayed under
@@ -59,19 +101,37 @@ class CaptionRenderer:
         the last captions; only off-screen history is trimmed. See
         CaptionBuffer.prune_history.
         """
-        return self._buffer.prune_history()
+        with self._lock:
+            return self._buffer.prune_history()
 
     def clear(self) -> None:
-        self._buffer.clear()
-        self._partial_preview = ""
+        with self._lock:
+            self._buffer.clear()
+            self._partial_preview = ""
+            if self._pacer is not None:
+                self._pacer.reset()
 
     def set_partial_preview(self, text: str) -> None:
         """Show unconfirmed ASR hypothesis text appended after the committed
         buffer, for display only -- never stored in caption history. Used
         when `asr.show_partial_captions` is enabled; overwritten or cleared
-        on the next partial/final/clear event.
+        on the next partial/final/clear event. Shown inline, continuing the
+        last caption line (CaptionBuffer.visible_lines_with_tail).
         """
-        self._partial_preview = text
+        with self._lock:
+            if self._pacer is not None:
+                self._pacer.push_partial(text)
+            else:
+                self._partial_preview = text
+
+    def set_recording_indicator(self, on: bool) -> None:
+        """Show/hide the small recording dot (off unless recording with
+        recording.on_air_dot enabled -- the controller decides)."""
+        self._recording_indicator = bool(on)
+
+    @property
+    def recording_indicator(self) -> bool:
+        return self._recording_indicator
 
     @property
     def resolved_font_size_px(self) -> int:
@@ -92,26 +152,25 @@ class CaptionRenderer:
     def snapshot_text(self) -> str:
         return self._buffer.snapshot_text()
 
+    def visible_lines(self) -> tuple[str, ...]:
+        """The caption lines currently on screen (partial preview included)."""
+        return self._visible_lines_with_preview()
+
     def _visible_lines_with_preview(self) -> tuple[str, ...]:
-        committed = self._buffer.visible_lines()
-        if not self._partial_preview:
-            return tuple(committed)
-        preview_lines = wrap_text(
-            self._partial_preview,
-            self._style_cfg.font_family,
-            self._geometry.font_size_px,
-            self._geometry.box.width,
-            _text_width,
-        )
-        combined = committed + preview_lines
-        return tuple(combined[-self._layout_cfg.max_lines :])
+        with self._lock:
+            if self._pacer is not None:
+                commits, self._partial_preview = self._pacer.advance(self._clock())
+                for text in commits:
+                    self._buffer.append_final_text(text)
+            return tuple(self._buffer.visible_lines_with_tail(self._partial_preview))
 
     def get_frame(self) -> Image.Image:
         """Return the current RGBA frame, recompositing only if the visible
         caption lines (including any partial preview) changed since the last call.
         """
         lines = self._visible_lines_with_preview()
-        if self._cached_frame is not None and lines == self._cached_lines:
+        key = (lines, self._recording_indicator)
+        if self._cached_frame is not None and key == self._cached_lines:
             return self._cached_frame
 
         canvas_cfg, layout_cfg, style_cfg, geometry = (
@@ -141,6 +200,15 @@ class CaptionRenderer:
                 text_align=layout_cfg.text_align,
             )
 
+        if self._recording_indicator:
+            height = canvas_cfg.height_px
+            diameter = max(4, round(height * _REC_DOT_DIAMETER_PCT / 100))
+            margin = round(height * _REC_DOT_MARGIN_PCT / 100)
+            right = canvas_cfg.width_px - margin
+            ImageDraw.Draw(image).ellipse(
+                (right - diameter, margin, right, margin + diameter), fill=_REC_DOT_COLOR
+            )
+
         self._cached_frame = image
-        self._cached_lines = lines
+        self._cached_lines = key
         return image

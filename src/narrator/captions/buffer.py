@@ -129,6 +129,21 @@ class CaptionBuffer:
             parts.append(pending)
         return " ".join(parts).strip()
 
+    def visible_lines_with_tail(self, tail: str) -> list[str]:
+        """The visible lines with `tail` (an in-progress partial caption)
+        continuing the pending line, wrapped like committed text -- so a
+        FINAL that replaces the partial with the same words reflows nothing.
+        The tail is never stored."""
+        tail = tail.strip()
+        if not tail:
+            return self.visible_lines()
+        if self._measure is None or self._font_path is None or self._size_px is None:
+            raise RuntimeError("CaptionBuffer.configure_geometry() must be called before rendering a tail")
+        committed, pending = self._state
+        combined = f"{pending} {tail}" if pending else tail
+        wrapped = wrap_text(combined, self._font_path, self._size_px, self._box_width, self._measure)
+        return (list(committed) + wrapped)[-self._max_lines :]
+
     def visible_lines(self) -> list[str]:
         committed, pending = self._state
         lines = list(committed)

@@ -924,3 +924,134 @@ def test_cross_commit_guard_ignores_case_and_punctuation():
     feed_decode_step(decoder, clock, config)  # utterance 2 starts with "Jezdnie,"
     finals = [e.text for e in events if e.type is CaptionEventType.FINAL]
     assert finals[-1] == "i chodniki"
+
+
+# ---------------------------------------------------------------------------
+# Text filters and FINAL spoken-time stamps
+# ---------------------------------------------------------------------------
+
+
+def test_text_filters_rewrite_hypotheses_before_agreement():
+    config = AsrConfig(
+        step_ms=100, agreement_passes=2, end_silence_ms=300, prune_history_after_silence_seconds=5,
+        language_whitelist=["pl"],
+        text_filters=[
+            {"pattern": r"\s*napisy stworzone przez.*", "replacement": ""},
+            {"pattern": r"\bwarszawa\b", "replacement": "Warszawa"},
+        ],
+    )
+    decoder, clock, events = make_decoder(
+        [
+            "jedziemy do warszawy napisy stworzone przez kogoś",
+            "jedziemy do WARSZAWA napisy stworzone przez kogoś innego",
+        ],
+        config=config,
+    )
+    feed_decode_step(decoder, clock, config)
+    feed_decode_step(decoder, clock, config)
+    finals = [e.text for e in events if e.type == CaptionEventType.FINAL]
+    # The credits tail is gone from both hypotheses, so they agree on
+    # "jedziemy do" and differ only in the inflected word.
+    assert finals == ["jedziemy do"]
+
+
+def _feed_real_time(decoder, clock, level: float, frames: int) -> None:
+    decoder._vad.level = level
+    for _ in range(frames):
+        clock.advance(len(FRAME) / 16000)  # real time: one frame per frame-length
+        decoder.feed(FRAME)
+
+
+def test_final_events_carry_spoken_time_not_emit_time():
+    # agreement_passes=99: nothing commits early, so the one FINAL comes from
+    # the finalize and spans the whole utterance.
+    config = AsrConfig(
+        step_ms=100, agreement_passes=99, end_silence_ms=300, prune_history_after_silence_seconds=5,
+        language_whitelist=["pl"],
+    )
+    decoder, clock, events = make_decoder(["raz dwa trzy"] * 30, config=config)
+    _feed_real_time(decoder, clock, 0.0, 10)  # 0.3s of silence
+    speech_start = clock.now  # the first speech frame spans [now, now + 30ms]
+    _feed_real_time(decoder, clock, 1.0, 30)  # 0.9s of speech
+    speech_end = clock.now
+    _feed_real_time(decoder, clock, 0.0, 15)  # long enough to finalize
+
+    finals = [e for e in events if e.type == CaptionEventType.FINAL]
+    assert [f.text for f in finals] == ["raz dwa trzy"]
+    assert abs(finals[0].start - speech_start) < 0.05
+    assert abs(finals[0].end - speech_end) < 0.05
+
+
+def test_committed_finals_are_stamped_in_order_within_the_speech():
+    config = AsrConfig(
+        step_ms=100, agreement_passes=2, end_silence_ms=300, prune_history_after_silence_seconds=5,
+        language_whitelist=["pl"],
+    )
+    words = ["raz", "dwa", "trzy", "cztery", "pięć", "sześć"]
+    responses = [" ".join(words[: n + 1]) for n in range(6)]
+    decoder, clock, events = make_decoder(responses + [responses[-1]] * 20, config=config)
+    _feed_real_time(decoder, clock, 0.0, 10)
+    speech_start = clock.now
+    _feed_real_time(decoder, clock, 1.0, 30)
+    speech_end = clock.now
+    _feed_real_time(decoder, clock, 0.0, 15)
+
+    finals = [e for e in events if e.type == CaptionEventType.FINAL]
+    assert len(finals) > 1
+    assert abs(finals[0].start - speech_start) < 0.05
+    for earlier, later in zip(finals, finals[1:]):
+        assert earlier.start <= earlier.end <= later.start + 1e-9 <= later.end + 1e-9
+    assert finals[-1].end <= speech_end + 0.05
+
+
+class _TimedBackend(FakeBackend):
+    """FakeBackend that also reports word times, like WhisperBackend's
+    last_word_times: each response is a list of (word, start, end)."""
+
+    def __init__(self, timed_responses):
+        super().__init__([" ".join(w for w, _, _ in r) for r in timed_responses])
+        self._timed = iter(timed_responses)
+        self.last_word_times = []
+
+    def transcribe(self, audio, language=None):
+        from narrator.asr.backend import WordTime
+
+        self.last_word_times = [WordTime(w, s, e) for w, s, e in next(self._timed)]
+        return super().transcribe(audio, language=language)
+
+
+def test_final_times_come_from_backend_word_times_when_available():
+    # One utterance, finalize-only (agreement_passes=99): the backend says
+    # the words were spoken at 0.10-0.30 and 0.50-0.70 s into the window,
+    # so the FINAL spans exactly that, not the whole speech stretch.
+    config = AsrConfig(
+        step_ms=100, agreement_passes=99, end_silence_ms=300, prune_history_after_silence_seconds=5,
+        language_whitelist=["pl"],
+    )
+    events = []
+    clock = FakeClock()
+    backend = _TimedBackend([[("raz", 0.10, 0.30), ("dwa", 0.50, 0.70)]] * 30)
+    decoder = StreamingDecoder(backend, FakeVad(), config, on_event=events.append, clock=clock, min_decode_seconds=0.01)
+    _feed_real_time(decoder, clock, 0.0, 10)
+    speech_start = clock.now
+    _feed_real_time(decoder, clock, 1.0, 30)
+    _feed_real_time(decoder, clock, 0.0, 15)
+    finals = [e for e in events if e.type == CaptionEventType.FINAL]
+    assert [f.text for f in finals] == ["raz dwa"]
+    assert abs(finals[0].start - (speech_start + 0.10)) < 1e-6
+    assert abs(finals[0].end - (speech_start + 0.70)) < 1e-6
+
+
+def test_align_word_times_follows_text_processing():
+    from narrator.asr.backend import WordTime
+    from narrator.asr.decoder_common import align_word_times
+
+    raw = [WordTime("raz", 0, 1), WordTime("dwa", 1, 2), WordTime("dwa", 2, 3), WordTime("Trzy.", 3, 4)]
+    # repetition collapse dropped one "dwa"; case/punctuation differ
+    assert align_word_times(["raz", "dwa", "trzy"], raw) == [(0, 1), (1, 2), (3, 4)]
+    # a filter replaced two words with one: spread over the replaced run
+    assert align_word_times(["raz", "X", "trzy"], raw[:1] + [WordTime("a", 1, 2), WordTime("b", 2, 3)] + raw[3:]) == [
+        (0, 1), (1.0, 3.0), (3, 4)
+    ]
+    assert align_word_times(["raz"], []) is None
+    assert align_word_times(["raz"], object()) is None

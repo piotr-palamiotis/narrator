@@ -11,6 +11,12 @@ What it measures per clip window:
   - wer:     word error rate vs the reference transcript (punctuation-stripped)
   - finalize_latency_s: time from the clip's audio ending to its last FINAL
   - first_final_s:      time from playback start to the first FINAL
+  - first_partial_s:    time from playback start to the first PARTIAL
+                        (asr.show_partial_captions; --partials)
+
+Either decoder: --decoder local_agreement|segmenter, plus the segmenter's
+levers (--partials, --partial-latency-ms, --max-segment-ms,
+--segmentation-mode, --context-sentences).
 
 What it reports across repeats:
   - per-clip WER mean/max, mean latencies
@@ -65,7 +71,7 @@ TAIL_ATTRIBUTION_S = 1.0
 
 # --------------------------------------------------------------------------
 # transcript scoring lives in narrator.asr.metrics (shared with the
-# autoconfigure quality probe so both score identically).
+# narrator-tune quality probe so both score identically).
 # --------------------------------------------------------------------------
 
 normalize = _normalize
@@ -196,7 +202,7 @@ def write_config(path: Path, asr_overrides: dict, language: str) -> None:
 
     config = RootConfig()
     config.audio.device = "default"
-    config.gui.enabled = False
+    config.web.enabled = False
     config.app.log_level = "WARNING"
     # --language pl pins the whitelist to Polish (permanent-forced); "auto"
     # runs unrestricted per-utterance detection. Either way the whitelist is
@@ -207,7 +213,8 @@ def write_config(path: Path, asr_overrides: dict, language: str) -> None:
         "language_whitelist": [] if language == "auto" else [language],
     }
     asr.update(asr_overrides)
-    config.asr = config.asr.model_copy(update=asr)
+    # validated (not model_copy): enum fields such as asr.decoder arrive as strings
+    config.asr = type(config.asr).model_validate({**config.asr.model_dump(mode="json"), **asr})
     from narrator.config.loader import save_config
     save_config(config, path)
 
@@ -240,6 +247,17 @@ def run_once(windows: list[ClipWindow], config_path: Path) -> dict:
         original_append(text)
 
     renderer.append_final_text = append_final_text  # type: ignore[method-assign]
+    # ... and its partial sink (asr.show_partial_captions): when text first
+    # became visible, before its FINAL.
+    partials: list[float] = []
+    original_partial = renderer.set_partial_preview
+
+    def set_partial_preview(text: str) -> None:
+        if text.strip():
+            partials.append(time.monotonic())
+        original_partial(text)
+
+    renderer.set_partial_preview = set_partial_preview  # type: ignore[method-assign]
 
     try:
         t0 = time.monotonic()
@@ -268,8 +286,10 @@ def run_once(windows: list[ClipWindow], config_path: Path) -> dict:
                     break
 
         per_clip = []
-        for window in windows:
+        for i, window in enumerate(windows):
             last_final_t = max((t for t, _ in window.finals), default=None)
+            window_end = windows[i + 1].t_play_start if i + 1 < len(windows) else float("inf")
+            first_partial = min((t for t in partials if window.t_play_start <= t < window_end), default=None)
             per_clip.append({
                 "clip": window.clip_id,
                 "text": window.text,
@@ -277,6 +297,7 @@ def run_once(windows: list[ClipWindow], config_path: Path) -> dict:
                 "wer": round(wer(window.reference, window.text), 4),
                 "finalize_latency_s": round(last_final_t - window.t_play_end, 3) if last_final_t else None,
                 "first_final_s": round(window.finals[0][0] - window.t_play_start, 3) if window.finals else None,
+                "first_partial_s": round(first_partial - window.t_play_start, 3) if first_partial else None,
             })
 
         transcript = [w.text for w in windows]
@@ -338,6 +359,12 @@ def main() -> None:
     ap.add_argument("--step-ms", type=int, default=None, help="asr.step_ms override")
     ap.add_argument("--agreement-passes", type=int, default=None, help="asr.agreement_passes override")
     ap.add_argument("--end-silence-ms", type=int, default=None, help="asr.end_silence_ms override")
+    ap.add_argument("--decoder", default=None, choices=["local_agreement", "segmenter"], help="asr.decoder override")
+    ap.add_argument("--partials", action="store_true", help="asr.show_partial_captions on (segmenter: peek decodes)")
+    ap.add_argument("--partial-latency-ms", type=int, default=None, help="asr.partial_latency_ms override")
+    ap.add_argument("--max-segment-ms", type=int, default=None, help="asr.max_segment_ms override")
+    ap.add_argument("--segmentation-mode", default=None, choices=["vad", "hybrid", "fixed"])
+    ap.add_argument("--context-sentences", type=int, default=None, help="asr.context_sentences override")
     ap.add_argument("--language", default="pl", choices=["pl", "auto"],
                     help="whitelist shortcut: 'pl' pins Polish; 'auto' detects per utterance "
                          "(any language whisper reports)")
@@ -352,6 +379,13 @@ def main() -> None:
         overrides["agreement_passes"] = args.agreement_passes
     if args.end_silence_ms:
         overrides["end_silence_ms"] = args.end_silence_ms
+    if args.decoder:
+        overrides["decoder"] = args.decoder
+    if args.partials:
+        overrides["show_partial_captions"] = True
+    for name in ("partial_latency_ms", "max_segment_ms", "segmentation_mode", "context_sentences"):
+        if getattr(args, name) is not None:
+            overrides[name] = getattr(args, name)
 
     loopback = ensure_virtual_mic()
     try:

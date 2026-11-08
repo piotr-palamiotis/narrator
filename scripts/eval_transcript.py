@@ -226,27 +226,12 @@ def _is_foreign_group(group: list[Cue]) -> bool:
 def _speech_spans(
     non_speech: list[tuple[float, float]], duration_s: float
 ) -> list[tuple[float, float]]:
-    """Complement of the non-speech windows, padded slightly into them (so
-    speech at a music boundary isn't clipped), with long spans split at
-    _MAX_SPAN_SECONDS so one poisoned stretch can only ruin one chunk."""
-    pad = 0.3
-    spans: list[tuple[float, float]] = []
-    cursor = 0.0
-    for ns_start, ns_end in sorted(non_speech):
-        if ns_start - pad > cursor:
-            spans.append((cursor, ns_start - pad))
-        cursor = max(cursor, ns_end + pad)
-    if cursor < duration_s:
-        spans.append((cursor, duration_s))
+    """Complement of the non-speech windows, split at _MAX_SPAN_SECONDS so one
+    poisoned stretch can only ruin one chunk (narrator.asr.offline, shared
+    with the recording draft pass)."""
+    from narrator.asr.offline import speech_spans
 
-    bounded: list[tuple[float, float]] = []
-    for s, e in spans:
-        while e - s > _MAX_SPAN_SECONDS:
-            bounded.append((s, s + _MAX_SPAN_SECONDS))
-            s += _MAX_SPAN_SECONDS
-        if e - s > 0.5:
-            bounded.append((s, e))
-    return bounded
+    return speech_spans(non_speech, duration_s, max_span_s=_MAX_SPAN_SECONDS)
 
 
 def load_audio_16k_mono(path: str) -> tuple["np.ndarray", float]:
@@ -259,7 +244,7 @@ def load_audio_16k_mono(path: str) -> tuple["np.ndarray", float]:
     """
     from pathlib import Path
 
-    from narrator.asr.real_fixtures import SAMPLE_RATE, load_audio_16k_mono as decode
+    from narrator_tune.real_fixtures import SAMPLE_RATE, load_audio_16k_mono as decode
 
     return decode(Path(path)), float(SAMPLE_RATE)
 
@@ -354,7 +339,10 @@ def _decode_all(args, non_speech: list[tuple[float, float]], excluded_speech: li
         for s, e in non_speech + excluded_speech
         if e - offset > 0 and s - offset < duration_s
     ]
-    model = Model(args.model, language=args.language)
+    from narrator.paths import model_load_args
+
+    model_name, models_dir = model_load_args(args.model)
+    model = Model(model_name, models_dir=models_dir, language=args.language)
     spans = _speech_spans(windows, duration_s)
     print(f"  decoding {len(spans)} speech spans (bounded at {_MAX_SPAN_SECONDS:.0f}s each)")
 

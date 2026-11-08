@@ -7,6 +7,10 @@ behind, the oldest queued frame is dropped rather than blocking the audio
 callback -- a dropped frame occasionally is far less harmful than stalling
 live capture.
 
+`audio.channels` picks which input channels are averaged into the mono
+signal: the stream opens with max(channels) channels, and the callback mixes
+the chosen ones (level meter included, since it reads the mix).
+
 Whisper requires 16kHz mono. We ask PortAudio for 16kHz directly; if the
 device can't honor that, we open at its default rate and resample every
 frame with scipy.signal.resample_poly before it reaches the queue, so
@@ -17,13 +21,14 @@ from __future__ import annotations
 import logging
 import queue
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 
 import numpy as np
 import sounddevice as sd
 from scipy.signal import resample_poly
 
 from narrator.audio.devices import resolve_device
+from narrator.audio.mixing import check_channels_available, mix_channels, required_channels
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +42,10 @@ class MicCapture:
         frame_ms: int = 30,
         target_sample_rate: int = TARGET_SAMPLE_RATE,
         max_queued_frames: int = 200,
+        channels: Sequence[int] = (1,),
     ) -> None:
         self._device_index = resolve_device(device_spec)
+        self._channels = list(channels)
         self._target_rate = target_sample_rate
         self._frame_ms = frame_ms
         self._queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=max_queued_frames)
@@ -51,11 +58,19 @@ class MicCapture:
         self.level: float = 0.0
 
     def start(self) -> None:
+        # The stream is opened with max(channels) channels, so a selection
+        # beyond what the device has must fail here with a readable message
+        # rather than as an opaque PortAudio error.
+        device_info = sd.query_devices(self._device_index, "input")
+        check_channels_available(
+            self._channels, int(device_info["max_input_channels"]), f"input device {device_info['name']!r}"
+        )
+        n_channels = required_channels(self._channels)
         blocksize = int(self._target_rate * self._frame_ms / 1000)
         try:
             self._stream = sd.InputStream(
                 device=self._device_index,
-                channels=1,
+                channels=n_channels,
                 samplerate=self._target_rate,
                 blocksize=blocksize,
                 dtype="float32",
@@ -72,7 +87,7 @@ class MicCapture:
             self._native_rate = native_rate
             self._stream = sd.InputStream(
                 device=self._device_index,
-                channels=1,
+                channels=n_channels,
                 samplerate=native_rate,
                 blocksize=native_blocksize,
                 dtype="float32",
@@ -83,7 +98,7 @@ class MicCapture:
     def _on_audio(self, indata: np.ndarray, frames: int, time_info, status) -> None:
         if status:
             logger.debug("sounddevice status: %s", status)
-        mono = indata[:, 0].copy()
+        mono = mix_channels(indata, self._channels)
         if self._native_rate != self._target_rate:
             mono = resample_poly(mono, self._target_rate, self._native_rate).astype(np.float32)
         self.level = float(np.sqrt(np.mean(mono**2)))

@@ -5,23 +5,34 @@ audio:
   device: "default"
   sample_rate: 16000
   frame_ms: 30
+  # 1-based input channels averaged into mono ([1] = first channel only,
+  # [1, 2] = stereo downmix). `device: "ndi:<source name>"` receives audio
+  # from an NDI source instead of a microphone.
+  channels: [1]
 
 asr:
-  model: "large-v3"
+  # Performance preset (presets.yaml next to this file): supplies model,
+  # step_ms and agreement_passes. `narrator --pick-preset` (make setup)
+  # benchmarks this machine and sets it; "custom" = no preset. Setting any
+  # of those three here overrides the preset for that field. quality =
+  # large-v3, step 500, 2 agreement passes.
+  preset: quality
   # The language control. Empty = auto-detect any language, per utterance.
   # With entries, each utterance is decoded in the best-matching listed
-  # language (one entry = that language permanently). Editable in the GUI
-  # (Audio/ASR tab, dropdown + Add / list + Remove). Whisper transcribes; it
+  # language (one entry = that language permanently). Editable in the web UI
+  # (ASR tab: language picker + Add / Remove). Whisper transcribes; it
   # has no X->Polish translation.
   language_whitelist: []
-  device: auto
-  # Which Vulkan GPU to use when several are present. "auto" prefers the
-  # first discrete card, so a machine with an iGPU alongside a discrete GPU
-  # does not silently run inference on the slow one.
-  gpu_device: auto
+  # Processing unit: cpu, vulkan:<n>, cuda:<n> (needs the CUDA build:
+  # make asr-backend ASR_GPU=cuda), or
+  # auto = the recommended unit when the ASR worker starts (CUDA > discrete
+  # Vulkan GPU > CPU > integrated GPU). The web UI's ASR tab lists this
+  # machine's units with live usage; picking one there also records its
+  # name + PCI bus id (unit_identity), so a shifted GPU index is reported
+  # instead of silently running on another card. Replaces device/gpu_device.
+  unit: auto
+  unit_identity: ""
   vad_threshold: 0.5
-  step_ms: 500
-  agreement_passes: 2
   end_silence_ms: 650
   # Continuous speech rolls over to a fresh utterance at the smaller of
   # these two (the decode window is never trimmed mid-utterance).
@@ -35,15 +46,63 @@ asr:
   prompt_carryover_chars: 0
   # After this much silence, off-screen caption history is pruned. The
   # visible lines are NOT cleared -- they stay until new speech scrolls them
-  # out, an operator clears them (Ctrl+N / the GUI Clear button), or a
+  # out, an operator clears them (the web UI Clear button / shortcut), or a
   # wipe_screen_after_silence_seconds lull elapses.
   prune_history_after_silence_seconds: 8
-  # After this much silence, the screen is truly cleared (like Ctrl+N).
+  # After this much silence, the screen is truly cleared (like the Clear button).
   # 0 disables it (the default: stale captions are usually better than blank
   # ones -- raise this only if very old text would misattribute to new
   # speech, e.g. on a broadcast with long quiet stretches).
   wipe_screen_after_silence_seconds: 0
   show_partial_captions: false
+  # Decode quality gates, applied to every decode (0 = off; narrator-tune
+  # measures them). A rejected decode counts as silence for that step.
+  # Reject when the mean text-token probability is below this (0-1).
+  min_mean_token_p: 0.0
+  # Reject when whisper's timestamps run past this multiple of the audio's
+  # length -- a hallucination/repetition loop (obs-localvocal uses 2.25).
+  max_timestamp_ratio: 0.0
+  # Drop whisper's [bracketed] sound annotations such as "[oklaski]".
+  strip_bracketed_annotations: true
+  # Find-and-replace rules (regular expressions, case-insensitive) applied
+  # to every hypothesis before it can be captioned. Example:
+  #   text_filters:
+  #     - pattern: "\\bnapisy wykonane przez.*"
+  #       replacement: ""
+  text_filters: []
+  # Event vocabulary: names, places and jargon, put at the front of
+  # whisper's prompt on every decode (ahead of the prompt carry-over).
+  vocabulary: []
+  # A saved list to merge in: <config dir>/vocabulary/<name>.txt, one entry
+  # per line ("" = none).
+  vocabulary_list: ""
+  # Replace near-miss spellings ("Kowalsky") with the vocabulary's spelling.
+  # Off by default: it can over-snap ordinary words that resemble a name.
+  vocabulary_snap: false
+  # whisper.cpp flash attention. Can crash the worker on some GPU drivers.
+  flash_attn: false
+  # Transcript/recording word times from whisper's DTW alignment (more exact,
+  # ~20% more decode time; ignored while flash_attn is on).
+  dtw_word_timestamps: false
+  # Streaming strategy. local_agreement: re-decode a growing window every
+  # step_ms and show what agreement_passes decodes agree on (words trickle
+  # out mid-sentence). segmenter: decode each stretch of speech once when it
+  # ends (obs-localvocal style); with show_partial_captions the open segment
+  # is re-decoded every partial_latency_ms for a live preview. The settings
+  # below are the segmenter's.
+  decoder: local_agreement
+  # vad (a segment per stretch of speech), hybrid (fixed-length segments,
+  # partials only while speech is heard) or fixed (fixed-length, no VAD).
+  segmentation_mode: vad
+  # Partial preview cadence (grows with the segment's length).
+  partial_latency_ms: 1100
+  # Segment length in hybrid/fixed mode.
+  segment_duration_ms: 7000
+  # Longest vad segment: continuous speech is cut here (at a short pause
+  # once 60% full) and continues in the next segment -- nothing is lost.
+  max_segment_ms: 15000
+  # Earlier captions given to whisper as context (0 = none).
+  context_sentences: 1
 
 canvas:
   width_px: 1920
@@ -59,6 +118,9 @@ layout:
   interline_pct: 1.0
   text_align: left
   vertical_align_within_box: bottom
+  # Typewriter-style captions: off, char, word or sentence (speeds up when
+  # text backs up; a caption arriving alone appears at once).
+  pacing: "off"
 
 style:
   font_family: "assets/fonts/NotoSans-Regular.ttf"
@@ -85,32 +147,79 @@ ndi:
   source_name: "LiveCaption"
   fps: 30
 
-gui:
-  enabled: true
+# Optional transcript file of every finalized caption, one file per session.
+transcript:
+  enabled: false
+  # Empty = <repo>/var/transcripts (platform user data dir outside a checkout).
+  directory: ""
+  # srt (timed cues) or txt (one line per cue).
+  format: srt
 
-# Tuning for `narrator --autoconfigure`, which searches the model and decode
-# settings (asr.*) under which live captions best match the reference
-# transcripts in scripts/test_audio/ and writes the winner into this file.
-# Also editable on the GUI's Autoconfigure tab.
-autoconfigure:
-  candidate_models: ["large-v3", "large-v3-turbo", "medium", "small", "base", "tiny"]
-  # Models slower than this multiple of real time can't caption live here.
-  slow_factor: 1.5
-  # Wall-clock budget for new decoding (results are cached across runs).
-  time_budget_minutes: 720
-  # Max median delay from spoken word to caption (s); 0 = no cap.
-  max_latency_s: 3.0
-  # Evaluation sample: fixed-length excerpts spread across recordings.
-  excerpt_seconds: 90
-  screen_excerpts: 32
-  dev_excerpts: 96
-  holdout_excerpts: 48
-  # Subtitle languages that are scored ("Title (Polish_ASR).srt").
-  reference_languages: ["pl"]
-  # Drop excerpts whose reference even offline large-v3 can't match.
-  max_ceiling_wer: 0.85
-  # Disk guards for the decoded-excerpt cache (scripts/autoconfigure_cache).
-  min_free_disk_mb: 1024
-  cache_max_mb: 1024
-  # Optional value grids replacing the built-in ones, e.g. {step_ms: [400, 600]}.
-  search_space: {}
+# Words that must never reach the screen (live captions and the transcript;
+# manual captions too). Whole-word, case- and diacritics-insensitive; a
+# trailing * is a stem matching every word starting with it ("kurw*").
+captions:
+  blocklist: []
+  # Also use the bundled Polish/English starter list.
+  blocklist_builtin: false
+  # mask (k***a), replace (with blocklist_replacement) or drop.
+  blocklist_action: mask
+  blocklist_replacement: "***"
+
+# Browser admin UI (replaces the old Tk GUI). Loopback only by default --
+# reach it remotely through an SSH tunnel or Tailscale, never a LAN bind.
+# `narrator --open-ui` opens it with this run's login token.
+web:
+  enabled: true
+  bind: "127.0.0.1"
+  port: 8765
+  # Extra Host names accepted besides localhost/127.0.0.1 (e.g. Tailscale).
+  allowed_hosts: []
+  preview_fps: 5
+  # Page-level shortcuts ("" = unbound). Browser-reserved combos such as
+  # Ctrl+N/T/W are refused, since a page cannot intercept them.
+  shortcuts:
+    clear: "Escape"
+    mode_toggle: "F2"
+    focus_entry: "F4"
+    submit: "Enter"
+    pause_toggle: "F8"
+    recording_toggle: "F9"
+    help: "?"
+  # Per-integration tokens for the control API (Bitfocus Companion, scripts):
+  #   - name: companion
+  #     token: "<24+ random letters/digits>"
+  # Delete an entry to revoke it.
+  api_tokens: []
+  # OSC (UDP) control input for vMix/QLab/TouchOSC; no authentication, so
+  # keep it on loopback.
+  osc:
+    enabled: false
+    bind: "127.0.0.1"
+    port: 9000
+
+# Session recording (todo C3): audio.flac (exactly what the ASR received),
+# live.srt (what went on air) and later draft.srt per session, under
+# <repo>/var/recordings/<timestamp>/. Recording is switched live from the web
+# UI, the recording shortcut (F9), POST /api/recording or OSC; this records
+# people speaking, so get consent first (README: Privacy). Recordings never
+# leave this machine unless someone downloads them.
+recording:
+  # Start recording when the app starts.
+  record_on_start: false
+  # Empty = <repo>/var/recordings (platform user data dir outside a checkout).
+  directory: ""
+  # Delete sessions older than this many days automatically (0 = never).
+  retention_days: 0
+  # Refuse to start / stop recording below this much free disk space.
+  min_free_disk_mb: 2048
+  # Small red dot in the corner of the NDI output while recording.
+  on_air_dot: false
+  # Offline best-effort draft.srt after each session (low priority, in the
+  # background; waits while live ASR on the same device is busy).
+  draft_enabled: true
+  draft_model: "large-v3"
+  draft_device: auto
+  # Run a draft next to live ASR only while its busy fraction is <= this
+  # (0 = only while ASR is stopped). "Generate draft now" ignores it.
+  draft_max_asr_busy: 0.3

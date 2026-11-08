@@ -60,7 +60,7 @@ def main() -> None:
     config_path = OUT_DIR / "live_demo_config.yaml"
     config = RootConfig()
     config.audio.device = "default"
-    config.gui.enabled = False
+    config.web.enabled = False
     config.app.log_level = "WARNING"
     config.asr = config.asr.model_copy(
         update={
