@@ -16,7 +16,6 @@
     <span id="backend" class="muted small"></span>
     <span id="mode-pill" class="pill">Auto</span>
     <span id="paused-pill" class="pill warn" hidden>Captions paused</span>
-    <span id="rec-pill" class="pill rec" hidden title="Recording audio and on-air captions">REC</span>
     <span class="meter-wrap" title="Input level">
       <span class="small muted">Mic</span>
       <span class="meter"><span id="meter-bar" class="meter-bar"></span></span>
@@ -42,6 +41,7 @@
     </div>
     <div class="preview-meta">
       <label class="small"><input type="checkbox" id="guides-toggle" checked> Margin guides</label>
+      <label class="small" title="Show a sample caption in this preview only; nothing goes on air"><input type="checkbox" id="sample-toggle"> Sample text</label>
       <span id="preview-note" class="small muted"></span>
     </div>
 
@@ -52,7 +52,6 @@
       </div>
       <button type="button" id="clear-btn" class="danger">Clear</button>
       <button type="button" id="pause-btn">Pause captions</button>
-      <button type="button" id="rec-btn" disabled>Record</button>
     </div>
 
     <form class="manual" id="manual-form" autocomplete="off">
@@ -60,12 +59,6 @@
       <button type="submit">Send</button>
     </form>
     <p id="manual-hint" class="small muted"></p>
-
-    <h2 class="sub">On air</h2>
-    <div id="on-air" class="on-air" aria-live="polite"></div>
-
-    <h2 class="sub">What ASR hears</h2>
-    <ol id="feed" class="feed"></ol>
   </section>
 
   <section class="panel settings" aria-label="Settings">

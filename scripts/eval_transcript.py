@@ -227,8 +227,7 @@ def _speech_spans(
     non_speech: list[tuple[float, float]], duration_s: float
 ) -> list[tuple[float, float]]:
     """Complement of the non-speech windows, split at _MAX_SPAN_SECONDS so one
-    poisoned stretch can only ruin one chunk (narrator.asr.offline, shared
-    with the recording draft pass)."""
+    poisoned stretch can only ruin one chunk (narrator.asr.offline)."""
     from narrator.asr.offline import speech_spans
 
     return speech_spans(non_speech, duration_s, max_span_s=_MAX_SPAN_SECONDS)

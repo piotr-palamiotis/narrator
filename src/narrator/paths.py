@@ -4,7 +4,7 @@ Layout under the repo root (all gitignored):
 
     config/config.yaml   the app config (passed with --config by the service)
     models/              whisper ggml models (downloads land here)
-    var/                 runtime data: log/, transcripts/, recordings/, tune/ (narrator-tune), token
+    var/                 runtime data: log/, tune/ (narrator-tune), web-ui.json
     third_party/         whisper.cpp / pywhispercpp source + build tree
 
 The root is found by walking up from this file looking for the checkout
@@ -71,19 +71,9 @@ def log_dir() -> Path:
     return var_dir() / "log"
 
 
-def transcripts_dir() -> Path:
-    return var_dir() / "transcripts"
-
-
-def recordings_dir() -> Path:
-    """Session recordings (audio + captions), one folder per session."""
-    return var_dir() / "recordings"
-
-
 def reference_library_dir() -> Path | None:
     """<repo>/scripts/test_audio, the reference recordings narrator-tune
-    learns from ("Use as reference" copies a corrected recording there).
-    None outside a checkout."""
+    learns from. None outside a checkout."""
     return None if REPO_ROOT is None else REPO_ROOT / "scripts" / "test_audio"
 
 

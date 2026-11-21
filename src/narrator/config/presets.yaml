@@ -16,8 +16,10 @@ tiers:
     model: large-v3
     step_ms: 500
     agreement_passes: 2
-    note: 'Provisional: today''s shipped defaults (large-v3, step 500, 2 passes). Most accurate; needs
-      a fast GPU (RX 6700 XT: ~1 s per 10 s window).'
+    note: 'Near-real-time (user decision 2026-11-17: on-screen delay <= ~5 s). With vad_preroll_ms
+      300 (defaults.yaml), 42-recording library, RTX 3070 CUDA: screen WER 26.8% -> 24.8%, on-screen
+      delay with word pacing p50 2.2 s / p90 4.5 s. Step 1000 x 3 passes was 27.0% dev WER but
+      5.6 / 9.2 s on screen with char pacing (users saw ~14 s): rejected.'
     tune:
       max_load: 0.7
   balanced:

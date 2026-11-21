@@ -11,10 +11,6 @@ Concurrency model (see the plan's threading table):
   - an event-drain thread applies CaptionEvents from the worker to the renderer
   - render + NDI send: fixed-fps thread (narrator.ndi.sender.run_render_send_loop)
   - config watcher: watchdog thread, applied via one atomic swap path
-  - session recording (narrator.recording, optional): the feed thread hands
-    each frame to a bounded non-blocking queue drained by a writer thread;
-    a maintenance thread runs the disk guard, retention purge and the
-    low-priority draft subprocess
   - web UI (optional, attached by main): one thread running its own asyncio
     loop (narrator.web.server). It only reads controller state and calls the
     operator actions; caption events reach it through `ui_events`, a bounded
@@ -51,16 +47,13 @@ from narrator.audio.capture import MicCapture
 from narrator.audio.factory import create_capture
 from narrator.audio.ndi_capture import NdiAudioCapture
 from narrator.captions.blocklist import apply_blocklist, blocklist_from_config
-from narrator.captions.transcript import TranscriptWriter
 from narrator.config.loader import ConfigWatcher
-from narrator.config.schema import AsrDevice, RootConfig, TranscriptConfig
+from narrator.config.schema import RootConfig
 from narrator.health import problems as health_problems
 from narrator.health.checks import RuntimeState
 from narrator.health.monitor import HealthMonitor
 from narrator.health.usage import UnitUsageMonitor
 from narrator.ndi.sender import NdiCaptionSender, run_render_send_loop
-from narrator.recording.manager import RecordingManager
-from narrator.recording.session import RecordingError
 from narrator.render.canvas import CaptionRenderer
 
 logger = logging.getLogger(__name__)
@@ -68,11 +61,6 @@ logger = logging.getLogger(__name__)
 _ASR_RESTART_BACKOFF_SECONDS = 2.0
 _ASR_RESTART_BACKOFF_MAX_SECONDS = 30.0
 
-
-def _device_class(unit_kind: str) -> AsrDevice:
-    """asr.unit's kind as the coarse AsrDevice the recording draft
-    scheduler compares against recording.draft_device (cpu vs a GPU)."""
-    return {"cpu": AsrDevice.CPU, "auto": AsrDevice.AUTO}.get(unit_kind, AsrDevice.VULKAN)
 
 # How long to let an ASR worker shut down cooperatively before escalating.
 # Generous because the worker can be inside a multi-second decode, or loading
@@ -98,10 +86,6 @@ _QUICK_CRASHES_BEFORE_HALT = 3
 _UI_EVENT_BACKLOG = 256
 
 
-class FeatureUnavailableError(RuntimeError):
-    """An operator action that exists in the UI/API but is not built yet."""
-
-
 class AppController:
     # Class-level defaults so controllers built with __new__ (the unit tests)
     # still have them; instances shadow them on first assignment.
@@ -112,7 +96,6 @@ class AppController:
     _web = None  # narrator.web.server.WebServer, attached by main
     ui_events: "collections.deque | None" = None
     _started_at: float | None = None
-    _recordings: RecordingManager | None = None  # session recording (narrator.recording)
     _asr_busy_value = None  # mp.Value("d") the current worker publishes its busy fraction into
     _health: HealthMonitor | None = None  # setup checks (narrator.health)
     _unit_usage: UnitUsageMonitor | None = None  # live load of every processing unit
@@ -175,11 +158,6 @@ class AppController:
         # set_caption_mode/submit_manual_text/clear_captions.
         self._caption_mode: str = "auto"
 
-        # Optional transcript file of ASR FINALs (transcript.enabled). Fed
-        # from the event-drain thread, swapped on config change.
-        self._transcript: TranscriptWriter | None = None
-        self._transcript_lock = threading.Lock()
-
         # Every CaptionEvent (plus whether it reached the screen), for the web
         # UI's live feed; see _UI_EVENT_BACKLOG.
         self.ui_events = collections.deque(maxlen=_UI_EVENT_BACKLOG)
@@ -209,14 +187,6 @@ class AppController:
         logging.basicConfig(level=self._config.app.log_level)
 
         self._renderer = CaptionRenderer(self._config.canvas, self._config.layout, self._config.style)
-        self._open_transcript(self._config.transcript)
-        self._recordings = RecordingManager(
-            lambda: self._config,
-            asr_load=self._asr_load,
-            vocabulary=lambda: list(self._text_settings(self._config).vocabulary),
-            on_change=self._update_recording_indicator,
-        )
-        self._recordings.start_background()
         self._health = HealthMonitor(lambda: self._config, self.runtime_state)
         # Neither raises: a failure is kept as a problem (see _ndi_error /
         # _audio_error) and the app starts without that part.
@@ -228,12 +198,6 @@ class AppController:
         self._health.start()
         self._unit_usage = UnitUsageMonitor(self._health.env, lambda: self._config)
         self._unit_usage.start()
-
-        if self._config.recording.record_on_start:
-            try:
-                self._recordings.start()
-            except RecordingError as exc:
-                logger.error("recording.record_on_start: recording did not start: %s", exc)
 
         self._spawn_thread(self._drain_events_loop)
         self._spawn_thread(self._supervise_asr_loop)
@@ -255,7 +219,7 @@ class AppController:
             self._sender = NdiCaptionSender(self._config.ndi, self._config.canvas)
         except Exception as exc:
             # No NDI runtime / sender failure: the rest of the app (ASR,
-            # web UI preview, manual captions, recording) keeps running.
+            # web UI preview, manual captions) keeps running.
             logger.error("NDI output could not start: %s", exc)
             self._sender = None
             self._ndi_thread = None
@@ -476,11 +440,6 @@ class AppController:
 
     def _feed_audio_loop(self, mic: MicCapture | NdiAudioCapture, stop_event: threading.Event) -> None:
         for frame in mic.frames(timeout=0.5, stop_event=stop_event):
-            recordings = self._recordings
-            if recordings is not None:
-                # Non-blocking (bounded queue, drop + count when full): the
-                # exact frame whisper is about to receive.
-                recordings.feed(frame)
             if self._asr_halted:
                 # No worker reads the queue while ASR is halted. Feeding it
                 # would keep its pipe full, and a full mp.Queue pipe blocks
@@ -520,11 +479,6 @@ class AppController:
             # the exit, the problem panel shows this text.
             self.asr_last_error = event.text
             return
-        # The transcript records what the ASR heard, in either caption mode.
-        if event.type == CaptionEventType.FINAL:
-            with self._transcript_lock:
-                if self._transcript is not None:
-                    self._transcript.add_final(event)
         # Paused works like manual mode: the worker keeps running (resuming
         # is instant), its output just doesn't reach the screen.
         applied = self._caption_mode == "auto" and not self._captions_paused
@@ -534,9 +488,6 @@ class AppController:
         if event.type == CaptionEventType.FINAL:
             # Replaces the open partial atomically (CaptionRenderer).
             self._renderer.append_final_text(event.text)
-            recordings = self._recordings
-            if recordings is not None:
-                recordings.on_air_final(event)  # live.srt: what went on air
         elif event.type == CaptionEventType.PARTIAL:
             self._renderer.set_partial_preview(event.text)
         elif event.type == CaptionEventType.WIPE:
@@ -560,17 +511,6 @@ class AppController:
         if events is not None:
             events.append((event.type.value, event.text, applied))
 
-    def _open_transcript(self, config: TranscriptConfig) -> None:
-        """Close the current transcript (if any) and, when enabled, start a
-        new session file."""
-        with self._transcript_lock:
-            if self._transcript is not None:
-                self._transcript.close()
-                self._transcript = None
-            if config.enabled:
-                self._transcript = TranscriptWriter(config)
-                logger.info("writing transcript to %s", self._transcript.path)
-
     def set_caption_mode(self, mode: str) -> None:
         """Switches between "auto" (ASR-driven) and "manual" (operator-typed)
         captions. The ASR worker keeps running underneath in either case --
@@ -593,55 +533,12 @@ class AppController:
         """Pause/resume ASR captions. Like manual mode, the ASR worker keeps
         running and only its output is ignored while paused, so resuming is
         instant; what is on screen stays (Clear is separate). Manual captions
-        are unaffected. The transcript keeps recording."""
+        are unaffected."""
         paused = bool(paused)
         if paused and not self._captions_paused and self._renderer is not None:
             self._renderer.set_partial_preview("")  # no stale partial frozen on air
         self._captions_paused = paused
         logger.info("captions %s", "paused" if paused else "resumed")
-
-    @property
-    def recordings(self) -> RecordingManager | None:
-        return self._recordings
-
-    @property
-    def recording_available(self) -> bool:
-        recordings = self._recordings
-        return recordings is not None and recordings.available
-
-    @property
-    def recording(self) -> bool:
-        recordings = self._recordings
-        return recordings is not None and recordings.recording
-
-    def set_recording(self, enabled: bool) -> None:
-        """Session recording on/off (web UI, shortcut, control API, OSC).
-        Raises RecordingError when it cannot start (low disk space)."""
-        recordings = self._recordings
-        if recordings is None or not recordings.available:
-            raise FeatureUnavailableError(
-                "recording is not available (FLAC writing needs the 'soundfile' package)"
-            )
-        recordings.set_recording(enabled)
-
-    def _update_recording_indicator(self) -> None:
-        """The optional on-air dot in the NDI output (recording.on_air_dot)."""
-        renderer, config = self._renderer, self._config
-        if renderer is not None and config is not None:
-            renderer.set_recording_indicator(self.recording and config.recording.on_air_dot)
-
-    def _asr_load(self) -> dict:
-        """Live ASR load for the draft scheduler: is the worker alive, its
-        decode busy fraction (None until measured), and its device."""
-        process, value, config = self._asr_process, self._asr_busy_value, self._config
-        busy = None
-        if value is not None and value.value >= 0:
-            busy = float(value.value)
-        return {
-            "active": process is not None and process.is_alive(),
-            "busy": busy,
-            "device": _device_class(config.asr.unit_kind) if config is not None else None,
-        }
 
     def refresh_text_settings(self) -> None:
         """Re-send the worker's text settings, e.g. after a saved vocabulary
@@ -657,7 +554,6 @@ class AppController:
         mic = self._mic
         renderer = self._renderer
         started = self._started_at
-        recordings = self._recordings
         busy_value = self._asr_busy_value
         usage = self._unit_usage
         units = usage.snapshot() if usage is not None else {}
@@ -668,9 +564,6 @@ class AppController:
         return {
             "caption_mode": self._caption_mode,
             "captions_paused": self._captions_paused,
-            "recording": self.recording,
-            "recording_available": self.recording_available,
-            "recording_info": recordings.status() if recordings is not None else None,
             "asr_busy": (
                 round(busy_value.value, 3) if busy_value is not None and busy_value.value >= 0 else None
             ),
@@ -814,9 +707,6 @@ class AppController:
             return
         self._renderer.set_partial_preview("")
         self._renderer.append_final_text(text)
-        recordings = self._recordings
-        if recordings is not None:
-            recordings.on_air_text(text)
 
     def clear_captions(self) -> None:
         """Clears the on-screen caption buffer. Works in either caption mode
@@ -923,13 +813,6 @@ class AppController:
                 self._push_text_settings(new_config)
             if new_config.audio != old_config.audio:
                 self._restart_audio_capture()
-            if new_config.transcript != old_config.transcript:
-                self._open_transcript(new_config.transcript)
-            if self._recordings is not None:
-                if new_config.asr != old_config.asr:
-                    self._recordings.note_asr_change(new_config)
-                if new_config.recording != old_config.recording:
-                    self._update_recording_indicator()
         # Re-run the setup checks against the new config (on their thread).
         self._request_health_check(invalidate=True)
         web = self._web
@@ -1002,10 +885,6 @@ class AppController:
             cancel = getattr(self._audio_queue, "cancel_join_thread", None)
             if cancel is not None:
                 cancel()
-        if self._recordings is not None:
-            # After the feed thread: the last frames are in. Flushes audio and
-            # live.srt; a running draft is stopped and queued for next time.
-            self._recordings.shutdown()
         if self._sender is not None:
             self._sender.close()
         current = threading.current_thread()
@@ -1015,5 +894,3 @@ class AppController:
             # uncleaned) -- the supervisor used to call stop() itself.
             if thread is not current and thread.is_alive():
                 thread.join(timeout=5)
-        # After the event-drain thread is gone: flush the cue being gathered.
-        self._open_transcript(TranscriptConfig(enabled=False))

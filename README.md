@@ -119,7 +119,7 @@ narrator`, and `loginctl enable-linger $USER` so the service starts at boot
 without a login. It runs `<repo>/.venv/bin/narrator --headless --config
 <repo>/config/config.yaml`, restarts on failure with a growing delay (at most
 5 starts per 5 minutes), logs to journald, and on `systemctl stop` (SIGTERM)
-shuts down cleanly: web UI, NDI stream, ASR worker, audio, transcript file.
+shuts down cleanly: web UI, NDI stream, ASR worker, audio.
 Setup problems (no GPU, missing model or microphone, no NDI runtime, an ASR
 worker that keeps crashing) never stop the service: it keeps running and the
 web UI shows them (see "Problems panel"), so "failure" restarts happen only
@@ -141,7 +141,7 @@ a checkout is the whole installation:
 |---|---|
 | `config/config.yaml` | the app config; created from the defaults on first start when passed with `--config` (the service does) |
 | `models/` | whisper ggml models; downloads land here, and a model already in the old `~/.local/share/pywhispercpp/models` is reused rather than downloaded again |
-| `var/` | `log/` (optional file log), `transcripts/` (default transcript dir), `tune/` (narrator-tune cache and reports) |
+| `var/` | `log/` (optional file log), `web-ui.json` (for `--open-ui`), `tune/` (narrator-tune cache and reports) |
 | `third_party/` | the pywhispercpp/whisper.cpp source and build tree used by `make asr-backend` |
 
 A bare `narrator` (no `--config`) still uses the platform config dir
@@ -183,27 +183,37 @@ size/NDI source name and audio device, which need a restart).
 ## Web UI and remote control
 
 narrator is operated from a browser (the Tkinter GUI is gone). The admin UI
-listens on `http://127.0.0.1:8765` (`web.bind`, `web.port`) -- loopback
-only; from another machine use an SSH tunnel (`ssh -L 8765:127.0.0.1:8765
-host`) or Tailscale, never a LAN bind.
+listens on port 8765 (`web.port`) on every network address: open
+`http://127.0.0.1:8765` on this computer or `http://<this machine's IP>:8765`
+from another one (the startup log lists the addresses). Start narrator with
+`--local-only` to accept this computer only. Who may connect is a startup
+flag on purpose, not a setting in the UI.
 
 ```bash
-narrator --open-ui        # open the running instance's UI, already logged in
+narrator --set-password   # set the login password (once; asked twice)
+narrator --local-only     # web UI for this computer only (default: other computers too)
+narrator --open-ui        # open the running instance's UI in a browser
 narrator --headless       # (the service) never opens a browser; the web UI still runs
 narrator --no-web         # no web UI and no OSC input (--no-gui: old spelling)
 ```
 
-Each start creates a random login token: it is logged ("login token: ...",
-`journalctl --user -u narrator | grep "login token"`) and stored in
-`var/web-token.json` (mode 0600). `--open-ui` uses it; the login page also
-accepts it pasted. Requests with a foreign `Host` (DNS rebinding) or a
-cross-site `Origin` (CSRF) are refused.
+Logging in needs a password. Set it with `narrator --set-password` (stored
+as a scrypt hash in `web-password.json` next to config.yaml, mode 0600;
+never inside config.yaml) or on the *Web & remote* tab; changing it there
+also logs out every other browser. While no password is set, a browser on
+this computer opens the UI without a login and other computers cannot log
+in at all (the login page says so). A forgotten password is replaced by
+running `--set-password` again on the machine. Logins live in memory, so
+every restart of narrator logs everyone out. Cross-site requests (an
+`Origin` other than the address used) are refused; with `--local-only` so
+is any `Host` that is not this computer (DNS rebinding). The page is plain
+HTTP: on an untrusted network reach it through a VPN such as Tailscale.
 
 The page has everything the Tk GUI had: live preview (with unsaved display
 settings previewed before they go on air), mic level, ASR Active/Inactive and
 backend, auto/manual caption mode with a manual entry, Clear, pause/resume,
 every config section (language whitelist, text filters, vocabulary and saved
-vocabulary lists, model and preset, blocklist, NDI, transcript, shortcuts,
+vocabulary lists, model and preset, blocklist, NDI, shortcuts,
 API tokens, OSC) and a status/log view. Save validates with the config schema
 (errors appear next to the fields) and writes `config.yaml`, which the running
 app picks up like a hand edit.
@@ -213,8 +223,7 @@ most severe first, each with fix buttons: the configured processing unit is
 missing or unusable (no Vulkan GPU, no Vulkan loader, a pre-AVX CPU with the
 PyPI wheel), the model is not installed or not downloadable, the ASR worker
 crashed and was stopped, the microphone or its channels are missing, the NDI
-audio source is not on the network, the NDI runtime or caption output failed,
-disk space for recordings is low. Checks run at startup, on every config
+audio source is not on the network, the NDI runtime or caption output failed. Checks run at startup, on every config
 change and every 30 s, on their own thread. Nothing in the list stops the
 app, and nothing is changed automatically: *Retry* restarts only the
 affected part (ASR worker, audio input or NDI output), *Use CPU instead*
@@ -230,14 +239,14 @@ starting stays stopped until a fix or an ASR config change.
 
 **Keyboard shortcuts** (configurable under `web.shortcuts`; `?` shows them):
 Esc clear, F2 auto/manual, F4 focus the manual entry, Enter send, F8
-pause/resume captions, F9 recording on/off. They work while
+pause/resume captions. They work while
 typing in a field. Ctrl+N/T/W and other keys the browser keeps for itself
 are refused.
 
 **Control API.** `GET /api/state`, `POST /api/clear`, `POST /api/mode`
 (`{"mode": "auto"|"manual"|"toggle"}`), `POST /api/manual-text`
-(`{"text": "..."}`), `POST /api/pause` (`{"paused": true|false|"toggle"}`),
-`POST /api/recording` (`{"recording": true|false|"toggle"}`). Parameters may also be
+(`{"text": "..."}`), `POST /api/pause` (`{"paused": true|false|"toggle"}`).
+Parameters may also be
 given as query strings. Integrations authenticate with a named token from
 `web.api_tokens` (add one on the *Web & remote* tab; delete it to revoke):
 `Authorization: Bearer <token>`. Those tokens reach only these endpoints.
@@ -268,30 +277,10 @@ is only worth writing if that proves too limited.
 **OSC** (vMix, QLab, TouchOSC): set `web.osc.enabled: true` (UDP
 `127.0.0.1:9000` by default). Addresses: `/narrator/clear`,
 `/narrator/mode [auto|manual|toggle]`, `/narrator/manual-text <text>`,
-`/narrator/pause [1|0|T|F]`, `/narrator/recording [1|0]`; no argument
+`/narrator/pause [1|0|T|F]`; no argument
 toggles. OSC has no authentication -- keep it on loopback. A lone `0`
 argument on `clear`/`mode` is a button release and ignored; for pause use a
 toggle button or send no argument.
-
-## Session recording and privacy
-
-Off by default. Switch it on from the web UI, the F9 shortcut,
-`POST /api/recording` or OSC. Each session is written to
-`var/recordings/<timestamp>/`: `audio.flac` (the exact 16 kHz mono signal the
-speech recognizer received), `live.srt` (what went on air), and afterwards a
-background `draft.srt` (offline large-v3 pass, low priority, waits for headroom
-next to live ASR). The *Recordings* tab lists them (duration, size, status),
-downloads SRTs, takes a corrected SRT back, deletes one or all recordings, and
-copies a corrected one into `scripts/test_audio/` ("Use as reference") so
-`make configure` learns from real venues. `recording.retention_days` purges old
-sessions; recording stops below `recording.min_free_disk_mb`. A REC badge shows
-in the UI, and `recording.on_air_dot` adds a small red dot to the NDI output.
-
-**Consent / GDPR.** A recording is a recording of people speaking, i.e.
-personal data (voices, and what they said). In the EU, tell speakers and the
-audience before you record, have a lawful basis (usually consent), keep
-recordings only as long as needed (use `retention_days`), and delete on
-request. Recordings stay on this machine unless you download them.
 
 ## Configuration
 
@@ -306,11 +295,6 @@ legibility effects: `background_band` (a solid box or rounded pill behind
 each line -- set `shape: rectangle` and a bright color for a high-contrast
 "yellow box" broadcast caption look), `shadow` (blurred drop shadow), and
 `stroke` (text outline).
-
-Transcript file: set `transcript.enabled: true` (or use the web UI's Transcript
-tab) to save everything the ASR finalizes as an `.srt` (timed cues) or
-`.txt` file, one per session, in `var/transcripts/` of the repo by
-default (the platform user data dir outside a checkout).
 
 Text cleanup: whisper's `[bracketed]` sound annotations ("[oklaski]") are
 dropped by default (`asr.strip_bracketed_annotations`). `asr.text_filters`

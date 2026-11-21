@@ -304,5 +304,5 @@ say ""
 dry && say "Dry run complete: nothing was changed."
 rc=0
 for row in "${LEDGER[@]}"; do case "$row" in *"|FAIL|"*) rc=1 ;; esac; done
-say "Next: 'make status' / 'make logs'; the web UI: .venv/bin/narrator --open-ui. Re-login if the groups line says so."
+say "Next: 'make status' / 'make logs'; the web UI: set its password with .venv/bin/narrator --set-password, then .venv/bin/narrator --open-ui. Re-login if the groups line says so."
 finish $rc

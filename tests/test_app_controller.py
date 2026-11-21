@@ -34,8 +34,6 @@ def make_controller() -> tuple[AppController, FakeRenderer]:
     controller._renderer = renderer
     controller._caption_mode = "auto"
     controller.resolved_asr_backend = "unresolved"
-    controller._transcript = None
-    controller._transcript_lock = threading.Lock()
     return controller, renderer
 
 
@@ -151,7 +149,7 @@ def test_set_caption_mode_rejects_unknown_mode():
 import threading
 import time
 
-from narrator.config.schema import AsrDevice, RootConfig
+from narrator.config.schema import RootConfig
 
 
 class FakeProcess:
@@ -200,8 +198,6 @@ def make_lifecycle_controller(monkeypatch, processes):
     controller._asr_spawn_time = 0.0
     controller._consecutive_quick_crashes = 0
     controller._audio_queue = None
-    controller._transcript = None
-    controller._transcript_lock = threading.Lock()
     controller._event_queue = None
     # stop() support (the crash-loop policy path calls it)
     controller._stopped = False
@@ -339,21 +335,3 @@ def test_drain_audio_queue_drops_stale_frames():
 
     assert drained == 3
     assert controller._audio_queue.empty()
-
-
-def test_asr_finals_go_to_the_transcript_in_both_caption_modes():
-    controller, renderer = make_controller()
-
-    class FakeTranscript:
-        def __init__(self):
-            self.texts = []
-
-        def add_final(self, event):
-            self.texts.append(event.text)
-
-    controller._transcript = FakeTranscript()
-    controller._handle_caption_event(CaptionEvent(CaptionEventType.FINAL, "auto"))
-    controller._handle_caption_event(CaptionEvent(CaptionEventType.PARTIAL, "not this"))
-    controller._caption_mode = "manual"
-    controller._handle_caption_event(CaptionEvent(CaptionEventType.FINAL, "manual"))
-    assert controller._transcript.texts == ["auto", "manual"]

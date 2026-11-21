@@ -37,12 +37,6 @@ def _validate_rgba_str(value: str) -> str:
 RgbaColor = Annotated[str, AfterValidator(_validate_rgba_str)]
 
 
-class AsrDevice(str, Enum):
-    AUTO = "auto"
-    VULKAN = "vulkan"
-    CPU = "cpu"
-
-
 class AsrDecoder(str, Enum):
     """The streaming strategy (narrator.asr.decoder_common.create_decoder)."""
 
@@ -65,6 +59,7 @@ class CaptionPacing(str, Enum):
     CHAR = "char"
     WORD = "word"
     SENTENCE = "sentence"
+    SMOOTH = "smooth"
 
 
 class TextAlign(str, Enum):
@@ -231,8 +226,8 @@ class AsrConfig(BaseModel):
     # (~25% faster decodes, but measurably different text). whisper.cpp
     # turns dtw_word_timestamps off when this is on.
     flash_attn: bool = False
-    # Word times for the transcript/recording SRT cues from whisper's DTW
-    # token alignment (cross-attention of the model's alignment heads)
+    # Word times of caption events (CaptionEvent.start/end) from whisper's
+    # DTW token alignment (cross-attention of the model's alignment heads)
     # instead of its cheaper token-timestamp heuristic. Measured on
     # large-v3: word-boundary error 0.07 s vs 0.25 s mean, at ~20% more
     # decode time. Captions themselves are unchanged.
@@ -568,7 +563,6 @@ class ShortcutsConfig(BaseModel):
     # Fires only while the manual caption entry has focus.
     submit: str = "Enter"
     pause_toggle: str = "F8"
-    recording_toggle: str = "F9"
     help: str = "?"
 
     @field_validator("*")
@@ -610,18 +604,26 @@ class WebConfig(BaseModel):
     """The browser admin UI (narrator.web), replacing the old Tk GUI."""
 
     enabled: bool = True
-    # Loopback only by default: the admin UI is never exposed on the LAN;
-    # remote access goes through an SSH tunnel or Tailscale.
-    bind: str = "127.0.0.1"
+    # Listens on every address (other computers can reach it, behind the
+    # login password); `narrator --local-only` limits it to this computer.
+    # Deliberately a startup flag, not a config/UI setting.
     port: int = Field(default=8765, ge=1, le=65535)
-    # Extra Host header names accepted besides localhost/127.0.0.1/[::1]
-    # (DNS-rebinding guard), e.g. a Tailscale machine name.
-    allowed_hosts: list[str] = Field(default_factory=list)
     # Live preview frame rate cap (frames are only sent when they change).
     preview_fps: float = Field(default=5.0, gt=0, le=30)
     shortcuts: ShortcutsConfig = Field(default_factory=ShortcutsConfig)
     api_tokens: list[ApiToken] = Field(default_factory=list)
     osc: OscConfig = Field(default_factory=OscConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_retired_network_keys(cls, data):
+        """`bind` / `allowed_hosts` were config settings; who may connect is
+        now the `--local-only` startup flag. Old keys are dropped."""
+        if isinstance(data, dict) and ("bind" in data or "allowed_hosts" in data):
+            data = {k: v for k, v in data.items() if k not in ("bind", "allowed_hosts")}
+            logger.info("config: ignoring web.bind / web.allowed_hosts -- the web UI is reachable from other "
+                        "computers unless narrator is started with --local-only")
+        return data
 
     @model_validator(mode="after")
     def _check_token_names(self) -> "WebConfig":
@@ -632,54 +634,6 @@ class WebConfig(BaseModel):
         if len(set(tokens)) != len(tokens):
             raise ValueError("web.api_tokens must not reuse a token")
         return self
-
-
-class TranscriptFormat(str, Enum):
-    SRT = "srt"
-    TXT = "txt"
-
-
-class TranscriptConfig(BaseModel):
-    """Optional transcript file of everything the ASR finalized (the
-    obs-localvocal "save to file" feature). One file per app session."""
-
-    enabled: bool = False
-    # Empty = <repo>/var/transcripts (narrator.paths); outside a checkout the
-    # platform user data dir's "transcripts" folder.
-    directory: str = ""
-    format: TranscriptFormat = TranscriptFormat.SRT
-
-
-class RecordingConfig(BaseModel):
-    """Session recording for later correction and accuracy work
-    (narrator.recording). Recording itself is switched live (web UI, the
-    recording shortcut, POST /api/recording, OSC); these are its settings.
-    Each session is a folder: audio.flac (what the ASR received), live.srt
-    (what went on air), session.json, and later draft.srt / corrected.srt."""
-
-    # Start a recording session when the app starts. Off: recording people
-    # needs their consent, so it is always an explicit choice.
-    record_on_start: bool = False
-    # Empty = <repo>/var/recordings (narrator.paths); outside a checkout the
-    # platform user data dir's "recordings" folder.
-    directory: str = ""
-    # Sessions older than this are deleted automatically (0 = keep forever).
-    retention_days: float = Field(default=0.0, ge=0.0)
-    # Recording refuses to start, and a running one stops, when the
-    # recordings disk has less free space than this.
-    min_free_disk_mb: int = Field(default=2048, ge=0)
-    # A small red dot in the corner of the NDI output while recording.
-    on_air_dot: bool = False
-    # After a session stops, generate draft.srt with an offline best-effort
-    # pass (not blocklist- or text-filtered): the starting point for a fix.
-    draft_enabled: bool = True
-    draft_model: str = "large-v3"
-    draft_device: AsrDevice = AsrDevice.AUTO
-    # A queued draft starts (and keeps running) next to live ASR on the same
-    # device only while the ASR worker's busy fraction is at most this; above
-    # it the draft waits (or is suspended). 0 = only while ASR is not running.
-    # "Generate draft now" ignores it.
-    draft_max_asr_busy: float = Field(default=0.3, ge=0.0, le=1.0)
 
 
 class BlocklistAction(str, Enum):
@@ -739,10 +693,8 @@ class RootConfig(BaseModel):
     layout: LayoutConfig = Field(default_factory=LayoutConfig)
     style: StyleConfig = Field(default_factory=StyleConfig)
     ndi: NdiConfig = Field(default_factory=NdiConfig)
-    transcript: TranscriptConfig = Field(default_factory=TranscriptConfig)
     captions: CaptionsConfig = Field(default_factory=CaptionsConfig)
     web: WebConfig = Field(default_factory=WebConfig)
-    recording: RecordingConfig = Field(default_factory=RecordingConfig)
 
     @model_validator(mode="before")
     @classmethod
@@ -771,6 +723,26 @@ class RootConfig(BaseModel):
                 "Ignoring the retired `autoconfigure:` config section "
                 "(narrator-tune keeps these settings in config/tune.yaml now)"
             )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_removed_features(cls, data):
+        """Drop the `transcript:` and `recording:` sections and the
+        recording shortcut: both features were removed (2026-11-16)."""
+        if not isinstance(data, dict):
+            return data
+        dropped = [k for k in ("transcript", "recording") if k in data]
+        if dropped:
+            data = {k: v for k, v in data.items() if k not in dropped}
+        web = data.get("web")
+        if isinstance(web, dict) and isinstance(web.get("shortcuts"), dict) and "recording_toggle" in web["shortcuts"]:
+            shortcuts = {k: v for k, v in web["shortcuts"].items() if k != "recording_toggle"}
+            data = {**data, "web": {**web, "shortcuts": shortcuts}}
+            dropped.append("web.shortcuts.recording_toggle")
+        if dropped:
+            logger.info("config: ignoring %s (session recording and the transcript file were removed)",
+                        ", ".join(dropped))
         return data
 
     @model_validator(mode="after")

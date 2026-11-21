@@ -10,7 +10,6 @@ Addresses (arguments optional unless noted):
     /narrator/mode        [s]          "auto" | "manual" | "toggle" (no arg: toggle)
     /narrator/manual-text  s           append an operator caption line
     /narrator/pause       [i|f|T|F|s]  1/0, true/false, "toggle" (no arg: toggle)
-    /narrator/recording   [i|f|T|F|s]  same, for session recording
 
 A lone numeric 0 argument on /narrator/clear or a no-arg toggle address is
 treated as a button *release* (TouchOSC/vMix buttons send 1 on press, 0 on
@@ -116,9 +115,8 @@ def dispatch(controller, address: str, args: list) -> str | None:
         actions.set_mode(controller, first if isinstance(first, str) else None)
     elif name == "manual-text":
         actions.manual_text(controller, first if isinstance(first, str) else "")
-    elif name in ("pause", "recording"):
-        action = actions.pause if name == "pause" else actions.recording
-        action(controller, first)
+    elif name == "pause":
+        actions.pause(controller, first)
     else:
         logger.debug("OSC: unknown address %s", address)
         return None

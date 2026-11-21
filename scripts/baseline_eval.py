@@ -51,6 +51,8 @@ def main() -> int:
                         help="override an AsrConfig field for every stage, e.g. --set decoder='\"segmenter\"'")
     parser.add_argument("--variant", action="append", default=[], metavar="NAME:FIELD=JSON[,FIELD=JSON]",
                         help="also score base+overrides per model, paired against the base")
+    parser.add_argument("--unit", default=None,
+                        help="processing unit for every decode (default: the config's asr.unit, e.g. cuda:0)")
     parser.add_argument("--variants-only", action="store_true",
                         help="skip the flash/dev/trusted stages of the base (screen + variants only)")
     args = parser.parse_args()
@@ -63,9 +65,11 @@ def main() -> int:
     cache = le.AudioCache(CACHE_DIR / "excerpts", max_mb=tuning.cache_max_mb, min_free_mb=tuning.min_free_disk_mb)
     ev = le.Evaluator(cache, le.ResultStore())
     bench_audio = ac._bench_audio_path(ev, tuning)
+    unit = args.unit or _config_unit(cfg_path)
+    log.info("unit: %s", unit)
     profiles = {}
     for m in models:
-        c = ac.profile_model(m, "vulkan", tuning, bench_audio, False)
+        c = ac.profile_model(m, unit, tuning, bench_audio, False)
         log.info("%s: %s %s", m, c.error, c.bench.get("decode_seconds_by_window"))
         if c.profile:
             profiles[m] = c.profile
@@ -138,6 +142,13 @@ def main() -> int:
     out.write_text(json.dumps(run.report, indent=1, default=str))
     log.info("done")
     return 0
+
+
+def _config_unit(cfg_path: Path) -> str:
+    """asr.unit of the config being evaluated ("auto" resolved by the backend)."""
+    from narrator.config.loader import load_config
+
+    return str(load_config(cfg_path).asr.unit)
 
 
 def _split_assignments(text: str) -> list[str]:

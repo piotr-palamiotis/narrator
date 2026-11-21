@@ -88,8 +88,6 @@ class FakeEnv(checks.Environment):
     def var_dir(self):
         return self.tmp / "var"
 
-    def recordings_dir(self, config):
-        return self.tmp / "recordings"
 
 
 def cfg(**sections) -> RootConfig:
@@ -285,14 +283,11 @@ def test_ndi_runtime_check():
 
 
 def test_disk_checks(tmp_path):
-    config = cfg(recording={"min_free_disk_mb": 2048})
-    assert checks.check_disk(config, FakeEnv(tmp_path)) == []
-    [problem] = checks.check_disk(config, FakeEnv(tmp_path, free=500.0))
-    assert problem.id == "recording.disk_low"
+    config = cfg()
+    assert checks.check_disk(config, FakeEnv(tmp_path, free=500.0)) == []  # no tune cache: nothing to warn about
     (tmp_path / "var" / "tune" / "cache").mkdir(parents=True)
-    assert ids(checks.check_disk(config, FakeEnv(tmp_path, free=500.0))) == [
-        "recording.disk_low", "setup.tune_cache_disk_low",
-    ]
+    assert checks.check_disk(config, FakeEnv(tmp_path)) == []
+    assert ids(checks.check_disk(config, FakeEnv(tmp_path, free=500.0))) == ["setup.tune_cache_disk_low"]
 
 
 def test_static_problems_survive_a_broken_probe():
@@ -465,7 +460,6 @@ def broken_app(tmp_path, monkeypatch, request):
         RootConfig.model_validate({
             "audio": {"device": "Zoom H6"},
             "asr": {"preset": "custom", "model": getattr(request, "param", "large-v9"), "unit": "vulkan:0"},
-            "recording": {"directory": str(tmp_path / "rec")},
             "web": {"enabled": False},
         }),
         config_path,

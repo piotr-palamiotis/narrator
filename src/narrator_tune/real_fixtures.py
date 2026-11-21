@@ -28,8 +28,7 @@ run 5-9s.
 Subtitle files downloaded with yt-dlp carry their language in the name:
 "Title (Polish_ASR).srt" is YouTube's auto-captions, "Title (Polish).srt" an
 uploaded (human) subtitle track, and "Title (Polish_corrected).srt" a
-narrator session recording whose captions an operator corrected by hand
-(the web UI's "Use as reference"): the best reference there is, an
+hand-corrected transcript of the audio: the best reference there is, an
 objective one, and preferred over any other SRT of the same title.
 `RealRecording.reference_language` /
 `reference_kind` expose that, so evaluation can skip e.g. an English

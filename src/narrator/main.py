@@ -24,8 +24,7 @@ def default_config_path() -> Path:
 
 def run_headless(controller, shutdown: threading.Event, poll_seconds: float = 0.5) -> int:
     """Block until `shutdown` is set (SIGTERM/SIGINT), then run the one
-    shutdown path (controller.stop(): web UI, NDI, ASR worker, audio,
-    transcript flush). Returns the exit status: 0 for a requested shutdown.
+    shutdown path (controller.stop(): web UI, NDI, ASR worker, audio). Returns the exit status: 0 for a requested shutdown.
 
     Since the 2026-10-17 failure policy the app never stops itself: an ASR
     crash loop, a missing unit/model/mic or NDI runtime leave the app up with
@@ -110,21 +109,23 @@ def main() -> int:
     )
     parser.add_argument(
         "--open-ui", action="store_true",
-        help="Open the web UI of the narrator already running (logged in with its startup token) and exit",
+        help="Open the web UI of the narrator already running in a browser and exit",
+    )
+    parser.add_argument(
+        "--local-only", action="store_true",
+        help="Web UI reachable from this computer only (listens on 127.0.0.1). Default: other "
+             "computers can reach it too, behind the login password",
+    )
+    parser.add_argument(
+        "--set-password", action="store_true",
+        help="Set the web UI login password (asked twice; stored as a hash next to config.yaml) and exit. "
+             "A running narrator uses it at the next login",
     )
     parser.add_argument(
         "--log-file", action="store_true",
         help="Also write a rotating log to <repo>/var/log/narrator.log (off by default; stderr/journald always)",
     )
-    # The recording draft pass runs as a subprocess of the app (this flag is
-    # how the frozen build reaches it; a checkout uses -m narrator.recording.draft).
-    parser.add_argument("--draft-recording", type=Path, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
-
-    if args.draft_recording is not None:
-        from narrator.recording.draft import main as draft_main
-
-        return draft_main([str(args.draft_recording)])
 
     if args.list_devices:
         _list_devices()
@@ -132,6 +133,9 @@ def main() -> int:
 
     if args.open_ui:
         return open_ui()
+
+    if args.set_password:
+        return set_password(args.config or default_config_path())
 
     if args.pick_preset:
         from narrator.asr.preset_picker import main as pick_preset_main
@@ -167,11 +171,11 @@ def main() -> int:
     if web_wanted:
         from narrator.web.server import WebServer
 
-        web = WebServer(controller)
+        web = WebServer(controller, local_only=args.local_only)
         controller.attach_web(web)  # config changes reach it; stop() stops it first
         web.start()
-        if not (args.headless or args.no_web) and web.login_url() and _has_display():
-            _open_browser(web.login_url())
+        if not (args.headless or args.no_web) and web.url and _has_display():
+            _open_browser(web.url)
 
     shutdown = threading.Event()
     install_signal_handlers(lambda signum: shutdown.set())
@@ -195,23 +199,47 @@ def _open_browser(url: str) -> None:
 
 
 def open_ui() -> int:
-    """`narrator --open-ui`: open the running instance's web UI, logged in.
-    The token file (<var>/web-token.json, 0600) is written by the running
-    app's web server and removed when it stops."""
-    from narrator.web.security import default_token_path, read_token_file
+    """`narrator --open-ui`: open the running instance's web UI (its login
+    page). <var>/web-ui.json is written by the running app's web server and
+    removed when it stops."""
+    from narrator.web.security import default_ui_file_path, read_ui_file
 
-    path = default_token_path()
+    path = default_ui_file_path()
     try:
-        info = read_token_file(path)
-    except (OSError, ValueError):
+        url = read_ui_file(path)["url"]
+    except (OSError, ValueError, KeyError):
         print(f"No running narrator web UI found ({path} is missing or unreadable).", file=sys.stderr)
         return 1
-    url = f"{info['url']}/auth?token={info['token']}"
-    print(f"Opening {info['url']}")
+    print(f"Opening {url}")
     import webbrowser
 
     if not webbrowser.open(url):
         print(f"Could not start a browser; open this URL yourself:\n  {url}")
+    return 0
+
+
+def set_password(config_path: Path) -> int:
+    """`narrator --set-password`: ask for the web UI password twice and store
+    its scrypt hash beside config.yaml. Changing it here does not log out
+    browsers that are already logged in (the web UI's own change does)."""
+    import getpass
+
+    from narrator.web.security import PasswordError, password_path_for, write_password_file
+
+    path = password_path_for(config_path)
+    try:
+        password = getpass.getpass("New web UI password: ")
+        if password != getpass.getpass("Same password again: "):
+            print("The passwords do not match; nothing was changed.", file=sys.stderr)
+            return 1
+        write_password_file(path, password)
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled; nothing was changed.", file=sys.stderr)
+        return 1
+    except PasswordError as exc:
+        print(f"Not set: {exc}.", file=sys.stderr)
+        return 1
+    print(f"Password saved ({path}).")
     return 0
 
 

@@ -12,22 +12,25 @@ import pytest
 import yaml
 from aiohttp.test_utils import TestClient, TestServer
 
-from narrator.app_controller import FeatureUnavailableError
 from narrator.config.loader import load_config, save_config
 from narrator.config.schema import RootConfig
 from narrator.render.canvas import CaptionRenderer
 from narrator.web import actions, osc
 from narrator.web.security import (
     SESSION_COOKIE,
-    host_allowed,
+    is_loopback_address,
+    is_loopback_host,
     origin_allowed,
-    read_token_file,
+    read_password_file,
+    read_ui_file,
     split_host,
-    write_token_file,
+    verify_password,
+    write_password_file,
+    write_ui_file,
 )
 from narrator.web.server import WebServer
 
-TOKEN = "startup-token-for-tests-0123456789"
+PASSWORD = "test-password-123"
 API_TOKEN = "companion-token-abcdefghijklmnop"
 
 
@@ -40,8 +43,6 @@ class FakeController:
         self.renderer = CaptionRenderer(self.config.canvas, self.config.layout, self.config.style)
         self.caption_mode = "auto"
         self.captions_paused = False
-        self.recording = False
-        self.recording_available = False
         self.ui_events = collections.deque(maxlen=256)
         self.calls: list = []
         self.problems = [
@@ -55,8 +56,6 @@ class FakeController:
         return {
             "caption_mode": self.caption_mode,
             "captions_paused": self.captions_paused,
-            "recording": False,
-            "recording_available": False,
             "asr_active": True,
             "asr_backend": "fake",
             "asr_restarts": 0,
@@ -95,9 +94,6 @@ class FakeController:
         self.calls.append(("pause", paused))
         self.captions_paused = paused
 
-    def set_recording(self, enabled):
-        raise FeatureUnavailableError("recording is not available yet")
-
     def refresh_text_settings(self):
         self.calls.append(("refresh_text",))
 
@@ -116,8 +112,12 @@ def run(coro):
     return asyncio.run(coro)
 
 
-async def _client(controller):
-    server = WebServer(controller, token=TOKEN, token_path=controller.config_path.parent / "token.json")
+async def _client(controller, local_only: bool = False):
+    password_path = controller.config_path.parent / "web-password.json"
+    if not password_path.exists():
+        write_password_file(password_path, PASSWORD)
+    server = WebServer(controller, password_path=password_path, local_only=local_only,
+                       ui_file_path=controller.config_path.parent / "web-ui.json")
     client = TestClient(TestServer(server.create_app(), host="127.0.0.1"))
     await client.start_server()
     return server, client
@@ -127,8 +127,9 @@ def _origin(client) -> str:
     return f"http://127.0.0.1:{client.port}"
 
 
-async def _login(client) -> None:
-    resp = await client.get(f"/auth?token={TOKEN}", allow_redirects=False)
+async def _login(client, password: str = PASSWORD) -> None:
+    resp = await client.post("/auth", data={"password": password}, headers={"Origin": _origin(client)},
+                             allow_redirects=False)
     assert resp.status == 303
     assert resp.headers["Location"] == "/"
     cookie = resp.cookies[SESSION_COOKIE]
@@ -168,7 +169,7 @@ async def test_api_requires_authentication(controller, server, client):
 @with_client
 async def test_root_serves_login_page_until_logged_in(controller, server, client):
     resp = await client.get("/")
-    assert "Login token" in await resp.text()
+    assert 'name="password"' in await resp.text()
     await _login(client)
     resp = await client.get("/")
     assert "app.js" in await resp.text()
@@ -178,8 +179,9 @@ async def test_root_serves_login_page_until_logged_in(controller, server, client
 
 
 @with_client
-async def test_wrong_startup_token_is_refused(controller, server, client):
-    resp = await client.get("/auth?token=nope", allow_redirects=False)
+async def test_wrong_password_is_refused(controller, server, client):
+    resp = await client.post("/auth", data={"password": "not-the-password"},
+                             headers={"Origin": _origin(client)}, allow_redirects=False)
     assert resp.status == 303 and "failed" in resp.headers["Location"]
     assert SESSION_COOKIE not in resp.cookies
     assert (await client.get("/api/state")).status == 401
@@ -187,16 +189,98 @@ async def test_wrong_startup_token_is_refused(controller, server, client):
 
 @with_client
 async def test_login_form_post(controller, server, client):
-    resp = await client.post("/auth", data={"token": TOKEN}, headers={"Origin": _origin(client)},
-                             allow_redirects=False)
-    assert resp.status == 303 and resp.headers["Location"] == "/"
+    await _login(client)
     assert (await client.get("/api/config")).status == 200
 
 
 @with_client
-async def test_bearer_startup_token_grants_full_access(controller, server, client):
-    headers = {"Authorization": f"Bearer {TOKEN}"}
-    assert (await client.get("/api/config", headers=headers)).status == 200
+async def test_get_auth_and_token_query_no_longer_log_in(controller, server, client):
+    resp = await client.get(f"/auth?token={PASSWORD}&password={PASSWORD}", allow_redirects=False)
+    assert resp.status == 303 and SESSION_COOKIE not in resp.cookies
+    assert (await client.get("/api/config", headers={"Authorization": f"Bearer {PASSWORD}"})).status == 401
+
+
+@with_client
+async def test_login_post_needs_same_origin(controller, server, client):
+    resp = await client.post("/auth", data={"password": PASSWORD}, headers={"Origin": "http://evil.example"},
+                             allow_redirects=False)
+    assert resp.status == 403
+
+
+@with_client
+async def test_no_password_on_loopback_opens_without_login(controller, server, client):
+    server.password_path.unlink()
+    assert (await (await client.get("/api/login-info")).json()) == {"password_set": False, "login_required": False}
+    resp = await client.get("/")
+    assert "app.js" in await resp.text()
+    assert (await client.get("/api/config")).status == 200
+    # Origin/Host checks still apply.
+    assert (await client.post("/api/clear", headers={"Origin": "http://evil.example"})).status == 403
+    # An API token still gets only the control API.
+    assert (await client.get("/api/config", headers={"Authorization": f"Bearer {API_TOKEN}"})).status == 403
+
+
+@with_client
+async def test_no_password_means_no_login_from_other_computers(controller, server, client):
+    server.password_path.unlink()
+    # A browser on another computer addresses this machine by its LAN IP;
+    # a DNS-rebinding page in a local browser by its own name. Neither is let in.
+    for host in (f"192.168.1.5:{client.port}", f"evil.example:{client.port}"):
+        h = {"Host": host}
+        assert (await (await client.get("/api/login-info", headers=h)).json()) == {
+            "password_set": False, "login_required": True}
+        assert (await client.get("/api/config", headers=h)).status == 401
+    lan = f"192.168.1.5:{client.port}"
+    resp = await client.post("/auth", data={"password": PASSWORD},
+                             headers={"Host": lan, "Origin": f"http://{lan}"}, allow_redirects=False)
+    assert resp.status == 303 and "nopassword" in resp.headers["Location"]
+    assert SESSION_COOKIE not in resp.cookies
+
+
+@with_client
+async def test_first_password_set_from_the_open_page_keeps_this_browser_in(controller, server, client):
+    server.password_path.unlink()
+    resp = await client.post("/api/password", json={"new": "first-password"}, headers={"Origin": _origin(client)})
+    assert resp.status == 200
+    assert SESSION_COOKIE in resp.cookies
+    assert (await client.get("/api/config")).status == 200  # this browser stays in
+    other = TestClient(TestServer(server.create_app(), host="127.0.0.1"))
+    await other.start_server()
+    try:
+        assert (await other.get("/api/config")).status == 401  # everyone else needs it now
+        await _login(other, "first-password")
+        assert (await other.get("/api/config")).status == 200
+    finally:
+        await other.close()
+
+
+@with_client
+async def test_change_password(controller, server, client):
+    await _login(client)
+    other = TestClient(TestServer(server.create_app(), host="127.0.0.1"))
+    await other.start_server()
+    try:
+        await _login(other)
+        origin = {"Origin": _origin(client)}
+        resp = await client.post("/api/password", json={"current": "wrong-one!", "new": "brand-new-pass"}, headers=origin)
+        assert resp.status == 403
+        resp = await client.post("/api/password", json={"current": PASSWORD, "new": "short"}, headers=origin)
+        assert resp.status == 400
+        resp = await client.post("/api/password", json={"current": PASSWORD, "new": "brand-new-pass"}, headers=origin)
+        assert resp.status == 200
+        assert verify_password(read_password_file(server.password_path), "brand-new-pass")
+        # This session stays; every other one ends.
+        assert (await client.get("/api/config")).status == 200
+        assert (await other.get("/api/config")).status == 401
+    finally:
+        await other.close()
+
+
+@with_client
+async def test_api_token_cannot_change_the_password(controller, server, client):
+    resp = await client.post("/api/password", json={"current": PASSWORD, "new": "brand-new-pass"},
+                             headers={"Authorization": f"Bearer {API_TOKEN}"})
+    assert resp.status == 403
 
 
 @with_client
@@ -230,15 +314,38 @@ async def test_logout_ends_the_session(controller, server, client):
 # --------------------------------------------------- Host / Origin checks
 
 
+def test_local_only_refuses_foreign_host_header(config_path):
+    """--local-only: DNS rebinding (evil.example resolved to 127.0.0.1)
+    carries its own Host, and a LAN address is not this computer only."""
+
+    async def body():
+        controller = FakeController(config_path)
+        server, client = await _client(controller, local_only=True)
+        try:
+            await _login(client)
+            for host in ("evil.example", f"evil.example:{client.port}", "127.0.0.1:1",
+                         "localhost.evil.example", f"192.168.1.5:{client.port}"):
+                resp = await client.get("/api/state", headers={"Host": host})
+                assert resp.status == 421, host
+            ok = await client.get("/api/state", headers={"Host": f"localhost:{client.port}"})
+            assert ok.status == 200
+        finally:
+            await client.close()
+
+    run(body())
+
+
 @with_client
-async def test_foreign_host_header_is_refused(controller, server, client):
-    """DNS rebinding: evil.example resolved to 127.0.0.1 carries its own Host."""
-    await _login(client)
-    for host in ("evil.example", f"evil.example:{client.port}", "127.0.0.1:1", "localhost.evil.example"):
-        resp = await client.get("/api/state", headers={"Host": host})
-        assert resp.status == 421, host
-    ok = await client.get("/api/state", headers={"Host": f"localhost:{client.port}"})
-    assert ok.status == 200
+async def test_other_computers_reach_it_by_default_with_a_login(controller, server, client):
+    lan = f"192.168.1.5:{client.port}"
+    h = {"Host": lan, "Origin": f"http://{lan}"}
+    assert (await client.get("/api/config", headers={"Host": lan})).status == 401
+    resp = await client.post("/auth", data={"password": PASSWORD}, headers=h, allow_redirects=False)
+    assert resp.status == 303 and SESSION_COOKIE in resp.cookies
+    assert (await client.get("/api/config", headers={"Host": lan})).status == 200
+    assert (await client.post("/api/clear", headers=h)).status == 200
+    # CSRF: an Origin other than the address used is still refused.
+    assert (await client.post("/api/clear", headers={"Host": lan, "Origin": f"http://localhost:{client.port}"})).status == 403
 
 
 @with_client
@@ -295,21 +402,47 @@ async def test_cross_origin_websocket_is_refused(controller, server, client):
 
 
 def test_host_and_origin_helpers():
-    allowed = frozenset({"localhost", "127.0.0.1", "::1"})
     assert split_host("[::1]:8765") == ("::1", 8765)
-    assert host_allowed("[::1]:8765", allowed, 8765)
-    assert not host_allowed(None, allowed, 8765)
-    assert not host_allowed("127.0.0.1:8765x", allowed, 8765)
-    assert origin_allowed(None, allowed, 8765)
-    assert origin_allowed("http://localhost:8765", allowed, 8765)
-    assert not origin_allowed("http://localhost:8766", allowed, 8765)
+    assert is_loopback_host("[::1]:8765", 8765)
+    assert is_loopback_host("127.0.0.1:8765", 8765)
+    assert not is_loopback_host("192.168.1.5:8765", 8765)
+    assert not is_loopback_host(None, 8765)
+    assert not is_loopback_host("127.0.0.1:8765x", 8765)
+    assert is_loopback_address("127.0.0.1") and is_loopback_address("::1")
+    assert not is_loopback_address("192.168.1.5") and not is_loopback_address(None)
+    assert origin_allowed(None, "localhost:8765")
+    assert origin_allowed("http://localhost:8765", "localhost:8765")
+    assert origin_allowed("http://192.168.1.5:8765", "192.168.1.5:8765")
+    assert not origin_allowed("http://localhost:8766", "localhost:8765")
+    assert not origin_allowed("http://localhost:8765", "192.168.1.5:8765")
+    assert not origin_allowed("null", "localhost:8765")
 
 
-def test_token_file_is_private(tmp_path):
-    path = tmp_path / "var" / "web-token.json"
-    write_token_file(path, "abc", "http://127.0.0.1:8765")
+def test_password_file_is_private_and_hashed(tmp_path):
+    path = tmp_path / "web-password.json"
+    write_password_file(path, "correct horse")
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
-    assert read_token_file(path)["token"] == "abc"
+    assert "correct horse" not in path.read_text()
+    record = read_password_file(path)
+    assert verify_password(record, "correct horse")
+    assert not verify_password(record, "correct horsE")
+    assert not verify_password(None, "correct horse")
+
+
+def test_password_rules(tmp_path):
+    from narrator.web.security import PasswordError
+
+    for bad in ["short", " leading-space", "trailing-space "]:
+        with pytest.raises(PasswordError):
+            write_password_file(tmp_path / "pw.json", bad)
+    assert read_password_file(tmp_path / "pw.json") is None
+
+
+def test_ui_file_is_private(tmp_path):
+    path = tmp_path / "var" / "web-ui.json"
+    write_ui_file(path, "http://127.0.0.1:8765")
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    assert read_ui_file(path)["url"] == "http://127.0.0.1:8765"
 
 
 # ------------------------------------------------------------ control API
@@ -339,9 +472,9 @@ async def test_each_control_action(controller, server, client):
     resp = await client.post("/api/clear", headers=h)
     assert (await resp.json())["state"]["on_air"] == []
 
-    resp = await client.post("/api/recording", json={"recording": "toggle"}, headers=h)
-    assert resp.status == 501
-    assert "not available" in (await resp.json())["error"]
+    # Session recording was removed: its endpoints are gone.
+    assert (await client.post("/api/recording", json={"recording": "toggle"}, headers=h)).status in (404, 405)
+    assert (await client.get("/api/recordings")).status in (404, 405)
 
     state = await (await client.get("/api/state")).json()
     assert state["shortcuts"]["clear"] == "Escape"
@@ -420,7 +553,8 @@ async def test_invalid_file_falls_back_to_live_config(controller, server, client
 async def test_schema_and_choices(controller, server, client):
     await _login(client)
     schema = await (await client.get("/api/schema")).json()
-    assert {"audio", "asr", "web", "captions", "transcript"} <= set(schema["properties"])
+    assert {"audio", "asr", "web", "captions"} <= set(schema["properties"])
+    assert not {"transcript", "recording"} & set(schema["properties"])
     choices = await (await client.get("/api/choices")).json()
     assert "large-v3" in choices["models"]
     assert ["pl", "Polish (pl)"] in choices["languages"]
@@ -575,18 +709,17 @@ def test_osc_over_udp(config_path):
 # ------------------------------------------------------------ server lifecycle
 
 
-def test_server_thread_start_stop_writes_and_removes_token(config_path):
+def test_server_thread_start_stop_writes_and_removes_ui_file(config_path):
     controller = FakeController(config_path)
     controller.config = controller.config.model_copy(
         update={"web": controller.config.web.model_copy(update={"port": _free_port()})}
     )
-    token_path = config_path.parent / "web-token.json"
-    server = WebServer(controller, token_path=token_path)
+    ui_path = config_path.parent / "web-ui.json"
+    write_password_file(config_path.parent / "web-password.json", PASSWORD)  # else the page is open
+    server = WebServer(controller, ui_file_path=ui_path)
     server.start()
     try:
-        info = read_token_file(token_path)
-        assert info["token"] == server.token
-        assert info["url"] == server.url
+        assert read_ui_file(ui_path)["url"] == server.url
         import urllib.request
 
         with urllib.request.urlopen(server.url + "/api/state") as resp:  # noqa: S310 (loopback)
@@ -595,7 +728,7 @@ def test_server_thread_start_stop_writes_and_removes_token(config_path):
         assert exc.code == 401
     finally:
         server.stop()
-    assert not token_path.exists()
+    assert not ui_path.exists()
 
 
 def _free_port() -> int:
@@ -604,118 +737,3 @@ def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
-
-
-# ---------------------------------------------------------------- recordings (C3)
-
-
-class RecordingController(FakeController):
-    """FakeController with a real RecordingManager on a temp folder."""
-
-    def __init__(self, config_path, rec_dir):
-        super().__init__(config_path)
-        from narrator.recording.manager import RecordingManager
-
-        self.config = self.config.model_copy(
-            update={"recording": self.config.recording.model_copy(update={"directory": str(rec_dir), "min_free_disk_mb": 0})}
-        )
-        self.recordings = RecordingManager(lambda: self.config, flac_available=lambda: True)
-
-    @property
-    def recording_available(self):
-        return True
-
-    @property
-    def recording(self):
-        return self.recordings.recording
-
-    @recording.setter
-    def recording(self, value):  # FakeController.__init__ assigns it
-        pass
-
-    @recording_available.setter
-    def recording_available(self, value):
-        pass
-
-    def set_recording(self, enabled):
-        self.recordings.set_recording(enabled)
-
-
-def test_recording_api(config_path, tmp_path, monkeypatch):
-    pytest.importorskip("soundfile")
-    import numpy as np
-
-    from narrator.recording import manager as manager_module
-
-    library = tmp_path / "library"
-    monkeypatch.setattr(manager_module, "reference_library_dir", lambda: library)
-
-    async def body():
-        controller = RecordingController(config_path, tmp_path / "rec")
-        server, client = await _client(controller)
-        try:
-            control = {"Authorization": f"Bearer {API_TOKEN}"}
-            # Recording on/off is a control action (API tokens: Companion's REC button).
-            resp = await client.post("/api/recording", json={"recording": True}, headers=control)
-            assert resp.status == 200 and (await resp.json())["result"] is True
-            assert controller.recordings.recording
-            controller.recordings.feed(np.full(16000, 0.1, dtype=np.float32))
-            rec_id = controller.recordings.active_id
-            # The recordings library is admin-only.
-            assert (await client.get("/api/recordings")).status == 401
-            assert (await client.get("/api/recordings", headers=control)).status == 403
-            resp = await client.post("/api/recording?recording=off", headers=control)
-            assert resp.status == 200 and not controller.recordings.recording
-
-            await _login(client)
-            h = {"Origin": _origin(client)}
-            listing = await (await client.get("/api/recordings")).json()
-            (item,) = listing["recordings"]
-            assert item["id"] == rec_id and item["status"] == "draft pending"
-            assert item["duration_s"] == pytest.approx(1.0)
-            assert listing["disk"]["recordings_bytes"] > 0
-
-            resp = await client.get(f"/api/recordings/{rec_id}/files/audio.flac")
-            assert resp.status == 200 and "attachment" in resp.headers["Content-Disposition"]
-            assert (await client.get(f"/api/recordings/{rec_id}/files/session.json")).status == 404
-            assert (await client.get(f"/api/recordings/{rec_id}/files/draft.srt")).status == 404
-            assert (await client.get("/api/recordings/..%2F..%2Fetc/files/audio.flac")).status == 404
-
-            # Corrected SRT: validated, 422 with the reason.
-            bad = await client.put(f"/api/recordings/{rec_id}/corrected", data=b"not an srt", headers=h)
-            assert bad.status == 422 and "invalid SRT" in (await bad.json())["error"]
-            late = b"1\n00:10:00,000 --> 00:10:01,000\nx\n"
-            assert (await client.put(f"/api/recordings/{rec_id}/corrected", data=late, headers=h)).status == 422
-            assert (await client.post(f"/api/recordings/{rec_id}/reference", headers=h)).status == 409
-            good = "1\n00:00:00,100 --> 00:00:00,900\nDzień dobry\n".encode()
-            resp = await client.put(f"/api/recordings/{rec_id}/corrected", data=good, headers=h)
-            assert resp.status == 200 and (await resp.json())["cues"] == 1
-            resp = await client.get(f"/api/recordings/{rec_id}/files/corrected.srt")
-            assert "Dzień dobry" in await resp.text()
-
-            resp = await client.post(f"/api/recordings/{rec_id}/reference", headers=h)
-            assert resp.status == 200
-            assert sorted(p.name for p in library.iterdir()) == [
-                f"narrator {rec_id} (FLAC).flac", f"narrator {rec_id} (Polish_corrected).srt"]
-
-            resp = await client.post(f"/api/recordings/{rec_id}/draft", headers=h)
-            assert resp.status == 200
-            # Cross-origin and unconfirmed deletes are refused.
-            evil = {"Origin": "http://evil.example"}
-            assert (await client.delete(f"/api/recordings/{rec_id}", headers=evil)).status == 403
-            assert (await client.post("/api/recordings/delete-all", json={}, headers=h)).status == 400
-            resp = await client.post("/api/recordings/delete-all", json={"confirm": True}, headers=h)
-            assert (await resp.json())["deleted"] == 1
-            assert (await (await client.get("/api/recordings")).json())["recordings"] == []
-            assert (await client.delete(f"/api/recordings/{rec_id}", headers=h)).status == 404
-        finally:
-            controller.recordings.shutdown()
-            await client.close()
-
-    run(body())
-
-
-@with_client
-async def test_recordings_api_without_recorder_is_501(controller, server, client):
-    await _login(client)
-    assert (await client.get("/api/recordings")).status == 501

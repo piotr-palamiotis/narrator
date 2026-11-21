@@ -9,8 +9,9 @@
 # starts it at boot without a login.
 #
 # Logs: journalctl --user -u narrator -f   (or `make logs`)
-# Control: the web UI at http://127.0.0.1:8765 (web.port); `narrator --open-ui`
-# opens it logged in. --headless only means "never open a browser".
+# Control: the web UI on port 8765 (web.port), reachable from other computers
+# (add --local-only to ExecStart to refuse them); password set with
+# `narrator --set-password`. --headless only means "never open a browser".
 [Unit]
 Description=narrator live captions (NDI)
 Wants=network-online.target

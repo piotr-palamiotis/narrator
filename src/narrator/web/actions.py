@@ -6,9 +6,6 @@ state. Errors are ActionError with an HTTP status the API passes through.
 """
 from __future__ import annotations
 
-from narrator.app_controller import FeatureUnavailableError
-from narrator.recording.session import RecordingError
-
 _TRUE = {"1", "true", "on", "yes", "pause", "paused", "start"}
 _FALSE = {"0", "false", "off", "no", "resume", "play", "stop"}
 
@@ -65,17 +62,6 @@ def pause(controller, value) -> bool:
     paused = parse_switch(value, controller.captions_paused)
     controller.set_captions_paused(paused)
     return paused
-
-
-def recording(controller, value) -> bool:
-    enabled = parse_switch(value, controller.recording)
-    try:
-        controller.set_recording(enabled)
-    except FeatureUnavailableError as exc:
-        raise ActionError(str(exc), status=501) from exc
-    except RecordingError as exc:  # e.g. too little free disk space
-        raise ActionError(str(exc), status=409) from exc
-    return enabled
 
 
 def fix(controller, action) -> str:

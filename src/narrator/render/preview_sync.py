@@ -33,8 +33,11 @@ class PreviewSync:
         layout: LayoutConfig,
         style: StyleConfig,
         live_renderer: CaptionRenderer | None,
+        sample_text: str = "",
     ) -> Image.Image:
-        if live_renderer is not None and (canvas, layout, style) == (
+        """`sample_text` (non-empty) previews that text instead of the live
+        captions -- for styling while nothing is on air; never broadcast."""
+        if not sample_text and live_renderer is not None and (canvas, layout, style) == (
             live_renderer.canvas_config,
             live_renderer.layout_config,
             live_renderer.style_config,
@@ -48,8 +51,8 @@ class PreviewSync:
         ):  # update_config forces a full re-layout; skip it when unchanged
             self._renderer.update_config(canvas, layout, style)
 
-        source_text = ""
-        if live_renderer is not None:
+        source_text = sample_text
+        if not sample_text and live_renderer is not None:
             try:
                 source_text = live_renderer.snapshot_text()
             except Exception:

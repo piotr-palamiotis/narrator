@@ -21,6 +21,15 @@ The pacer holds no thread: `advance(now)` is called by the renderer
 whenever a frame is composed (the NDI loop runs at the output frame rate),
 and returns the text to commit to the buffer and the in-progress tail to
 show after it.
+
+`smooth` (narrator's own, not LocalVocal's) types characters at a steady
+rate instead of the stepped speeds: the rate follows the speaker's recent
+speed (characters arrived over the last SMOOTH_RATE_WINDOW seconds) and is
+nudged so the queue holds about SMOOTH_LAG seconds of text, catching up
+over SMOOTH_CATCHUP seconds when it grows. Bursts of committed words then
+flow out continuously instead of racing out and stopping. Added 2026-11-17
+because the local-agreement decoder commits words in groups and `word`
+pacing showed them as visible bursts.
 """
 from __future__ import annotations
 
@@ -34,6 +43,12 @@ _SPEEDS = {
     "word": ((0.100, 0.150, 0.200), (5, 10)),
     "sentence": ((0.300, 0.600, 1.000), (1, 3)),
 }
+# smooth: speaker-rate window (s), target queue (s of text), catch-up time
+# (s) and the typing-rate bounds (characters per second).
+SMOOTH_RATE_WINDOW = 6.0
+SMOOTH_LAG = 0.8
+SMOOTH_CATCHUP = 1.5
+SMOOTH_RATE_BOUNDS = (8.0, 80.0)
 _SENTENCE_RE = re.compile(r"\S.*?(?:[.!?…]+(?=\s|$)|$)", re.DOTALL)
 
 
@@ -43,7 +58,7 @@ def split_units(text: str, mode: str) -> list[str]:
     text = " ".join(text.split())
     if not text:
         return []
-    if mode == "char":
+    if mode in ("char", "smooth"):
         units: list[str] = []
         pending_space = False
         for ch in text:
@@ -62,10 +77,14 @@ def split_units(text: str, mode: str) -> list[str]:
 
 class CaptionPacer:
     def __init__(self, mode: str) -> None:
-        if mode not in _SPEEDS:
+        if mode not in _SPEEDS and mode != "smooth":
             raise ValueError(f"unknown pacing mode {mode!r}")
         self.mode = mode
-        self._speeds, self._thresholds = _SPEEDS[mode]
+        self._speeds, self._thresholds = _SPEEDS.get(mode, _SPEEDS["char"])
+        # smooth: characters queued since the last frame, and recent
+        # arrivals as (time, characters) for the speaker-rate estimate
+        self._arrived = 0
+        self._arrivals: deque[tuple[float, int]] = deque()
         # Queued FINAL units; None marks the end of one FINAL (commit point).
         self._final_units: deque[str | None] = deque()
         self._typing = ""  # revealed text of the FINAL being typed, not yet committed
@@ -88,9 +107,11 @@ class CaptionPacer:
         self._partial, self._partial_shown = [], 0
         self._final_units.extend(units)
         self._final_units.append(None)
+        self._arrived += len(units)
 
     def push_partial(self, text: str) -> None:
         units = split_units(text, self.mode)
+        self._arrived += max(len(units) - len(self._partial), 0)
         # Pop the shown units the new partial does not share.
         self._partial_shown = min(self._partial_shown, _common_prefix(self._partial, units))
         self._partial = units
@@ -111,6 +132,8 @@ class CaptionPacer:
     def advance(self, now: float) -> tuple[list[str], str]:
         """Reveal what is due by `now`. Returns (texts to append to the
         caption buffer, in order; the tail to show after the buffer)."""
+        if self.mode == "smooth":
+            self._note_arrivals(now)
         interval = self._interval()
         if self._next_at < now - interval:
             self._next_at = now  # idle: the next unit is due at once
@@ -132,8 +155,26 @@ class CaptionPacer:
                 self._commit_typing(all_of_it=True)
         return self._take_commits(), self._tail()
 
+    def _note_arrivals(self, now: float) -> None:
+        """smooth: record what arrived since the last frame; forget
+        arrivals older than the rate window."""
+        if self._arrived:
+            self._arrivals.append((now, self._arrived))
+            self._arrived = 0
+        while self._arrivals and self._arrivals[0][0] < now - SMOOTH_RATE_WINDOW:
+            self._arrivals.popleft()
+
+    def smooth_rate(self) -> float:
+        """smooth: typing speed (characters/s) for the current backlog."""
+        speaker = sum(n for _, n in self._arrivals) / SMOOTH_RATE_WINDOW
+        rate = speaker + (self.backlog() - speaker * SMOOTH_LAG) / SMOOTH_CATCHUP
+        low, high = SMOOTH_RATE_BOUNDS
+        return min(max(rate, low), high)
+
     def _interval(self) -> float:
         backlog = self.backlog()
+        if self.mode == "smooth":
+            return 1.0 / self.smooth_rate()
         fast, medium, slow = self._speeds
         low, high = self._thresholds
         return fast if backlog > high else medium if backlog > low else slow

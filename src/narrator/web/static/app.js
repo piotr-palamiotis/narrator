@@ -89,7 +89,6 @@ const S = {
   activeTab: null,
   ws: null,
   logLines: [],
-  feed: [],
 };
 
 const DISPLAY_SECTIONS = ["canvas", "layout", "style"];
@@ -97,21 +96,19 @@ const DISPLAY_SECTIONS = ["canvas", "layout", "style"];
 // ------------------------------------------------------------------ schema UI
 
 const TABS = [
-  { id: "audio", title: "Audio", sections: ["audio"] },
-  { id: "asr", title: "ASR", sections: ["asr"] },
-  { id: "display", title: "Display", sections: ["canvas", "layout", "style"] },
-  { id: "ndi", title: "NDI", sections: ["ndi"] },
-  { id: "transcript", title: "Transcript", sections: ["transcript"] },
-  { id: "captions", title: "Captions", sections: ["captions"] },
-  { id: "recordings", title: "Recordings", sections: ["recording"] },
+  { id: "audio", title: "Audio input", sections: ["audio"] },
+  { id: "asr", title: "Speech recognition", sections: ["asr"] },
+  { id: "display", title: "Look & layout", sections: ["style", "layout", "canvas"] },
+  { id: "ndi", title: "NDI output", sections: ["ndi"] },
+  { id: "captions", title: "Word filter", sections: ["captions"] },
   { id: "remote", title: "Web & remote", sections: ["web"] },
   { id: "status", title: "Status & log", sections: ["app"] },
 ];
 
 const SECTION_TITLES = {
-  app: "App", audio: "Audio input", asr: "Speech recognition", canvas: "Canvas", layout: "Layout",
-  style: "Style", ndi: "NDI output", transcript: "Transcript file", captions: "Caption text policy",
-  web: "Web UI & remote control", recording: "Recording settings", overrides: "Style overrides", background_band: "Background band",
+  app: "App", audio: "Audio input", asr: "Speech recognition", canvas: "Video size", layout: "Position on screen",
+  style: "Text", ndi: "NDI output", captions: "Blocked words",
+  web: "Web UI & remote control", overrides: "Style overrides", background_band: "Background band",
   shadow: "Shadow", stroke: "Stroke (outline)", shortcuts: "Keyboard shortcuts", osc: "OSC input",
 };
 
@@ -120,119 +117,165 @@ const SECTION_TITLES = {
 const LA = { "asr.decoder": ["local_agreement"] };
 const SEG = { "asr.decoder": ["segmenter"] };
 
+// Per-field UI hints. Keys besides label/help/when:
+//   widget   - a WIDGETS entry (else picked from the schema type)
+//   labels   - {enumValue: "friendly label"} for enum dropdowns / segmented
+//   choices  - [[value, label], ...] for the "choice" dropdown; `custom`
+//              (default true) adds an "Other…" entry with a free input
+//   min/max/step/unit - slider range (the schema still validates)
+//   adv      - shown under the section's "Advanced settings" fold
+const SEC = (n) => [[n, `${n} s`]];
 const HINTS = {
-  "app.log_level": { label: "Log level", widget: "select", options: ["DEBUG", "INFO", "WARNING", "ERROR"] },
-  "audio.device": { label: "Input device", widget: "device",
-    help: "\"default\", a microphone (name or part of it), or ndi:<source> to take audio from an NDI source." },
-  "audio.sample_rate": { label: "Sample rate (Hz)" },
-  "audio.frame_ms": { label: "Frame (ms)" },
-  "audio.channels": { label: "Input channels", widget: "intlist",
-    help: "1-based channels averaged into mono: 1 = first channel, 1, 2 = stereo downmix." },
+  "app.log_level": { label: "Log detail", widget: "enum", enumValues: ["DEBUG", "INFO", "WARNING", "ERROR"],
+    labels: { DEBUG: "Debug (everything)", INFO: "Normal", WARNING: "Warnings and errors", ERROR: "Errors only" } },
+  "audio.device": { label: "Input", widget: "device",
+    help: "A microphone or sound card, or an NDI source (its audio). Rescan after plugging something in." },
+  "audio.sample_rate": { label: "Sample rate", widget: "choice", adv: true,
+    choices: [[16000, "16 kHz (speech recognition native)"], [44100, "44.1 kHz"], [48000, "48 kHz"]] },
+  "audio.frame_ms": { label: "Audio frame length", widget: "choice", adv: true,
+    choices: [[10, "10 ms"], [20, "20 ms"], [30, "30 ms (default)"]] },
+  "audio.channels": { label: "Channels to listen to", widget: "choice", customLabel: "Other channels…",
+    choices: [[[1], "Channel 1 (mono / left)"], [[2], "Channel 2 (right)"], [[1, 2], "Channels 1 + 2 mixed (stereo)"]],
+    help: "Which inputs of the device are mixed into the speech signal. Other: a list such as 3, 4." },
   "asr.preset": { label: "Performance preset", widget: "preset" },
-  "asr.model": { label: "Whisper model", widget: "datalist", list: "models",
-    help: "Pick from the list or type a model name / path to a ggml file." },
+  "asr.model": { label: "Whisper model", widget: "model",
+    help: "Bigger models are more accurate and need more GPU. Models not downloaded yet are fetched on first use." },
   "asr.language_whitelist": { label: "Languages", widget: "languages",
-    help: "Empty = detect any language per utterance. One = always that language. Several = the best match per utterance." },
-  "asr.unit": { label: "Processing unit", widget: "unit",
-    help: "Where the model runs. auto = the recommended unit when the worker starts (CUDA > discrete GPU > CPU > integrated GPU). Picking a GPU also records its name and PCI slot, so a shifted index is reported instead of silently using another card. Never changed by the app itself. Changing it restarts the ASR worker." },
+    help: "None = recognise any language. One = always that language. Several = the best match per sentence." },
+  "asr.unit": { label: "Runs on", widget: "unit",
+    help: "Auto picks the best device at start (CUDA > dedicated GPU > CPU > integrated GPU). Changing it restarts speech recognition." },
   "asr.unit_identity": { widget: "hidden" },
-  "asr.vad_threshold": { label: "VAD speech threshold (0-1)", step: 0.05 },
-  "asr.decoder": { label: "Streaming decoder",
-    help: "local_agreement: re-decode a growing window and show what consecutive decodes agree on (words trickle out). segmenter: decode each stretch of speech once when it ends (obs-localvocal style); turn partial captions on for a live preview while it is open. Changing it restarts the ASR worker." },
-  "asr.step_ms": { label: "Decode step (ms)", when: LA },
-  "asr.agreement_passes": { label: "Agreement passes", when: LA },
-  "asr.end_silence_ms": { label: "End silence (ms)" },
-  "asr.max_utterance_ms": { label: "Max utterance (ms)", when: LA },
-  "asr.max_context_seconds": { label: "Max decode window (s)", step: 0.5, when: LA },
-  "asr.prune_history_after_silence_seconds": { label: "Prune off-screen history after silence (s)",
+  "asr.vad_threshold": { label: "Speech detection sensitivity", widget: "slider", min: 0, max: 1, step: 0.05, adv: true,
+    help: "Higher = needs clearer speech before captioning starts (less noise picked up)." },
+  "asr.decoder": { label: "Caption style", widget: "enum",
+    labels: { local_agreement: "Word by word as it is confirmed (default)", segmenter: "Whole phrases after each pause" },
+    help: "Word by word re-reads the audio continuously and shows words once they are stable. Whole phrases decodes each stretch of speech once it ends (turn on partial captions for a live preview). Changing it restarts speech recognition." },
+  "asr.step_ms": { label: "Decode step (ms)", when: LA, adv: true },
+  "asr.agreement_passes": { label: "Agreement passes", when: LA, adv: true },
+  "asr.end_silence_ms": { label: "End of sentence after silence (ms)", adv: true },
+  "asr.max_utterance_ms": { label: "Max utterance (ms)", when: LA, adv: true },
+  "asr.max_context_seconds": { label: "Max decode window (s)", step: 0.5, when: LA, adv: true },
+  "asr.prune_history_after_silence_seconds": { label: "Forget off-screen lines after silence (s)", adv: true,
     help: "Never touches the visible lines." },
-  "asr.wipe_screen_after_silence_seconds": { label: "Wipe screen after silence (s, 0 = off)" },
-  "asr.show_partial_captions": { label: "Show partial captions",
-    help: "Unconfirmed text shown after the captions. With the segmenter it costs extra decodes of the open segment (GPU time); off = none at all." },
-  "asr.vad_preroll_ms": { label: "VAD pre-roll (ms)", when: LA },
-  "asr.prompt_carryover_chars": { label: "Prompt carry-over (chars, 0 = off)", when: LA },
-  "asr.segmentation_mode": { label: "Segmentation", when: SEG,
-    help: "vad: a segment per stretch of speech. hybrid: fixed-length segments, previews only while speech is heard. fixed: fixed-length segments, no VAD (the silence timers never fire)." },
-  "asr.partial_latency_ms": { label: "Partial preview every (ms)", when: { ...SEG, "asr.show_partial_captions": [true] },
-    help: "Re-decode the open segment for display after this much new audio; grows with the segment's length and gives way when the GPU is busy." },
-  "asr.segment_duration_ms": { label: "Segment length (ms)", when: { ...SEG, "asr.segmentation_mode": ["hybrid", "fixed"] } },
-  "asr.max_segment_ms": { label: "Longest segment (ms)", when: { ...SEG, "asr.segmentation_mode": ["vad"] },
-    help: "Continuous speech is cut here (at a short pause once 60% full) and continues in the next segment; nothing is lost." },
-  "asr.context_sentences": { label: "Earlier captions as context (0 = none)", when: SEG,
-    help: "The last N captions are given to whisper as the prompt for the next segment; reset by a screen wipe and on a language change." },
-  "asr.min_mean_token_p": { label: "Min. token confidence (0-1, 0 = off)", step: 0.05 },
-  "asr.max_timestamp_ratio": { label: "Hallucination timestamp ratio (0 = off)", step: 0.25 },
-  "asr.strip_bracketed_annotations": { label: "Drop [bracketed] sound annotations" },
-  "asr.text_filters": { label: "Text filters (regex find → replace)", widget: "rows",
+  "asr.wipe_screen_after_silence_seconds": { label: "Clear the screen after silence", widget: "choice",
+    choices: [[0, "Never (keep the last captions)"], ...SEC(10), ...SEC(20), ...SEC(30), [60, "1 minute"], [120, "2 minutes"]],
+    customLabel: "Other (seconds)…" },
+  "asr.show_partial_captions": { label: "Show unconfirmed words",
+    help: "Shows text before it is confirmed (it may still change). With whole-phrase captions this costs extra GPU time." },
+  "asr.vad_preroll_ms": { label: "VAD pre-roll (ms)", when: LA, adv: true },
+  "asr.prompt_carryover_chars": { label: "Prompt carry-over (chars, 0 = off)", when: LA, adv: true },
+  "asr.segmentation_mode": { label: "Phrase cutting", when: SEG, adv: true,
+    labels: { vad: "At speech pauses (default)", hybrid: "Fixed length, while speech is heard", fixed: "Fixed length, always (no silence detection)" } },
+  "asr.partial_latency_ms": { label: "Partial preview every (ms)", when: { ...SEG, "asr.show_partial_captions": [true] }, adv: true,
+    help: "Re-decode the open phrase for display after this much new audio; grows with the phrase's length and gives way when the GPU is busy." },
+  "asr.segment_duration_ms": { label: "Phrase length (ms)", when: { ...SEG, "asr.segmentation_mode": ["hybrid", "fixed"] }, adv: true },
+  "asr.max_segment_ms": { label: "Longest phrase (ms)", when: { ...SEG, "asr.segmentation_mode": ["vad"] }, adv: true,
+    help: "Continuous speech is cut here (at a short pause once 60% full) and continues in the next phrase; nothing is lost." },
+  "asr.context_sentences": { label: "Earlier captions as context", when: SEG, adv: true, widget: "choice",
+    choices: [[0, "None"], [1, "1 caption (default)"], [2, "2 captions"], [3, "3 captions"]],
+    help: "The last captions are given to whisper as a hint for the next phrase; reset by a screen wipe and on a language change." },
+  "asr.min_mean_token_p": { label: "Min. confidence (0 = off)", widget: "slider", min: 0, max: 1, step: 0.05, adv: true },
+  "asr.max_timestamp_ratio": { label: "Hallucination timestamp ratio (0 = off)", step: 0.25, adv: true },
+  "asr.strip_bracketed_annotations": { label: "Hide [sound] annotations such as [music]" },
+  "asr.text_filters": { label: "Find and replace (regex)", widget: "rows", adv: true,
     help: "Case-insensitive regular expressions applied before anything is captioned; an empty replacement deletes the match." },
-  "asr.vocabulary": { label: "Vocabulary (one per line)", widget: "lines",
-    help: "Names, places and jargon put at the front of whisper's prompt." },
-  "asr.vocabulary_list": { label: "Saved vocabulary list", widget: "vocablist",
-    help: "Merged with the vocabulary above. Lists live in <config dir>/vocabulary/." },
-  "asr.vocabulary_snap": { label: "Snap near-miss spellings to the vocabulary" },
-  "asr.flash_attn": { label: "Flash attention (may crash some GPU drivers)" },
-  "asr.dtw_word_timestamps": { label: "Exact word times for transcripts (DTW, slower decodes)",
-    help: "Aligns transcript/recording cue times with whisper's DTW; about 20% more decode time. Ignored while flash attention is on." },
-  "canvas.width_px": { label: "Width (px)" },
-  "canvas.height_px": { label: "Height (px)" },
-  "canvas.background_color": { label: "Stream background (RGBA)" },
-  "layout.max_lines": { label: "Max lines" },
-  "layout.margin_top_pct": { label: "Margin top (%)", step: 0.5 },
-  "layout.margin_bottom_pct": { label: "Margin bottom (%)", step: 0.5 },
-  "layout.margin_left_pct": { label: "Margin left (%)", step: 0.5 },
-  "layout.margin_right_pct": { label: "Margin right (%)", step: 0.5 },
-  "layout.interline_pct": { label: "Interline (% of canvas height)", step: 0.1 },
-  "layout.vertical_align_within_box": { label: "Vertical align" },
-  "layout.pacing": { label: "Typewriter pacing",
-    help: "Reveal captions per character, word or sentence (faster when text backs up; a caption arriving alone appears at once). off = show each caption as it arrives." },
-  "style.font_family": { label: "Font file", widget: "datalist", list: "fonts" },
-  "style.font_color": { label: "Font color (RGBA)" },
-  "ndi.source_name": { label: "NDI source name" },
-  "ndi.fps": { label: "Frame rate (fps)" },
-  "transcript.enabled": { label: "Save a transcript (one file per session)" },
-  "transcript.directory": { label: "Folder", widget: "transcriptdir" },
-  "captions.blocklist": { label: "Blocklist (one word per line)", widget: "lines",
+  "asr.vocabulary": { label: "Names and terms (one per line)", widget: "lines",
+    help: "Names, places and jargon the recogniser should expect." },
+  "asr.vocabulary_list": { label: "Saved term list", widget: "vocablist",
+    help: "Used together with the terms above. Lists live in <config dir>/vocabulary/." },
+  "asr.vocabulary_snap": { label: "Correct near-miss spellings to these terms" },
+  "asr.flash_attn": { label: "Flash attention (may crash some GPU drivers)", adv: true },
+  "asr.dtw_word_timestamps": { label: "Exact word times (DTW, slower decodes)", adv: true,
+    help: "Caption-event word times from whisper's DTW alignment; about 20% more decode time. Ignored while flash attention is on." },
+  "canvas.width_px": { label: "Resolution", widget: "resolution" },
+  "canvas.height_px": { widget: "hidden" },
+  "canvas.background_color": { label: "Video background", widget: "rgba", adv: true,
+    help: "Normally fully transparent, so the captions sit over the picture in OBS / vMix." },
+  "layout.max_lines": { label: "Lines on screen", widget: "choice",
+    choices: [[1, "1 line"], [2, "2 lines"], [3, "3 lines"], [4, "4 lines"]], customLabel: "More…",
+    help: "The text size follows from the caption area's height and the number of lines." },
+  "layout.margin_top_pct": { label: "Top margin", widget: "slider", min: 0, max: 95, step: 0.5, unit: "%" },
+  "layout.margin_bottom_pct": { label: "Bottom margin", widget: "slider", min: 0, max: 95, step: 0.5, unit: "%" },
+  "layout.margin_left_pct": { label: "Left margin", widget: "slider", min: 0, max: 45, step: 0.5, unit: "%" },
+  "layout.margin_right_pct": { label: "Right margin", widget: "slider", min: 0, max: 45, step: 0.5, unit: "%" },
+  "layout.interline_pct": { label: "Line spacing", widget: "slider", min: 0, max: 10, step: 0.1, unit: "%",
+    help: "Gap between lines, in % of the picture height." },
+  "layout.text_align": { label: "Text alignment", widget: "segmented", labels: { left: "Left", center: "Centre", right: "Right" } },
+  "layout.vertical_align_within_box": { label: "Vertical position", widget: "segmented",
+    labels: { top: "Top", center: "Middle", bottom: "Bottom" } },
+  "layout.pacing": { label: "Typewriter effect",
+    labels: { off: "Off (show captions at once)", char: "Letter by letter", word: "Word by word", sentence: "Sentence by sentence", smooth: "Smooth (steady letter flow)" },
+    help: "Reveals captions gradually (faster when text backs up; a caption arriving alone appears at once). Smooth types at an even pace matched to how often captions arrive, so bursts flow out continuously." },
+  "style.font_family": { label: "Font", widget: "font" },
+  "style.font_color": { label: "Text colour", widget: "rgba" },
+  "style.overrides": { widget: "effects" },
+  "style.overrides.background_band": { label: "Box behind text", toggle: "enabled",
+    intro: "A tinted box behind each line. The most readable on busy pictures." },
+  "style.overrides.background_band.shape": { label: "Corners", widget: "segmented", labels: { pill: "Rounded", rectangle: "Square" } },
+  "style.overrides.background_band.color": { label: "Box colour", widget: "rgba" },
+  "style.overrides.background_band.corner_radius_pct": { label: "Roundness", widget: "slider", min: 0, max: 5, step: 0.1,
+    when: { "style.overrides.background_band.shape": ["pill"] } },
+  "style.overrides.background_band.padding_pct": { label: "Side padding", widget: "slider", min: 0, max: 5, step: 0.1 },
+  "style.overrides.shadow": { label: "Drop shadow", toggle: "enabled",
+    intro: "A soft shadow under the letters. Subtle; good together with an outline." },
+  "style.overrides.shadow.offset_x_pct": { label: "Shift right", widget: "slider", min: -2, max: 2, step: 0.05 },
+  "style.overrides.shadow.offset_y_pct": { label: "Shift down", widget: "slider", min: -2, max: 2, step: 0.05 },
+  "style.overrides.shadow.blur_px": { label: "Softness", widget: "slider", min: 0, max: 20, step: 1, unit: "px" },
+  "style.overrides.shadow.color": { label: "Shadow colour", widget: "rgba" },
+  "style.overrides.stroke": { label: "Outline", toggle: "enabled",
+    intro: "A thin border around every letter. Keeps text readable without covering the picture." },
+  "style.overrides.stroke.width_px": { label: "Thickness", widget: "slider", min: 0, max: 12, step: 1, unit: "px" },
+  "style.overrides.stroke.color": { label: "Outline colour", widget: "rgba" },
+  "ndi.source_name": { label: "Source name", help: "The name OBS, vMix or Studio Monitor list this caption feed under." },
+  "ndi.fps": { label: "Frame rate", widget: "choice",
+    choices: [[25, "25 fps"], [29.97, "29.97 fps"], [30, "30 fps"], [50, "50 fps"], [59.94, "59.94 fps"], [60, "60 fps"]] },
+  "captions.blocklist": { label: "Blocked words (one per line)", widget: "lines",
     help: "Whole words, case- and diacritics-blind; a trailing * matches every word starting with the stem (kurw*)." },
   "captions.blocklist_builtin": { label: "Also use the bundled Polish/English starter list" },
-  "captions.blocklist_action": { label: "Blocked words are" },
-  "recording.record_on_start": { label: "Start recording when the app starts",
-    help: "Recording captures people speaking: get their consent first." },
-  "recording.directory": { label: "Folder", help: "Empty = var/recordings in the narrator folder." },
-  "recording.retention_days": { label: "Delete recordings older than (days, 0 = never)" },
-  "recording.min_free_disk_mb": { label: "Minimum free disk space (MB)",
-    help: "Recording will not start, and stops, below this." },
-  "recording.on_air_dot": { label: "Red recording dot in the NDI output" },
-  "recording.draft_enabled": { label: "Generate a draft transcript after each recording" },
-  "recording.draft_model": { label: "Draft model", widget: "datalist", list: "models",
-    help: "Offline best-effort pass (large-v3 recommended); it must already be downloaded." },
-  "recording.draft_device": { label: "Draft device" },
-  "recording.draft_max_asr_busy": { label: "Run drafts next to live ASR up to this load (0-1)", step: 0.05,
-    help: "0 = only while live ASR is stopped. Generate draft now ignores it." },
-  "web.enabled": { label: "Web UI enabled", help: "Turning this off stops this page; re-enable in config.yaml." },
-  "web.bind": { label: "Bind address", help: "Keep 127.0.0.1. Reach it remotely through an SSH tunnel or Tailscale." },
-  "web.port": { label: "Port" },
-  "web.allowed_hosts": { label: "Extra allowed host names (one per line)", widget: "lines",
-    help: "Host headers accepted besides localhost / 127.0.0.1 (DNS-rebinding guard)." },
-  "web.preview_fps": { label: "Preview frame rate cap (fps)" },
+  "captions.blocklist_action": { label: "Blocked words are",
+    labels: { mask: "Masked (k***a)", replace: "Replaced with the text below", drop: "Removed" } },
+  "captions.blocklist_replacement": { label: "Replacement text", when: { "captions.blocklist_action": ["replace"] } },
+  "web.enabled": { label: "Web UI enabled", adv: true, help: "Turning this off stops this page; re-enable in config.yaml." },
+  "web.port": { label: "Port", adv: true },
+  "web.preview_fps": { label: "Preview refresh rate", widget: "choice",
+    choices: [[1, "1 fps"], [2, "2 fps"], [5, "5 fps (default)"], [10, "10 fps"], [15, "15 fps"], [30, "30 fps"]] },
   "web.shortcuts.clear": { label: "Clear captions", widget: "shortcut" },
   "web.shortcuts.mode_toggle": { label: "Auto / manual switch", widget: "shortcut" },
   "web.shortcuts.focus_entry": { label: "Focus manual entry", widget: "shortcut" },
   "web.shortcuts.submit": { label: "Send manual caption", widget: "shortcut",
     help: "Without Ctrl/Alt/Meta it fires only while the manual entry has focus." },
   "web.shortcuts.pause_toggle": { label: "Pause / resume captions", widget: "shortcut" },
-  "web.shortcuts.recording_toggle": { label: "Recording on / off", widget: "shortcut" },
   "web.shortcuts.help": { label: "Show this cheat sheet", widget: "shortcut" },
   "web.api_tokens": { label: "API tokens (Companion, scripts)", widget: "rows", generate: "token",
-    help: "Each integration gets its own token for the control API (state, clear, mode, manual text, pause, recording). Delete a row and Save to revoke." },
-  "web.osc.enabled": { label: "OSC input enabled", help: "UDP, no authentication: keep it on 127.0.0.1." },
-  "web.osc.bind": { label: "OSC bind address" },
-  "web.osc.port": { label: "OSC UDP port" },
+    help: "Each integration gets its own token for the control API (state, clear, mode, manual text, pause). Delete a row and Save to revoke." },
+  "web.osc.enabled": { label: "OSC input enabled", help: "UDP, no authentication: keep it on this computer." },
+  "web.osc.bind": { label: "Listen on", widget: "choice", when: { "web.osc.enabled": [true] },
+    choices: [["127.0.0.1", "This computer only (127.0.0.1)"], ["0.0.0.0", "All networks (0.0.0.0)"]], customLabel: "Other address…" },
+  "web.osc.port": { label: "OSC UDP port", when: { "web.osc.enabled": [true] } },
+};
+
+// Display order of a section's fields (unlisted fields follow, schema order).
+const FIELD_ORDER = {
+  asr: ["preset", "model", "unit", "language_whitelist", "decoder", "show_partial_captions",
+    "wipe_screen_after_silence_seconds", "strip_bracketed_annotations", "vocabulary", "vocabulary_list", "vocabulary_snap"],
+};
+
+// One line under a section's title: what it is for.
+const SECTION_INTROS = {
+  audio: "Where the speech comes from.",
+  asr: "How speech is turned into text. The preset sets sensible values for this computer; most of the rest can stay as it is.",
+  canvas: "The size of the caption video sent over NDI.",
+  layout: "Where the captions sit on the picture. Drag the margins and watch the dashed box in the preview.",
+  style: "How the caption text looks.",
+  ndi: "The caption video other programs receive (transparent background).",
+  captions: "Words that must never appear on screen.",
+  web: "This page, keyboard shortcuts and remote control (Companion, OSC).",
 };
 
 const ACTION_LABELS = {
   clear: "Clear captions", mode_toggle: "Auto / manual switch", focus_entry: "Focus manual entry",
   submit: "Send manual caption", pause_toggle: "Pause / resume captions",
-  recording_toggle: "Recording on / off", help: "Show this cheat sheet",
+  help: "Show this cheat sheet",
 };
 
 function resolve(schema) {
@@ -291,21 +334,98 @@ function parseNumber(raw, integer) {
   return n;
 }
 
-function renderObject(schema, path, container) {
+// Which "Advanced settings" folds are open (kept across re-renders).
+const openFolds = new Set();
+
+function renderObject(schema, path, container, extraWhen = null) {
   const s = resolve(schema);
-  for (const [key, propSchema] of Object.entries(s.properties || {})) {
+  let fold = null; // this level's "Advanced settings" (created on first use)
+  const advanced = () => {
+    if (!fold) {
+      const key = pathId(path);
+      fold = el("details", { class: "advanced", open: openFolds.has(key),
+        ontoggle: (e) => { if (e.target.open) openFolds.add(key); else openFolds.delete(key); } },
+        el("summary", { text: "Advanced settings" }));
+    }
+    return fold;
+  };
+  const order = FIELD_ORDER[pathId(path)] || [];
+  const rank = (k) => (order.includes(k) ? order.indexOf(k) : order.length);
+  const entries = Object.entries(s.properties || {}).map((e, i) => [e, i])
+    .sort(([[a], i], [[b], j]) => rank(a) - rank(b) || i - j).map(([e]) => e);
+  for (const [key, propSchema] of entries) {
     const childPath = [...path, key];
+    const id = pathId(childPath);
+    const hint = HINTS[id] || {};
     const child = resolve(propSchema);
-    if (child.properties) {
-      const fs = el("fieldset", { "data-path": pathId(childPath) },
-        el("legend", { text: SECTION_TITLES[key] || humanize(key) }));
-      fs.append(el("div", { class: "err", id: "e-" + pathId(childPath) }));
-      renderObject(child, childPath, fs);
+    if (hint.widget === "effects") {
+      container.append(buildEffects(child, childPath));
+    } else if (child.properties) {
+      const fs = hint.toggle ? buildToggleCard(child, childPath, hint) : (() => {
+        const box = el("fieldset", { "data-path": id }, el("legend", { text: hint.label || SECTION_TITLES[key] || humanize(key) }));
+        box.append(el("div", { class: "err", id: "e-" + id }));
+        renderObject(child, childPath, box, extraWhen);
+        return box;
+      })();
       container.append(fs);
     } else {
-      container.append(renderField(childPath, child));
+      const row = renderField(childPath, child, extraWhen);
+      (hint.adv ? advanced() : container).append(row);
     }
   }
+  if (fold) container.append(fold);
+}
+
+// A sub-section that is switched on/off by one of its boolean fields (the
+// text effects): a switch in the title, the other fields only while on.
+function buildToggleCard(schema, path, hint) {
+  const id = pathId(path);
+  const flagPath = [...path, hint.toggle];
+  const on = !!getPath(S.config, flagPath);
+  const card = el("fieldset", { class: "card" + (on ? " on" : ""), "data-path": id });
+  const sw = el("input", { type: "checkbox", class: "switch", id: "f-" + pathId(flagPath), checked: on,
+    onchange: (e) => { card.classList.toggle("on", e.target.checked); onValue(flagPath, e.target.checked); } });
+  card.append(el("legend", {}, el("label", { class: "card-title" }, sw, hint.label || humanize(path[path.length - 1]))));
+  if (hint.intro) card.append(el("p", { class: "help card-intro", text: hint.intro }));
+  card.append(el("div", { class: "err", id: "e-" + id }), el("div", { class: "err", id: "e-" + pathId(flagPath) }));
+  const body = el("div", { class: "card-body", "data-when": JSON.stringify({ [pathId(flagPath)]: [true] }) });
+  const rest = { ...schema, properties: Object.fromEntries(Object.entries(schema.properties).filter(([k]) => k !== hint.toggle)) };
+  renderObject(rest, path, body);
+  card.append(body);
+  return card;
+}
+
+// Text effects (style.overrides): quick looks + one switchable card per effect.
+const LOOKS = [
+  ["Plain", { background_band: false, shadow: false, stroke: false }],
+  ["Outline", { background_band: false, shadow: false, stroke: true }],
+  ["Outline + shadow", { background_band: false, shadow: true, stroke: true }],
+  ["Box", { background_band: true, shadow: false, stroke: false }],
+  ["Box + outline", { background_band: true, shadow: false, stroke: true }],
+];
+
+function buildEffects(schema, path) {
+  const wrap = el("fieldset", { class: "effects", "data-path": pathId(path) },
+    el("legend", { text: "Text effects" }),
+    el("p", { class: "help", text: "Effects that keep the captions readable over any picture. Pick a look, then fine-tune it below — the preview shows the result before you save." }));
+  const flags = () => Object.fromEntries(Object.keys(LOOKS[0][1]).map((k) => [k, !!getPath(S.config, [...path, k, "enabled"])]));
+  const looks = el("div", { class: "looks", role: "group", "aria-label": "Quick looks" });
+  const drawLooks = () => {
+    const now = flags();
+    looks.replaceChildren(el("span", { class: "small muted", text: "Quick look:" }), ...LOOKS.map(([name, set]) => el("button", {
+      type: "button", text: name, "aria-pressed": String(same(now, set)),
+      onclick: () => {
+        for (const [k, v] of Object.entries(set)) setPath(S.config, [...path, k, "enabled"], v);
+        onValue([...path, "stroke", "enabled"], set.stroke, { rebuild: true });
+      } })));
+  };
+  drawLooks();
+  wrap.append(looks, el("div", { class: "err", id: "e-" + pathId(path) }));
+  const cards = el("div", { class: "cards" });
+  renderObject(schema, path, cards);
+  wrap.append(cards);
+  wrap.addEventListener("change", drawLooks);
+  return wrap;
 }
 
 function widgetFor(id, s, hint) {
@@ -324,7 +444,7 @@ function widgetFor(id, s, hint) {
   return "text";
 }
 
-function renderField(path, s) {
+function renderField(path, s, extraWhen = null) {
   const id = pathId(path);
   const hint = HINTS[id] || {};
   const widget = widgetFor(id, s, hint);
@@ -332,6 +452,7 @@ function renderField(path, s) {
   const inputId = "f-" + id;
   const control = el("div", { class: "control" });
   const wide = ["rows", "lines", "languages"].includes(widget);
+  if (widget === "checkbox") return renderSwitchRow(path, id, inputId, hint, value, extraWhen);
   const row = el("div", { class: "field" + (wide ? " wide" : ""), "data-path": id });
   const label = el("label", { for: inputId, text: hint.label || humanize(path[path.length - 1]) });
   const builder = WIDGETS[widget] || WIDGETS.text;
@@ -339,8 +460,24 @@ function renderField(path, s) {
   row.append(label, control);
   if (widget === "hidden") row.hidden = true; // set by another widget (asr.unit_identity by the unit picker)
   if (hint.help) row.append(el("div", { class: "help", text: hint.help }));
+  // A hidden field's errors go to its section (it has no visible row).
+  if (widget !== "hidden") row.append(el("div", { class: "err", id: "e-" + id }));
+  const when = { ...(extraWhen || {}), ...(hint.when || {}) };
+  if (Object.keys(when).length) row.dataset.when = JSON.stringify(when);
+  return row;
+}
+
+// Booleans: a switch with its label beside it (the whole row is clickable).
+function renderSwitchRow(path, id, inputId, hint, value, extraWhen) {
+  const row = el("div", { class: "field switch-row", "data-path": id });
+  row.append(el("label", { class: "switch-label", for: inputId },
+    el("input", { type: "checkbox", class: "switch", id: inputId, checked: !!value,
+      onchange: (e) => onValue(path, e.target.checked) }),
+    el("span", { text: hint.label || humanize(path[path.length - 1]) })));
+  if (hint.help) row.append(el("div", { class: "help", text: hint.help }));
   row.append(el("div", { class: "err", id: "e-" + id }));
-  if (hint.when) row.dataset.when = JSON.stringify(hint.when);
+  const when = { ...(extraWhen || {}), ...(hint.when || {}) };
+  if (Object.keys(when).length) row.dataset.when = JSON.stringify(when);
   return row;
 }
 
@@ -350,8 +487,8 @@ function applyConditions() {
   for (const row of document.querySelectorAll("[data-when]")) {
     const when = JSON.parse(row.dataset.when);
     const ok = Object.entries(when).every(([p, values]) => values.includes(getPath(S.config, p.split("."))));
-    const err = row.querySelector(".err");
-    row.hidden = !ok && !(err && err.textContent);
+    const err = [...row.querySelectorAll(".err")].some((e) => e.textContent);
+    row.hidden = !ok && !err;
   }
 }
 
@@ -372,8 +509,124 @@ const WIDGETS = {
     control.append(el("input", { type: "checkbox", id: inputId, checked: !!value,
       onchange: (e) => onValue(path, e.target.checked) }));
   },
-  enum({ path, inputId, value, control, s }) {
-    control.append(selectOf(inputId, s.enum.map((v) => [v, v]), value, (v) => onValue(path, v)));
+  enum({ path, inputId, value, control, s, hint }) {
+    const values = hint.enumValues || s.enum;
+    const labels = hint.labels || {};
+    const all = values.includes(value) ? values : [value, ...values];
+    control.append(selectOf(inputId, all.map((v) => [v, labels[v] || v]), value, (v) => onValue(path, v)));
+  },
+  segmented({ path, inputId, value, control, s, hint }) {
+    const labels = hint.labels || {};
+    const group = el("div", { class: "segmented", role: "group", id: inputId });
+    const draw = (current) => group.replaceChildren(...s.enum.map((v) => el("button", {
+      type: "button", text: labels[v] || v, "aria-pressed": String(v === current),
+      onclick: () => { onValue(path, v); draw(v); } })));
+    draw(value);
+    control.append(group);
+  },
+  // A dropdown of common values (hint.choices) plus "Other…" with a free input.
+  choice({ path, inputId, value, control, s, hint }) {
+    const options = hint.choices;
+    const isList = s.type === "array";
+    const numeric = s.type === "integer" || s.type === "number";
+    const fmt = (v) => (Array.isArray(v) ? v.join(", ") : v ?? "");
+    const parse = (raw) => {
+      if (isList) return raw.split(/[,\s]+/).filter(Boolean).map((p) => (/^-?\d+$/.test(p) ? Number(p) : p));
+      return numeric ? parseNumber(raw, s.type === "integer") : raw;
+    };
+    const index = options.findIndex(([v]) => same(v, value));
+    const custom = el("input", { type: numeric ? "number" : "text", class: "custom-input", value: fmt(value),
+      step: numeric ? (s.type === "integer" ? 1 : "any") : undefined, "aria-label": `${hint.label || ""} (other value)`,
+      hidden: index >= 0, oninput: (e) => onValue(path, parse(e.target.value)) });
+    const select = el("select", { id: inputId, onchange: (e) => {
+      if (e.target.value === "other") {
+        custom.hidden = false;
+        custom.focus();
+        onValue(path, parse(custom.value));
+      } else {
+        const v = clone(options[Number(e.target.value)][0]);
+        custom.hidden = true;
+        custom.value = fmt(v);
+        onValue(path, v);
+      }
+    } }, options.map(([, label], i) => el("option", { value: String(i), text: label })),
+      hint.custom === false ? null : el("option", { value: "other", text: hint.customLabel || "Other…" }));
+    select.value = index >= 0 ? String(index) : "other";
+    control.append(select, custom);
+  },
+  slider({ path, inputId, value, control, s, hint }) {
+    const integer = s.type === "integer";
+    const step = hint.step ?? (integer ? 1 : 0.1);
+    const num = el("input", { type: "number", id: inputId, class: "slider-num", value: value ?? "", step,
+      min: s.minimum ?? s.exclusiveMinimum, max: s.maximum ?? s.exclusiveMaximum });
+    const range = el("input", { type: "range", class: "slider", min: hint.min ?? 0, max: hint.max ?? 100, step,
+      value: value ?? 0, "aria-label": hint.label || "" });
+    range.addEventListener("input", () => { num.value = range.value; onValue(path, parseNumber(range.value, integer)); });
+    num.addEventListener("input", () => { range.value = num.value; onValue(path, parseNumber(num.value, integer)); });
+    control.append(range, num);
+    if (hint.unit) control.append(el("span", { class: "small muted unit", text: hint.unit }));
+  },
+  resolution({ inputId, control }) {
+    const RES = [[1920, 1080, "1920 × 1080 — Full HD"], [1280, 720, "1280 × 720 — HD"],
+      [2560, 1440, "2560 × 1440 — QHD"], [3840, 2160, "3840 × 2160 — 4K UHD"], [1080, 1920, "1080 × 1920 — vertical"]];
+    const w = getPath(S.config, ["canvas", "width_px"]), h = getPath(S.config, ["canvas", "height_px"]);
+    const index = RES.findIndex(([rw, rh]) => rw === w && rh === h);
+    const num = (key, v) => el("input", { type: "number", class: "res-num", value: v ?? "", step: 1, min: 1,
+      "aria-label": key === "width_px" ? "Width (px)" : "Height (px)",
+      oninput: (e) => onValue(["canvas", key], parseNumber(e.target.value, true)) });
+    const custom = el("span", { class: "res-custom", hidden: index >= 0 },
+      num("width_px", w), el("span", { class: "muted", text: "×" }), num("height_px", h), el("span", { class: "small muted", text: "px" }));
+    const select = el("select", { id: inputId, onchange: (e) => {
+      if (e.target.value === "other") { custom.hidden = false; return; }
+      const [rw, rh] = RES[Number(e.target.value)];
+      setPath(S.config, ["canvas", "height_px"], rh);
+      onValue(["canvas", "width_px"], rw, { rebuild: true });
+    } }, RES.map(([, , label], i) => el("option", { value: String(i), text: label })), el("option", { value: "other", text: "Custom size…" }));
+    select.value = index >= 0 ? String(index) : "other";
+    control.append(select, custom);
+  },
+  model({ path, inputId, value, control }) {
+    const select = el("select", { id: inputId });
+    const custom = el("input", { type: "text", class: "custom-input", value: value ?? "", hidden: true,
+      placeholder: "Model name or path to a ggml .bin file", "aria-label": "Model name or file",
+      oninput: (e) => onValue(path, e.target.value.trim()) });
+    const fill = () => {
+      const current = getPath(S.config, path);
+      const catalog = S.choices.catalog || [];
+      const info = (m) => catalog.find((c) => c.model === m);
+      const names = (S.choices.models || []).filter((m) => modelFitsUnit(m) || m === current);
+      const label = (m) => {
+        const c = info(m);
+        const note = MODEL_NOTES[m];
+        const size = c && c.size_mb ? ` · ${c.size_mb >= 1000 ? (c.size_mb / 1000).toFixed(1) + " GB" : Math.round(c.size_mb) + " MB"}` : "";
+        return `${m}${note ? ` — ${note}` : ""}${size}`;
+      };
+      const installed = names.filter((m) => info(m)?.installed);
+      const rest = names.filter((m) => !info(m)?.installed);
+      select.replaceChildren(...[
+        installed.length ? el("optgroup", { label: "On this computer" }, installed.map((m) => el("option", { value: m, text: label(m) }))) : null,
+        rest.length ? el("optgroup", { label: "Downloaded on first use" }, rest.map((m) => el("option", { value: m, text: label(m) }))) : null,
+        el("option", { value: "\u0000other", text: "Other model file…" })].filter(Boolean));
+      const known = names.includes(current);
+      select.value = known ? current : "\u0000other";
+      custom.hidden = known;
+    };
+    select.addEventListener("change", (e) => {
+      if (e.target.value === "\u0000other") { custom.hidden = false; custom.focus(); return; }
+      custom.hidden = true;
+      custom.value = e.target.value;
+      onValue(path, e.target.value);
+    });
+    refreshModelOptions = fill;
+    fill();
+    control.append(select, custom);
+  },
+  font({ path, inputId, value, control }) {
+    const fonts = S.choices.fonts || [];
+    const pretty = (f) => String(f).split("/").pop().replace(/\.(ttf|otf)$/i, "")
+      .replace(/[-_]/g, " ").replace(/([a-z])([A-Z])/g, "$1 $2");
+    control.append(WIDGETS_choiceOf({ path, inputId, value, options: fonts.map((f) => [f, pretty(f)]),
+      customLabel: "Other font file…", placeholder: "Path to a .ttf / .otf file" }));
   },
   select({ path, inputId, value, control, hint }) {
     const options = hint.options.includes(value) ? hint.options : [value, ...hint.options];
@@ -405,29 +658,32 @@ const WIDGETS = {
       setPath(S.config, ["asr", "unit_identity"], unit && unit.kind !== "cpu" ? unit.identity : "");
       onValue(path, e.target.value);
       refreshUnits(true);
+      refreshModelOptions(); // the model list offers only models that run on the chosen unit
     } });
     const note = el("div", { class: "help", id: "unit-note" });
-    const table = el("table", { class: "rec-table units", id: "unit-table" });
-    control.append(select, note, table);
-    unitsKey = null;
-    refreshUnits(true);
+    control.append(select, note);
+    // Fill THIS select: it is not in the page yet, and a re-render (after a
+    // Save) still has the old select with the same id there -- looking it up
+    // by id filled the old one and left this one empty.
+    refreshUnits(true, select, note);
   },
   device({ path, inputId, value, control }) {
-    const listId = "dl-" + inputId;
-    const list = el("datalist", { id: listId }, S.devices.map((v) => el("option", { value: v })));
-    control.append(
-      el("input", { type: "text", id: inputId, value: value ?? "", list: listId,
-        oninput: (e) => onValue(path, e.target.value) }),
-      list,
-      el("button", { type: "button", text: "Rescan", title: "Re-list microphones and NDI sources",
-        onclick: async (e) => {
-          e.target.disabled = true;
-          await loadDevices(true);
-          list.replaceChildren(...S.devices.map((v) => el("option", { value: v })));
-          e.target.disabled = false;
-          toast(`${S.devices.length} input(s) found`);
-        } }),
-    );
+    const deviceOptions = () => [["default", "System default input"],
+      ...S.devices.filter((d) => d !== "default").map((d) => [d, d.startsWith("ndi:") ? `NDI source: ${d.slice(4)}` : d])];
+    let box = WIDGETS_choiceOf({ path, inputId, value, options: deviceOptions(), customLabel: "Other (type a name)…",
+      placeholder: "Device name, part of it, or ndi:<source>", missingLabel: (v) => `${v} (not found now)` });
+    control.append(box, el("button", { type: "button", text: "Rescan", title: "Re-list microphones and NDI sources",
+      onclick: async (e) => {
+        e.target.disabled = true;
+        await loadDevices(true);
+        const fresh = WIDGETS_choiceOf({ path, inputId, value: getPath(S.config, path), options: deviceOptions(),
+          customLabel: "Other (type a name)…", placeholder: "Device name, part of it, or ndi:<source>",
+          missingLabel: (v) => `${v} (not found now)` });
+        box.replaceWith(fresh);
+        box = fresh;
+        e.target.disabled = false;
+        toast(`${S.devices.length} input(s) found`);
+      } }));
   },
   intlist({ path, inputId, value, control }) {
     control.append(el("input", { type: "text", id: inputId, value: (value || []).join(", "),
@@ -494,24 +750,30 @@ const WIDGETS = {
     draw();
     control.append(chips, picker, add);
   },
+  // Colour + opacity; the #RRGGBBAA text stays editable for exact values.
   rgba({ path, inputId, value, control }) {
-    const text = el("input", { type: "text", id: inputId, value: value ?? "", class: "rgba-text",
-      oninput: (e) => { onValue(path, e.target.value); syncPickers(); } });
-    const color = el("input", { type: "color", class: "swatch", "aria-label": "Color" });
+    const color = el("input", { type: "color", class: "swatch", id: inputId, "aria-label": "Colour" });
     const alpha = el("input", { type: "range", min: 0, max: 255, class: "alpha", "aria-label": "Opacity" });
+    const pct = el("span", { class: "small muted alpha-pct" });
+    const text = el("input", { type: "text", value: value ?? "", class: "rgba-text", "aria-label": "Colour code #RRGGBBAA",
+      title: "Colour code #RRGGBBAA (the last two digits are the opacity)",
+      oninput: (e) => { onValue(path, e.target.value); syncPickers(); } });
     const syncPickers = () => {
       const m = /^#([0-9a-f]{6})([0-9a-f]{2})$/i.exec(text.value);
       if (m) { color.value = "#" + m[1].toLowerCase(); alpha.value = parseInt(m[2], 16); }
+      pct.textContent = `${Math.round((Number(alpha.value) / 255) * 100)}% opaque`;
+      alpha.style.setProperty("--swatch", color.value);
     };
     const fromPickers = () => {
       const a = Number(alpha.value).toString(16).padStart(2, "0").toUpperCase();
       text.value = color.value.toUpperCase() + a;
+      syncPickers();
       onValue(path, text.value);
     };
     color.addEventListener("input", fromPickers);
     alpha.addEventListener("input", fromPickers);
     syncPickers();
-    control.append(color, alpha, text);
+    control.append(color, el("span", { class: "alpha-wrap" }, alpha, pct), text);
   },
   shortcut({ path, inputId, value, control }) {
     const input = el("input", { type: "text", id: inputId, value: value ?? "", class: "shortcut",
@@ -539,7 +801,7 @@ const WIDGETS = {
     const note = el("div", { class: "help" });
     const showNote = (name) => {
       const p = presets.find((x) => x.name === name);
-      note.textContent = p ? p.note : "Model, decode step and agreement passes are set individually below.";
+      note.textContent = p ? p.note : "No preset: the model is chosen below, decode timing under Advanced settings.";
     };
     const select = selectOf(inputId, options, value ?? "custom", (name) => {
       const p = presets.find((x) => x.name === name);
@@ -560,25 +822,44 @@ const WIDGETS = {
     updateBenchmark();
   },
   vocablist({ path, inputId, value, control }) {
-    const listId = "dl-" + inputId;
     const editor = el("div", { class: "vocab-editor", hidden: true });
-    const input = el("input", { type: "text", id: inputId, value: value ?? "", list: listId,
-      oninput: (e) => onValue(path, e.target.value) });
+    const lists = S.choices.vocabulary_lists || [];
     control.append(
-      input,
-      el("datalist", { id: listId }, S.choices.vocabulary_lists.map((v) => el("option", { value: v }))),
-      el("button", { type: "button", text: "Edit list…", onclick: () => openVocabEditor(input.value.trim(), editor) }),
+      WIDGETS_choiceOf({ path, inputId, value, options: [["", "None"], ...lists.map((v) => [v, v])],
+        customLabel: "New list…", placeholder: "Name for the new list" }),
+      el("button", { type: "button", text: "Edit list…",
+        onclick: () => openVocabEditor(String(getPath(S.config, path) || "").trim(), editor) }),
       editor,
     );
   },
-  transcriptdir({ path, inputId, value, control }) {
-    control.append(el("input", { type: "text", id: inputId, value: value ?? "",
-      placeholder: S.choices.transcript_default_dir || "", oninput: (e) => onValue(path, e.target.value) }));
-    if (S.choices.transcript_default_dir) {
-      control.append(el("span", { class: "small muted", text: `Empty = ${S.choices.transcript_default_dir}` }));
-    }
-  },
 };
+
+// A string dropdown with an "Other…" free-text entry; the current value is
+// kept as an option when it is not in the list (missingLabel names it).
+function WIDGETS_choiceOf({ path, inputId, value, options, customLabel, placeholder, missingLabel }) {
+  const wrap = el("span", { class: "choice" });
+  const opts = [...options];
+  if (value && !opts.some(([v]) => v === value) && missingLabel) opts.push([value, missingLabel(value)]);
+  const known = opts.some(([v]) => v === value);
+  const custom = el("input", { type: "text", class: "custom-input", value: known ? "" : value ?? "", placeholder,
+    hidden: known, "aria-label": placeholder, oninput: (e) => onValue(path, e.target.value.trim()) });
+  const select = el("select", { id: inputId, onchange: (e) => {
+    if (e.target.value === "\u0000other") { custom.hidden = false; custom.focus(); onValue(path, custom.value.trim()); return; }
+    custom.hidden = true;
+    onValue(path, e.target.value);
+  } }, opts.map(([v, label]) => el("option", { value: v, text: label })), el("option", { value: "\u0000other", text: customLabel }));
+  select.value = known ? value : "\u0000other";
+  wrap.append(select, custom);
+  return wrap;
+}
+
+// One-line hints for well-known whisper models in the model dropdown.
+const MODEL_NOTES = {
+  tiny: "fastest, least accurate", base: "very fast", small: "fast, good for a CPU",
+  medium: "balanced", "large-v1": "accurate", "large-v2": "accurate", "large-v3": "most accurate, needs a good GPU",
+  "large-v3-turbo": "nearly as accurate, much faster",
+};
+let refreshModelOptions = () => {};
 
 // ------------------------------------------------------------------ processing units
 
@@ -596,26 +877,26 @@ function modelFitsUnit(model) {
   return kind === "auto" || catalogUnits(model).includes(kind);
 }
 
-const fmt = (v, unit, digits = 0) => (v === null || v === undefined ? "n/a" : `${Number(v).toFixed(digits)}${unit}`);
-
-function memText(u) {
-  const m = u.usage || {};
-  if (m.mem_used_mb === null || m.mem_used_mb === undefined) return m.mem_total_mb ? `n/a / ${fmt(m.mem_total_mb / 1024, " GB", 1)}` : "n/a";
-  return `${fmt(m.mem_used_mb / 1024, "", 1)} / ${fmt(m.mem_total_mb / 1024, " GB", 1)}`;
+// Short device name for the picker: no (R)/(TM), CPU clock or chip codename.
+function shortDeviceName(name) {
+  return String(name || "").replace(/\((R|TM)\)/gi, "").replace(/\s*@.*$/, "").replace(/\s+CPU\b/i, "")
+    .replace(/\s*\([A-Z0-9 ]+\)\s*$/, "").replace(/\s+/g, " ").trim();
 }
 
-function unitOptionLabel(u) {
-  const vram = u.kind !== "cpu" && u.type === "discrete" && u.vram_mb ? `, ${(u.vram_mb / 1024).toFixed(0)} GB` : "";
-  const tags = [u.recommended ? "recommended" : "", u.type === "integrated" ? "integrated" : ""].filter(Boolean);
-  return `${u.id} — ${u.name} (${u.backend}${vram})${tags.length ? " · " + tags.join(", ") : ""}${u.usable ? "" : " · unavailable"}`;
+// "<backend> — <device>", e.g. "Vulkan — NVIDIA GeForce RTX 3070". The index
+// is added only when one backend lists two devices with the same name.
+function unitOptionLabel(u, units = []) {
+  const name = shortDeviceName(u.name);
+  const twin = units.some((o) => o.id !== u.id && o.kind === u.kind && shortDeviceName(o.name) === name);
+  const tags = [u.type === "integrated" ? "integrated" : "", u.usable ? "" : "not available"].filter(Boolean);
+  return `${u.backend} — ${name}${twin ? ` #${u.index}` : ""}${tags.length ? ` (${tags.join(", ")})` : ""}`;
 }
 
 // Re-render the unit picker's options (only when the unit list, the model
-// or the selection changed, so an open dropdown is not replaced) and the
-// live usage table (every state message).
+// or the selection changed, so an open dropdown is not replaced).
 let unitsKey = null;
-function refreshUnits(force = false) {
-  const select = document.getElementById("f-asr.unit");
+function refreshUnits(force = false, select = document.getElementById("f-asr.unit"),
+                      note = document.getElementById("unit-note")) {
   if (!select || !S.config) return;
   const units = S.state.units || [];
   const value = getPath(S.config, ["asr", "unit"]) || "auto";
@@ -624,10 +905,10 @@ function refreshUnits(force = false) {
   if (force || key !== unitsKey) {
     unitsKey = key;
     const rec = units.find((u) => u.recommended);
-    const options = [el("option", { value: "auto", text: `auto — the recommended unit${rec ? ` (now ${rec.id}, ${rec.name})` : ""}` })];
+    const options = [el("option", { value: "auto", text: `Auto${rec ? ` (${unitOptionLabel(rec, units)})` : ""}` })];
     for (const u of units) {
       const fits = kinds.includes(u.kind);
-      options.push(el("option", { value: u.id, text: unitOptionLabel(u) + (fits ? "" : " · not for this model"),
+      options.push(el("option", { value: u.id, text: unitOptionLabel(u, units) + (fits ? "" : " (not for this model)"),
         disabled: (!u.usable || !fits) && u.id !== value, title: u.reason || (fits ? "" : `the model runs on ${kinds.join(", ")}`) }));
     }
     if (value !== "auto" && !units.some((u) => u.id === value)) {
@@ -636,35 +917,15 @@ function refreshUnits(force = false) {
     select.replaceChildren(...options);
     select.value = value;
   }
-  const note = document.getElementById("unit-note");
   if (note) {
+    // Only when something needs attention; the reason of a greyed-out
+    // option is in its tooltip.
     const chosen = units.find((u) => u.id === value);
-    const identity = getPath(S.config, ["asr", "unit_identity"]) || "";
     const parts = [];
-    if (value === "auto") parts.push(S.state.unit_resolved ? `auto runs on ${S.state.unit_resolved}.` : "auto: no usable unit found.");
-    if (chosen && !chosen.usable) parts.push(`Not usable: ${chosen.reason}.`);
-    if (chosen && chosen.kind !== "cpu") parts.push(identity ? `Recorded card: ${identity}.` : "No card recorded yet (pick the unit again to record it).");
-    if (!units.length) parts.push("Listing units…");
+    if (value === "auto" && units.length && !S.state.unit_resolved) parts.push("Auto: no usable device found.");
+    if (chosen && !chosen.usable) parts.push(`Not available: ${chosen.reason}.`);
+    if (!units.length) parts.push("Listing devices…");
     note.textContent = parts.join(" ");
-  }
-  const table = document.getElementById("unit-table");
-  if (table) {
-    const head = el("tr", {}, ["Unit", "Device", "Load", "Memory", "Temp", "Power", ""].map((h) => el("th", { text: h })));
-    table.replaceChildren(el("thead", {}, head), el("tbody", {}, units.map((u) => {
-      const m = u.usage || {};
-      const cores = Array.isArray(m.per_core_pct) && m.per_core_pct.length
-        ? ` (${m.per_core_pct.map((c) => fmt(c, "%")).join(" ")})` : "";
-      const status = [u.selected ? "in use" : "", u.recommended ? "recommended" : "", u.usable ? "" : (u.reason || "unavailable")]
-        .filter(Boolean).join(" · ");
-      return el("tr", { class: u.selected ? "selected" : "" },
-        el("td", { text: u.id }),
-        el("td", { text: `${u.name} (${u.backend}${u.pci_bus_id ? ", " + u.pci_bus_id : ""})` }),
-        el("td", { text: fmt(m.util_pct, "%") + cores }),
-        el("td", { text: memText(u) }),
-        el("td", { text: fmt(m.temp_c, " °C") }),
-        el("td", { text: fmt(m.power_w, " W", 1) }),
-        el("td", { class: "small muted", text: status }));
-    })));
   }
 }
 
@@ -714,27 +975,74 @@ function renderTabs() {
   if (!S.activeTab) S.activeTab = tabs[0].id;
   nav.replaceChildren(...tabs.map((t) => el("button", {
     type: "button", role: "tab", id: "tab-" + t.id, text: t.title, "aria-selected": String(t.id === S.activeTab),
-    onclick: () => { S.activeTab = t.id; renderTabs(); },
+    onclick: () => { S.activeTab = t.id; renderTabs(); if (t.id === "display") autoSample(); },
   })));
   const tab = tabs.find((t) => t.id === S.activeTab) || tabs[0];
   const panel = el("div", { role: "tabpanel", "aria-labelledby": "tab-" + tab.id });
   if (tab.id === "status") panel.append(buildStatus());
-  if (tab.id === "recordings") panel.append(buildRecordings());
   for (const section of tab.sections) {
     const schema = S.schema.properties[section];
     if (!schema) continue;
     const fs = el("fieldset", { "data-path": section }, el("legend", { text: SECTION_TITLES[section] || humanize(section) }));
+    if (SECTION_INTROS[section]) fs.append(el("p", { class: "help section-intro", text: SECTION_INTROS[section] }));
     fs.append(el("div", { class: "err", id: "e-" + section }));
     renderObject(schema, [section], fs);
     panel.append(fs);
   }
-  if (tab.id === "remote") panel.append(buildRemoteHelp());
+  if (tab.id === "remote") panel.append(buildPasswordBox(), buildRemoteHelp());
   panels.replaceChildren(panel);
   panels.scrollTop = scroll;
   showErrors();
   applyConditions();
   if (tab.id === "status") renderLog();
-  if (tab.id === "recordings") refreshRecordings();
+}
+
+// Set / change the login password (POST /api/password). Not part of the
+// settings form: the hash lives in its own file, never in config.yaml. With
+// no password yet the page is open (loopback bind) and no current password
+// is asked for.
+function buildPasswordBox() {
+  const field = (id, label, autocomplete) => el("div", { class: "field" },
+    el("label", { for: id, text: label }),
+    el("div", { class: "control" }, el("input", { type: "password", id, autocomplete })));
+  const msg = el("p", { class: "small", id: "pw-msg" });
+  const note = el("p", { class: "small err", id: "pw-note", hidden: true,
+    text: "No password is set: anyone on this computer can open this page without logging in. Set one to require a login." });
+  const current = field("pw-current", "Current password", "current-password");
+  const legend = el("legend", { text: "Login password" });
+  const button = el("button", { type: "button", class: "primary", text: "Change password" });
+  let isSet = true;
+  const refresh = async () => {
+    try {
+      const info = await (await fetch("/api/login-info", { credentials: "same-origin" })).json();
+      isSet = !!info.password_set;
+    } catch (e) { isSet = true; }
+    current.hidden = !isSet;
+    note.hidden = isSet;
+    legend.textContent = isSet ? "Login password" : "Set a login password";
+    button.textContent = isSet ? "Change password" : "Set password";
+  };
+  button.addEventListener("click", async () => {
+    const next = $("#pw-new").value;
+    if (next !== $("#pw-confirm").value) { msg.className = "small err"; msg.textContent = "The new passwords do not match."; return; }
+    button.disabled = true;
+    try {
+      const res = await api("POST", "/api/password", { current: isSet ? $("#pw-current").value : "", new: next });
+      if (res.ok) {
+        for (const id of ["#pw-current", "#pw-new", "#pw-confirm"]) $(id).value = "";
+        msg.className = "small";
+        msg.textContent = isSet ? "Password changed. Other browsers were logged out."
+          : "Password set. This browser stays logged in; others need the password from now on.";
+        await refresh();
+      } else {
+        msg.className = "small err"; msg.textContent = res.data?.error || `Not changed (${res.status})`;
+      }
+    } finally { button.disabled = false; }
+  });
+  refresh();
+  return el("fieldset", { id: "password-box" }, legend, note, current,
+    field("pw-new", "New password (8+ characters)", "new-password"),
+    field("pw-confirm", "New password again", "new-password"), button, msg);
 }
 
 function buildRemoteHelp() {
@@ -746,131 +1054,13 @@ function buildRemoteHelp() {
       "POST /api/mode          {\"mode\": \"auto\" | \"manual\" | \"toggle\"}",
       "POST /api/manual-text   {\"text\": \"...\"}",
       "POST /api/pause         {\"paused\": true | false | \"toggle\"}",
-      "POST /api/recording     {\"recording\": true | false | \"toggle\"}",
       "",
       "OSC: /narrator/clear, /narrator/mode [s], /narrator/manual-text s,",
-      "     /narrator/pause [i|T|F], /narrator/recording [i|T|F]",
+      "     /narrator/pause [i|T|F]",
     ].join("\n") }),
     el("p", { class: "small muted", text: "Bitfocus Companion: see the README section \"Web UI and remote control\" for a ready button set." }));
 }
 
-// ------------------------------------------------------------------ recordings tab
-
-function formatBytes(n) {
-  if (!Number.isFinite(n)) return "-";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let i = 0;
-  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
-  return `${n.toFixed(i ? 1 : 0)} ${units[i]}`;
-}
-
-function buildRecordings() {
-  return el("fieldset", { id: "recordings-box" }, el("legend", { text: "Recordings" }),
-    el("p", { class: "small muted", text: "Each session keeps the audio the recognizer heard and the captions that went on air; " +
-      "a draft transcript is made afterwards. Download, correct and upload the SRT back; a corrected recording can join " +
-      "the reference library that tuning learns from. Recordings never leave this machine unless downloaded." }),
-    el("div", { class: "rec-tools" },
-      el("span", { id: "rec-disk", class: "small muted" }),
-      el("span", { class: "spacer" }),
-      el("button", { type: "button", class: "danger", id: "rec-delete-all", text: "Delete all recordings…", onclick: deleteAllRecordings })),
-    el("div", { id: "rec-list" }, el("p", { class: "small muted", text: "Loading…" })));
-}
-
-let recTimer = null;
-async function refreshRecordings() {
-  clearTimeout(recTimer);
-  if (S.activeTab !== "recordings" || !$("#rec-list")) return;
-  const res = await api("GET", "/api/recordings");
-  if (S.activeTab !== "recordings" || !$("#rec-list")) return;
-  if (!res.ok) {
-    $("#rec-list").replaceChildren(el("p", { class: "err", text: res.data?.error || `Cannot list recordings (${res.status})` }));
-  } else renderRecordings(res.data);
-  recTimer = setTimeout(refreshRecordings, 3000);
-}
-
-function renderRecordings(data) {
-  const d = data.disk || {};
-  $("#rec-disk").textContent = `Recordings use ${formatBytes(d.recordings_bytes)}; ${formatBytes(d.free_bytes)} free ` +
-    `(recording stops below ${d.min_free_disk_mb} MB) — ${d.directory || ""}`;
-  const list = data.recordings || [];
-  $("#rec-delete-all").disabled = !list.some((r) => r.status !== "recording");
-  if (!list.length) {
-    $("#rec-list").replaceChildren(el("p", { class: "small muted", text: "No recordings yet. Use Record (or its shortcut) to start one." }));
-    return;
-  }
-  const head = el("thead", {}, el("tr", {}, ["Started", "Duration", "Size", "Status", ""].map((h) => el("th", { text: h }))));
-  const body = el("tbody", {}, list.map(recordingRow));
-  $("#rec-list").replaceChildren(el("table", { class: "rec-table" }, head, body));
-}
-
-function recordingRow(r) {
-  const url = (name) => `/api/recordings/${encodeURIComponent(r.id)}/files/${name}`;
-  const live = r.status === "recording";
-  const started = r.started_at ? new Date(r.started_at).toLocaleString() : r.id;
-  const duration = live ? formatDuration(S.state.recording_info?.elapsed_s || 0) : formatDuration(r.duration_s || 0);
-  let detail = "";
-  if (r.status === "draft pending") {
-    detail = r.draft.state === "running" ? (r.draft.suspended ? "draft paused while live ASR is busy" : "generating draft…")
-      : (r.draft.waiting || "draft queued");
-  } else if (r.status === "draft failed") detail = r.draft.error || "";
-  if (r.dropped_frames) detail += `${detail ? "; " : ""}${r.dropped_frames} audio frame(s) dropped`;
-  if (r.session_status && !["complete", "recording"].includes(r.session_status)) detail += `${detail ? "; " : ""}${r.stop_reason || r.session_status}`;
-  if (r.reference) detail += `${detail ? "; " : ""}in the reference library`;
-  const actions = el("div", { class: "actions" });
-  const dl = (name, label) => r.files[name] && actions.append(el("a", { class: "btn", href: url(name), download: "", text: label }));
-  dl("audio.flac", "Audio");
-  dl("live.srt", "Live SRT");
-  dl("draft.srt", "Draft SRT");
-  dl("corrected.srt", "Corrected SRT");
-  if (!live) {
-    const file = el("input", { type: "file", accept: ".srt,text/plain", hidden: true,
-      onchange: (e) => uploadCorrected(r.id, e.target.files[0]) });
-    actions.append(file,
-      el("button", { type: "button", text: "Upload corrected…", onclick: () => file.click() }),
-      el("button", { type: "button", text: r.files["draft.srt"] ? "Redo draft" : "Generate draft now",
-        disabled: r.draft.state === "running" && !r.draft.suspended,
-        onclick: () => recAction("POST", `/api/recordings/${encodeURIComponent(r.id)}/draft`, "Draft requested") }),
-      el("button", { type: "button", text: "Use as reference", disabled: !r.files["corrected.srt"],
-        title: r.files["corrected.srt"] ? "Copy into scripts/test_audio for narrator-tune" : "Upload a corrected SRT first",
-        onclick: () => recAction("POST", `/api/recordings/${encodeURIComponent(r.id)}/reference`, "Copied into the reference library") }),
-      el("button", { type: "button", class: "danger", text: "Delete", onclick: () => {
-        if (confirm(`Delete the recording from ${started}? This cannot be undone.`)) {
-          recAction("DELETE", `/api/recordings/${encodeURIComponent(r.id)}`, "Recording deleted");
-        }
-      } }));
-  }
-  const tag = r.status.replace(/\s+/g, "-");
-  return el("tr", {},
-    el("td", { text: started }),
-    el("td", { text: duration }),
-    el("td", { text: formatBytes(r.size_bytes) }),
-    el("td", {}, el("span", { class: `status-tag ${tag}`, text: r.status }), detail ? el("div", { class: "small muted", text: detail }) : null),
-    el("td", {}, actions));
-}
-
-async function recAction(method, path, okMessage, body) {
-  const res = await api(method, path, body);
-  if (res.ok) toast(okMessage);
-  else toast(res.data?.error || `Failed (${res.status})`, true);
-  refreshRecordings();
-}
-
-async function uploadCorrected(id, file) {
-  if (!file) return;
-  const res = await fetch(`/api/recordings/${encodeURIComponent(id)}/corrected`, {
-    method: "PUT", credentials: "same-origin", headers: { "Content-Type": "application/x-subrip" }, body: file,
-  });
-  let data = null;
-  try { data = await res.json(); } catch (e) { data = null; }
-  if (res.ok) toast(`Corrected SRT saved (${data.cues} cues)`);
-  else toast(data?.error || `Upload failed (${res.status})`, true);
-  refreshRecordings();
-}
-
-async function deleteAllRecordings() {
-  if (!confirm("Delete ALL recordings (audio and subtitles)? A recording that is still running is kept. This cannot be undone.")) return;
-  await recAction("POST", "/api/recordings/delete-all", "All recordings deleted", { confirm: true });
-}
 
 // ------------------------------------------------------------------ status tab
 
@@ -884,7 +1074,6 @@ function buildStatus() {
     ["Worker crashes", `${st.asr_crashes ?? 0}${st.asr_last_exit_code !== null && st.asr_last_exit_code !== undefined ? ` (last exit code ${st.asr_last_exit_code})` : ""}`],
     ["Caption mode", `${st.caption_mode || "auto"}${st.captions_paused ? ", paused" : ""}`],
     ["ASR load", st.asr_busy !== null && st.asr_busy !== undefined ? `${Math.round(st.asr_busy * 100)}% busy decoding` : "-"],
-    ["Recording", st.recording ? `on (${st.recording_info?.session_id || ""})` : "off"],
     ["Uptime", st.uptime_s !== null && st.uptime_s !== undefined ? formatDuration(st.uptime_s) : "-"],
     ["Config file", S.configPath || "-"],
   ];
@@ -1048,6 +1237,29 @@ function scheduleDraft() {
   updateGuides();
 }
 
+// A sample caption in this browser's preview only (never on air), so the
+// look can be set up while nobody is speaking.
+const SAMPLE_TEXT = "Przykładowy napis — tak wyglądają napisy.";
+let sampleAuto = false;
+function sendSample() {
+  if (!S.ws || S.ws.readyState !== WebSocket.OPEN) return;
+  const on = $("#sample-toggle").checked;
+  S.ws.send(JSON.stringify({ type: "sample", text: on ? SAMPLE_TEXT : "" }));
+  updatePreviewNote();
+}
+function autoSample() {
+  if (sampleAuto) return;
+  sampleAuto = true;
+  if (!$("#sample-toggle").checked) { $("#sample-toggle").checked = true; sendSample(); }
+}
+let draftNote = "";
+function updatePreviewNote() {
+  const parts = [];
+  if ($("#sample-toggle").checked) parts.push("Showing sample text (not on air)");
+  if (draftNote) parts.push(draftNote);
+  $("#preview-note").textContent = parts.join(" · ");
+}
+
 function displayOf(cfg) { return Object.fromEntries(DISPLAY_SECTIONS.map((k) => [k, cfg[k]])); }
 
 function sendDraft() {
@@ -1055,7 +1267,8 @@ function sendDraft() {
   const draft = displayOf(S.config);
   const unsaved = !same(draft, displayOf(S.saved));
   S.ws.send(JSON.stringify({ type: "draft", display: unsaved ? draft : null }));
-  $("#preview-note").textContent = unsaved ? "Previewing unsaved display settings (not on air)" : "";
+  draftNote = unsaved ? "Previewing unsaved look settings — Save to put them on air" : "";
+  updatePreviewNote();
 }
 
 function updateGuides() {
@@ -1093,32 +1306,13 @@ function updateState(st) {
   const pause = $("#pause-btn");
   pause.textContent = st.captions_paused ? "Resume captions" : "Pause captions";
   pause.classList.toggle("active", !!st.captions_paused);
-  const rec = $("#rec-btn");
-  rec.disabled = !st.recording_available;
-  rec.title = st.recording_available ? "Record the audio and on-air captions of this session" : "Recording is not available (needs the soundfile package)";
-  rec.textContent = st.recording ? "Stop recording" : "Record";
-  rec.classList.toggle("active", !!st.recording);
-  const recPill = $("#rec-pill");
-  recPill.hidden = !st.recording;
-  const info = st.recording_info || {};
-  recPill.textContent = st.recording ? `REC ${formatDuration(info.elapsed_s || 0)}` : "REC";
-  if (S.wasRecording && !st.recording && info.last_stop_reason && info.last_stop_reason !== "stopped by the operator") {
-    toast(`Recording stopped: ${info.last_stop_reason}`, true);
-  }
-  S.wasRecording = !!st.recording;
   $("#manual-hint").textContent = manual
     ? "Manual mode: ASR output is not put on air."
-    : (st.captions_paused ? "Captions paused: ASR keeps listening, nothing new goes on air." : "Auto mode: lines you send are added after the ASR captions.");
+    : (st.captions_paused ? "Captions paused: ASR keeps listening, nothing new goes on air." : "");
   const level = Math.max(0, Math.min(1, st.mic_level || 0));
   const bar = $("#meter-bar");
   bar.style.width = `${Math.pow(level, 1 / 3) * 100}%`;
   bar.classList.toggle("clip", level >= 0.98);
-  const onAir = $("#on-air");
-  const lines = st.on_air || [];
-  if (onAir.dataset.lines !== JSON.stringify(lines)) {
-    onAir.dataset.lines = JSON.stringify(lines);
-    onAir.replaceChildren(...lines.map((line) => el("span", { class: "line", text: line })));
-  }
   if (S.rev !== null && st.config_rev !== S.rev) {
     S.rev = st.config_rev;
     if (!isDirty()) loadConfig();
@@ -1142,7 +1336,7 @@ function updateState(st) {
 // Fix buttons: "ui:<tab>" opens that settings tab, anything else is POSTed
 // to /api/fix (the server restarts only the affected part). Re-rendered
 // only when the list changes, so a button is not replaced under the cursor.
-const SUBSYSTEM_TITLES = { asr: "ASR", audio: "Audio", ndi: "NDI", web: "Web", recording: "Recording", setup: "Setup" };
+const SUBSYSTEM_TITLES = { asr: "ASR", audio: "Audio", ndi: "NDI", web: "Web", setup: "Setup" };
 let problemsKey = null;
 
 function renderProblems(problems) {
@@ -1193,27 +1387,6 @@ async function runBenchmark() {
   else toast(res.data?.error || "Could not start the benchmark", true);
 }
 
-function addFeed(events) {
-  const feed = $("#feed");
-  for (const ev of events) {
-    if (ev.kind === "clear") continue; // off-screen pruning: nothing visible changed
-    const last = feed.lastElementChild;
-    if (last && last.classList.contains("partial")) last.remove();
-    let item;
-    if (ev.kind === "final" || ev.kind === "partial") {
-      item = el("li", { class: ev.kind + (ev.applied ? "" : " ignored") }, ev.text);
-      if (!ev.applied) item.append(el("span", { class: "tag", text: "not on air" }));
-    } else if (ev.kind === "wipe") {
-      item = el("li", { class: "system", text: "— screen wiped after silence —" });
-    } else if (ev.kind === "status") {
-      item = el("li", { class: "system", text: `ASR backend: ${ev.text}` });
-    } else continue;
-    feed.append(item);
-  }
-  while (feed.childElementCount > 80) feed.firstChild.remove();
-  feed.scrollTop = feed.scrollHeight;
-}
-
 // ------------------------------------------------------------------ websocket
 
 let previewUrl = null;
@@ -1229,6 +1402,7 @@ function connect() {
     conn.textContent = "Connected";
     conn.className = "pill ok";
     sendDraft();
+    sendSample();
     ws.send(JSON.stringify({ type: "preview", enabled: !document.hidden }));
   };
   ws.onmessage = (msg) => {
@@ -1241,7 +1415,6 @@ function connect() {
     }
     const data = JSON.parse(msg.data);
     if (data.type === "state") updateState(data);
-    else if (data.type === "captions") addFeed(data.events);
     else if (data.type === "log") appendLog(data.lines);
     else if (data.type === "draft_error") {
       if (data.errors.length) $("#preview-note").textContent = `Preview: ${data.errors.map((e) => `${e.loc}: ${e.msg}`).join("; ")}`;
@@ -1290,16 +1463,14 @@ const ACTIONS = {
     if (r && r.result === "manual") $("#manual-entry").focus();
     if (r) toast(r.result === "manual" ? "Manual mode" : "Auto mode");
   },
-  focus_entry: () => { const i = $("#manual-entry"); i.focus(); i.select(); },
+  focus_entry: () => {
+    if (!document.body.classList.contains("mode-manual")) return; // the entry exists in manual mode only
+    const i = $("#manual-entry"); i.focus(); i.select();
+  },
   submit: submitManual,
   pause_toggle: async () => {
     const r = await control("/api/pause", { paused: "toggle" });
     if (r) toast(r.result ? "Captions paused" : "Captions resumed");
-  },
-  recording_toggle: async () => {
-    const r = await control("/api/recording", { recording: "toggle" });
-    if (r) toast(r.result ? "Recording started" : "Recording stopped");
-    refreshRecordings();
   },
   help: () => toggleHelp(),
 };
@@ -1386,7 +1557,6 @@ async function boot() {
   });
   $("#clear-btn").addEventListener("click", ACTIONS.clear);
   $("#pause-btn").addEventListener("click", ACTIONS.pause_toggle);
-  $("#rec-btn").addEventListener("click", ACTIONS.recording_toggle);
   $("#manual-form").addEventListener("submit", (e) => { e.preventDefault(); submitManual(); });
   $("#help-btn").addEventListener("click", () => toggleHelp());
   $("#help-close").addEventListener("click", () => toggleHelp(false));
@@ -1394,6 +1564,7 @@ async function boot() {
   $("#save-btn").addEventListener("click", saveConfig);
   $("#revert-btn").addEventListener("click", () => { $("#error-summary").hidden = true; loadConfig(); });
   $("#guides-toggle").addEventListener("change", updateGuides);
+  $("#sample-toggle").addEventListener("change", sendSample);
   $("#recheck-btn").addEventListener("click", (e) => runFix({ action: "health.recheck", label: "Check again" }, e.currentTarget));
   window.addEventListener("beforeunload", (e) => { if (isDirty()) { e.preventDefault(); e.returnValue = ""; } });
 

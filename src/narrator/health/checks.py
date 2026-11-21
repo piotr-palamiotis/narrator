@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import shutil
 import sys
 import threading
 from dataclasses import dataclass
@@ -45,7 +46,6 @@ from narrator.health.problems import (
     FIX_UI_ASR,
     FIX_UI_AUDIO,
     FIX_UI_NDI,
-    FIX_UI_RECORDINGS,
     Fix,
     Problem,
     Severity,
@@ -200,10 +200,12 @@ class Environment(LocalProbes):
         return None
 
     def free_mb(self, path: Path) -> float | None:
-        from narrator.recording.session import free_disk_mb
-
+        """Free space on the disk holding `path` (its nearest existing parent)."""
+        probe = path
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
         try:
-            return free_disk_mb(path)
+            return shutil.disk_usage(probe).free / (1024 * 1024)
         except OSError:
             return None
 
@@ -212,11 +214,6 @@ class Environment(LocalProbes):
 
         return var_dir()
 
-    def recordings_dir(self, config: RootConfig) -> Path:
-        from narrator.paths import recordings_dir
-
-        directory = config.recording.directory
-        return Path(directory).expanduser() if directory else recordings_dir()
 
 
 @dataclass(frozen=True)
@@ -539,15 +536,6 @@ def check_ndi_runtime(env: Environment) -> list[Problem]:
 
 def check_disk(config: RootConfig, env: Environment) -> list[Problem]:
     problems = []
-    minimum = config.recording.min_free_disk_mb
-    free = env.free_mb(env.recordings_dir(config))
-    if minimum > 0 and free is not None and free < minimum:
-        problems.append(Problem(
-            "recording.disk_low", Severity.WARNING, Subsystem.RECORDING,
-            f"Only {free:.0f} MB free on the recordings disk (recording.min_free_disk_mb is {minimum}): "
-            "a recording cannot start, and a running one stops.",
-            (Fix(FIX_UI_RECORDINGS, "Recordings"),),
-        ))
     tune_cache = env.var_dir() / "tune" / "cache"
     if tune_cache.is_dir():
         free = env.free_mb(tune_cache)

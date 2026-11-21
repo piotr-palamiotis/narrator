@@ -34,8 +34,8 @@ binaries = []
 # Modules reached only by name or via `python -m` / lazy imports, which the
 # static analysis can miss. narrator.health.vulkan_probe: the frozen app
 # enumerates in-process instead of spawning it (health/checks.py);
-# narrator.asr.preset_probe / recording.draft: subprocess entry points
-# (draft via --draft-recording; preset_probe is NOT reachable when frozen).
+# narrator.asr.preset_probe: a subprocess entry point (NOT reachable when
+# frozen).
 hiddenimports = [
     "narrator.health.checks",
     "narrator.health.monitor",
@@ -50,10 +50,8 @@ hiddenimports = [
     "narrator.asr.segmenter",
     "narrator.asr.streaming_decoder",
     "narrator.asr.text_settings",
-    "narrator.asr.offline",
     "narrator.asr.preset_picker",
     "narrator.asr.preset_probe",
-    "narrator.recording.draft",
     "narrator.web.osc",
 ]
 
@@ -62,8 +60,7 @@ hiddenimports = [
 # analysis won't fully discover on its own -- collect_all pulls in their
 # binaries/data/submodules explicitly rather than hand-listing exact .so
 # paths, which would be fragile across platforms and package versions.
-# soundfile: libsndfile (FLAC) for session recording, bundled in its wheel.
-for package in ("pywhispercpp", "cyndilib", "onnxruntime", "sounddevice", "soundfile"):
+for package in ("pywhispercpp", "cyndilib", "onnxruntime", "sounddevice"):
     pkg_datas, pkg_binaries, pkg_hiddenimports = collect_all(package)
     datas += pkg_datas
     binaries += pkg_binaries

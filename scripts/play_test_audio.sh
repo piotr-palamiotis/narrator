@@ -4,7 +4,7 @@
 # not already running.
 #
 # Usage: scripts/play_test_audio.sh [path/to/file.mp3]
-#   (defaults to test.mp3 at the repo root)
+#   (defaults to test.mp3 at the repo root; LOOP=1 repeats it until Ctrl+C)
 #
 # Run narrator against it with:
 #   PIPEWIRE_NODE=narrator_mic_source narrator
@@ -33,5 +33,9 @@ if ! pw-cli ls Node 2>/dev/null | grep -q "node.name = \"$SINK_NAME\""; then
     sleep 1
 fi
 
+if [[ "${LOOP:-0}" == "1" ]]; then
+    echo "Playing $MP3_PATH into $SINK_NAME on a loop (Ctrl+C to stop)..."
+    while true; do pw-play --target="$SINK_NAME" "$MP3_PATH"; done
+fi
 echo "Playing $MP3_PATH into $SINK_NAME..."
 pw-play --target="$SINK_NAME" "$MP3_PATH"

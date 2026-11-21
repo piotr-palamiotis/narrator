@@ -23,9 +23,6 @@ dependencies = [
     # The web admin UI (narrator.web): HTTP + WebSocket server on its own
     # thread/event loop; replaces the Tk GUI (sv-ttk, pystray).
     "aiohttp>=3.9",
-    # Session recording (narrator.recording): audio.flac is written with
-    # libsndfile, which the soundfile wheels bundle (no system package).
-    "soundfile>=0.12",
 ]
 
 [project.optional-dependencies]

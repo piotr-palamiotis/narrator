@@ -20,7 +20,7 @@ scripts/output/
 !/scripts/test_audio/README.md
 
 # Self-contained layout: everything the app writes lives under the repo.
-# var/ = logs, transcripts, token, and narrator-tune's working data
+# var/ = logs, web-ui.json, and narrator-tune's working data
 # (var/tune/: decoded excerpt cache, resumable result store, run reports).
 # scripts/autoconfigure_* is the pre-narrator-tune location, still used
 # until moved to var/tune/.

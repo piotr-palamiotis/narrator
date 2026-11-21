@@ -39,14 +39,21 @@ from narrator.web import actions
 from narrator.web.logbuffer import log_ring
 from narrator.web.security import (
     SESSION_COOKIE,
-    allowed_host_names,
-    default_token_path,
-    host_allowed,
+    PasswordError,
+    check_new_password,
+    default_ui_file_path,
+    is_loopback_address,
+    is_loopback_host,
+    legacy_token_path,
     new_secret,
     origin_allowed,
-    remove_token_file,
+    password_path_for,
+    read_password_file,
+    remove_ui_file,
     tokens_equal,
-    write_token_file,
+    verify_password,
+    write_password_file,
+    write_ui_file,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,8 +68,29 @@ _FANOUT_TASK = web.AppKey("fanout", asyncio.Task)
 
 # Paths reachable with a per-integration API token (web.api_tokens).
 _CONTROL_PATHS = frozenset(
-    {"/api/state", "/api/clear", "/api/mode", "/api/manual-text", "/api/pause", "/api/recording"}
+    {"/api/state", "/api/clear", "/api/mode", "/api/manual-text", "/api/pause"}
 )
+
+
+def _lan_addresses() -> list[str]:
+    """This machine's non-loopback IPv4 addresses (for the startup log
+    line), from `hostname -I` when available, else the default route's."""
+    import socket
+    import subprocess
+
+    try:
+        out = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=2).stdout
+        found = [a for a in out.split() if "." in a and not a.startswith("127.")]
+        if found:
+            return found
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("192.0.2.1", 9))  # no packet is sent (UDP connect)
+            return [sock.getsockname()[0]]
+    except OSError:
+        return []
 
 
 def _error(message: str, status: int) -> web.Response:
@@ -87,6 +115,9 @@ class _Client:
         self.preview_enabled = True
         self.draft: tuple[CanvasConfig, LayoutConfig, StyleConfig] | None = None
         self.draft_version = 0
+        # Sample caption shown in this browser's preview only (styling the
+        # captions while nothing is on air); "" = the real captions.
+        self.sample_text = ""
         self.preview_sync: PreviewSync | None = None
         self.last_frame = None
         self.last_frame_key = None
@@ -121,11 +152,19 @@ class _Client:
 
 
 class WebServer:
-    def __init__(self, controller, *, token: str | None = None, token_path: Path | None = None) -> None:
+    def __init__(
+        self, controller, *, password_path: Path | None = None, ui_file_path: Path | None = None,
+        local_only: bool = False,
+    ) -> None:
         self._controller = controller
-        self._token = token or new_secret()
-        self._token_path = token_path or default_token_path()
-        self._sessions: set[str] = set()
+        # Startup-only choice (`narrator --local-only`), never a config/UI
+        # setting: other computers can reach the UI unless it is set.
+        self._local_only = local_only
+        self._bind = "127.0.0.1" if local_only else "0.0.0.0"
+        self._password_path = password_path or password_path_for(controller.config_path)
+        self._ui_file_path = ui_file_path or default_ui_file_path()
+        self._sessions: set[str] = set()  # in memory: a restart logs everyone out
+        self._login_lock: asyncio.Lock | None = None  # one password check at a time
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._runner: web.AppRunner | None = None
@@ -144,15 +183,34 @@ class WebServer:
     # ---------------------------------------------------------------- lifecycle
 
     @property
-    def token(self) -> str:
-        return self._token
-
-    @property
     def url(self) -> str | None:
         return self._url
 
-    def login_url(self) -> str | None:
-        return None if self._url is None else f"{self._url}/auth?token={self._token}"
+    @property
+    def password_path(self) -> Path:
+        return self._password_path
+
+    def password_set(self) -> bool:
+        return read_password_file(self._password_path) is not None
+
+    @property
+    def local_only(self) -> bool:
+        return self._local_only
+
+    def login_required(self, request: web.Request) -> bool:
+        """With no password set, a browser on this machine gets in without a
+        login (user decision 2026-11-16); every other computer needs a
+        password, so with none set it cannot log in at all. "This machine"
+        = a loopback client AND a loopback Host: a DNS-rebinding page in a
+        local browser arrives with its own host name and is not let in."""
+        if self.password_set():
+            return True
+        return not (is_loopback_address(request.remote)
+                    and is_loopback_host(request.headers.get("Host"), self._served_port(request)))
+
+    def _served_port(self, request: web.Request) -> int:
+        sockname = request.transport.get_extra_info("sockname") if request.transport else None
+        return sockname[1] if sockname else (self._port or self._web_config().port)
 
     def start(self) -> None:
         loop = asyncio.new_event_loop()
@@ -201,7 +259,7 @@ class WebServer:
                 logger.exception("web UI: applying the new web settings failed")
 
     async def _apply(self, cfg: WebConfig) -> None:
-        http_key = (cfg.bind, cfg.port) if cfg.enabled else None
+        http_key = (self._bind, cfg.port) if cfg.enabled else None
         if http_key != self._http_key:
             await self._stop_http()
             if http_key is not None:
@@ -215,37 +273,48 @@ class WebServer:
     async def _start_http(self, cfg: WebConfig) -> None:
         runner = web.AppRunner(self.create_app(), access_log=None, handle_signals=False)
         await runner.setup()
-        site = web.TCPSite(runner, cfg.bind, cfg.port)
+        site = web.TCPSite(runner, self._bind, cfg.port)
         try:
             await site.start()
         except OSError as exc:
             logger.error("web UI: cannot listen on %s:%s (%s); captions keep running without it",
-                         cfg.bind, cfg.port, exc)
+                         self._bind, cfg.port, exc)
             await runner.cleanup()
             return
         self._runner = runner
-        self._http_key = (cfg.bind, cfg.port)
+        self._http_key = (self._bind, cfg.port)
         sockets = getattr(site._server, "sockets", None) or []  # actual port when cfg.port is 0
         self._port = sockets[0].getsockname()[1] if sockets else cfg.port
-        shown = "127.0.0.1" if cfg.bind in ("0.0.0.0", "::", "", "localhost") else cfg.bind
-        if ":" in shown:
-            shown = f"[{shown}]"
-        self._url = f"http://{shown}:{self._port}"
+        self._url = f"http://127.0.0.1:{self._port}"
         try:
-            write_token_file(self._token_path, self._token, self._url)
+            write_ui_file(self._ui_file_path, self._url)
         except OSError as exc:
-            logger.warning("web UI: cannot write the token file %s: %s", self._token_path, exc)
-        logger.info("Web UI at %s -- login token: %s (`narrator --open-ui` opens it logged in)",
-                    self._url, self._token)
-        if cfg.bind not in ("127.0.0.1", "localhost", "::1"):
-            logger.warning("web UI is bound to %s, not loopback: keep it off untrusted networks", cfg.bind)
+            logger.warning("web UI: cannot write %s: %s", self._ui_file_path, exc)
+        try:  # the retired login token's file, if an older version left one
+            legacy_token_path().unlink(missing_ok=True)
+        except OSError:
+            pass
+        if self._local_only:
+            logger.info("Web UI at %s (this computer only: --local-only)", self._url)
+        else:
+            others = ", ".join(f"http://{ip}:{self._port}" for ip in _lan_addresses()) or "this machine's IP"
+            logger.info("Web UI at %s; from other computers: %s (start with --local-only to refuse them)",
+                        self._url, others)
+        if not self.password_set():
+            if self._local_only:
+                logger.warning("web UI: no password is set, so it opens without a login on this computer; "
+                               "set one with `narrator --set-password` or on the Web & remote tab")
+            else:
+                logger.warning("web UI: no password is set: it opens without a login on this computer, and "
+                               "other computers cannot log in until one is set (`narrator --set-password` "
+                               "or the Web & remote tab)")
 
     async def _stop_http(self) -> None:
         runner, self._runner = self._runner, None
         self._http_key = None
         if runner is not None:
             await runner.cleanup()
-            remove_token_file(self._token_path, self._token)
+            remove_ui_file(self._ui_file_path)
             self._url = None
 
     async def _start_osc(self, cfg: WebConfig) -> None:
@@ -282,12 +351,13 @@ class WebServer:
         r.add_get("/auth", self._auth)
         r.add_post("/auth", self._auth)
         r.add_post("/api/logout", self._logout)
+        r.add_get("/api/login-info", self._login_info)
+        r.add_post("/api/password", self._change_password)
         r.add_get("/api/state", self._state)
         r.add_post("/api/clear", self._clear)
         r.add_post("/api/mode", self._mode)
         r.add_post("/api/manual-text", self._manual_text)
         r.add_post("/api/pause", self._pause)
-        r.add_post("/api/recording", self._recording)
         r.add_post("/api/fix", self._fix)
         r.add_get("/api/config", self._get_config)
         r.add_post("/api/config", self._save_config)
@@ -298,13 +368,6 @@ class WebServer:
         r.add_get("/api/vocabulary/{name}", self._get_vocabulary)
         r.add_put("/api/vocabulary/{name}", self._put_vocabulary)
         r.add_post("/api/preset/benchmark", self._run_benchmark)
-        r.add_get("/api/recordings", self._list_recordings)
-        r.add_post("/api/recordings/delete-all", self._delete_all_recordings)
-        r.add_get("/api/recordings/{id}/files/{name}", self._recording_file)
-        r.add_put("/api/recordings/{id}/corrected", self._upload_corrected)
-        r.add_post("/api/recordings/{id}/draft", self._generate_draft)
-        r.add_post("/api/recordings/{id}/reference", self._use_as_reference)
-        r.add_delete("/api/recordings/{id}", self._delete_recording)
         r.add_get("/ws", self._websocket)
         r.add_static("/static", STATIC_DIR, show_index=False)
         app.on_response_prepare.append(self._add_security_headers)
@@ -330,15 +393,13 @@ class WebServer:
 
     @web.middleware
     async def _security_middleware(self, request: web.Request, handler):
-        cfg = self._web_config()
-        sockname = request.transport.get_extra_info("sockname") if request.transport else None
-        port = sockname[1] if sockname else (self._port or cfg.port)
-        allowed = allowed_host_names(cfg.bind, cfg.allowed_hosts)
-        if not host_allowed(request.headers.get("Host"), allowed, port):
+        port = self._served_port(request)
+        host = request.headers.get("Host")
+        if self._local_only and not is_loopback_host(host, port):
             # DNS rebinding: a hostile name pointed at 127.0.0.1.
             return web.Response(status=421, text="Misdirected request: unexpected Host header\n")
         if request.method not in _SAFE_METHODS or request.path == "/ws":
-            if not origin_allowed(request.headers.get("Origin"), allowed, port):
+            if not origin_allowed(request.headers.get("Origin"), host):
                 return _error("cross-origin request refused", 403)
         return await handler(request)
 
@@ -356,6 +417,11 @@ class WebServer:
         response.headers.setdefault("Referrer-Policy", "same-origin")
         if not request.path.startswith("/static/"):
             response.headers.setdefault("Cache-Control", "no-store")
+        else:
+            # Revalidate every time (a 304 when unchanged): without it the
+            # browser may heuristically cache app.js across an update and pair
+            # the old script with the new page, which breaks the UI at boot.
+            response.headers.setdefault("Cache-Control", "no-cache")
 
     @staticmethod
     def _presented_token(request: web.Request) -> str | None:
@@ -374,15 +440,20 @@ class WebServer:
                 return api_token.name
         return None
 
-    def _access_level(self, request: web.Request) -> str | None:
-        """"admin" (session cookie / startup token), "control" (an API token),
-        or None."""
+    def _session(self, request: web.Request) -> str | None:
         session = request.cookies.get(SESSION_COOKIE)
         if session and any(tokens_equal(session, s) for s in list(self._sessions)):
+            return session
+        return None
+
+    def _access_level(self, request: web.Request) -> str | None:
+        """"admin" (a password login's session cookie), "control" (an API
+        token), or None."""
+        if self._session(request):
             return "admin"
-        if tokens_equal(self._presented_token(request), self._token):
-            return "admin"
-        return "control" if self._integration_name(request) else None
+        if self._integration_name(request):
+            return "control"
+        return None if self.login_required(request) else "admin"
 
     def _require(self, request: web.Request, level: str = "admin") -> web.Response | None:
         granted = self._access_level(request)
@@ -398,20 +469,74 @@ class WebServer:
         page = "index.html" if self._access_level(request) == "admin" else "login.html"
         return web.FileResponse(STATIC_DIR / page)
 
+    async def _check_password(self, password: str) -> bool:
+        """scrypt off the loop, one check at a time, a pause after a miss
+        (slows guessing; the file is re-read so `--set-password` on a running
+        app applies at once)."""
+        if self._login_lock is None:
+            self._login_lock = asyncio.Lock()
+        async with self._login_lock:
+            loop = asyncio.get_running_loop()
+            record = await loop.run_in_executor(None, read_password_file, self._password_path)
+            ok = await loop.run_in_executor(None, verify_password, record, password)
+            if not ok:
+                await asyncio.sleep(1.0)
+            return ok
+
     async def _auth(self, request: web.Request) -> web.StreamResponse:
-        if request.method == "POST":
-            form = await request.post()
-            given = str(form.get("token", "")).strip()
-        else:
-            given = request.query.get("token", "").strip()
-        if not tokens_equal(given, self._token):
-            await asyncio.sleep(0.5)  # slows guessing; the token is 256 bits anyway
+        if request.method != "POST":
+            return web.Response(status=303, headers={"Location": "/"})
+        form = await request.post()
+        password = str(form.get("password", ""))
+        if not self.password_set():
+            # No password: on a loopback bind "/" opens without one; on any
+            # other bind nobody can log in until one is set.
+            where = "/" if not self.login_required(request) else "/?login=nopassword"
+            return web.Response(status=303, headers={"Location": where})
+        if not await self._check_password(password):
+            logger.warning("web UI: failed login from %s", request.remote)
             return web.Response(status=303, headers={"Location": "/?login=failed"})
         session = new_secret()
         self._sessions.add(session)
-        # The redirect drops the token from the address bar.
         response = web.Response(status=303, headers={"Location": "/"})
         response.set_cookie(SESSION_COOKIE, session, httponly=True, samesite="Strict", path="/")
+        return response
+
+    async def _login_info(self, request: web.Request) -> web.Response:
+        """Unauthenticated: only whether a password exists (the login page
+        says how to set one when not)."""
+        return web.json_response({"password_set": self.password_set(), "login_required": self.login_required(request)})
+
+    async def _change_password(self, request: web.Request) -> web.Response:
+        """{"current", "new"}: admin only; the current password is required
+        too (a session left open is not enough), unless none is set yet.
+        Every other session ends."""
+        denied = self._require(request, "admin")
+        if denied is not None:
+            return denied
+        try:
+            params = await self._params(request)
+        except actions.ActionError as exc:
+            return _error(str(exc), 400)
+        current, new = str(params.get("current", "")), str(params.get("new", ""))
+        if self.password_set() and not await self._check_password(current):
+            return _error("the current password is wrong", 403)
+        try:
+            check_new_password(new)
+            await asyncio.get_running_loop().run_in_executor(None, write_password_file, self._password_path, new)
+        except PasswordError as exc:
+            return _error(str(exc), 400)
+        except OSError as exc:
+            return _error(f"cannot save the password: {exc}", 500)
+        keep = self._session(request)
+        response = web.json_response({"ok": True})
+        if keep is None:
+            # The first password, set from a no-login page: this browser
+            # stays in (a fresh session) instead of being sent to the login.
+            keep = new_secret()
+            response.set_cookie(SESSION_COOKIE, keep, httponly=True, samesite="Strict", path="/")
+        self._sessions = {keep}
+        logger.info("web UI: password changed; other sessions logged out")
         return response
 
     async def _logout(self, request: web.Request) -> web.Response:
@@ -459,7 +584,7 @@ class WebServer:
             return denied
         try:
             params = await self._params(request)
-            if blocking:  # file I/O (recording start/stop flushes): off the loop
+            if blocking:  # restarts join threads/processes: off the loop
                 result = await asyncio.get_running_loop().run_in_executor(None, run, params)
             else:
                 result = run(params)
@@ -489,11 +614,6 @@ class WebServer:
     async def _pause(self, request):
         return await self._control(request, lambda p: actions.pause(self._controller, p.get("paused")))
 
-    async def _recording(self, request):
-        return await self._control(
-            request, lambda p: actions.recording(self._controller, p.get("recording")), blocking=True
-        )
-
     async def _fix(self, request):
         """Problems panel fix (narrator.health). Admin only, not the API
         tokens: "Use CPU instead" writes config.yaml. Blocking (restarts
@@ -501,101 +621,6 @@ class WebServer:
         return await self._control(
             request, lambda p: actions.fix(self._controller, p.get("action")), blocking=True, level="admin"
         )
-
-    # ------------------------------------------------------------ recordings
-
-    def _recordings_or_error(self):
-        recordings = getattr(self._controller, "recordings", None)
-        if recordings is None:
-            raise actions.ActionError("recording is not available", status=501)
-        return recordings
-
-    async def _recordings_call(self, request: web.Request, fn) -> web.Response:
-        """Admin-only recordings action, run in the executor (file I/O);
-        maps the store's errors onto HTTP statuses."""
-        denied = self._require(request)
-        if denied is not None:
-            return denied
-        from narrator.recording.session import RecordingError
-        from narrator.recording.srt import SrtError
-        from narrator.recording.store import RecordingNotFound
-
-        try:
-            recordings = self._recordings_or_error()
-            result = await asyncio.get_running_loop().run_in_executor(None, fn, recordings)
-        except actions.ActionError as exc:
-            return _error(str(exc), exc.status)
-        except RecordingNotFound as exc:
-            return _error(str(exc), 404)
-        except SrtError as exc:
-            return web.json_response({"ok": False, "error": f"invalid SRT: {exc}"}, status=422)
-        except PermissionError as exc:
-            return _error(str(exc), 409)
-        except (FileNotFoundError, RecordingError, ValueError) as exc:
-            return _error(str(exc), 409)
-        if isinstance(result, web.StreamResponse):
-            return result
-        return web.json_response({"ok": True, **(result or {})})
-
-    async def _list_recordings(self, request: web.Request) -> web.Response:
-        return await self._recordings_call(
-            request,
-            lambda r: {"recordings": r.list(), "disk": r.disk(), "status": r.status()},
-        )
-
-    async def _recording_file(self, request: web.Request) -> web.StreamResponse:
-        from narrator.recording.store import DOWNLOADABLE, session_dir
-
-        recording_id, name = request.match_info["id"], request.match_info["name"]
-        if name not in DOWNLOADABLE:
-            return _error(f"unknown file {name!r}", 404)
-
-        def locate(recordings):
-            path = session_dir(recordings.root, recording_id) / name
-            if not path.is_file():
-                raise actions.ActionError(f"{name} does not exist for this recording", status=404)
-            return web.FileResponse(
-                path,
-                headers={"Content-Disposition": f'attachment; filename="narrator-{recording_id}-{name}"'},
-            )
-
-        return await self._recordings_call(request, locate)
-
-    async def _upload_corrected(self, request: web.Request) -> web.Response:
-        denied = self._require(request)
-        if denied is not None:
-            return denied
-        recording_id = request.match_info["id"]
-        if request.content_type == "multipart/form-data":
-            form = await request.post()
-            field = form.get("file")
-            data = field.file.read() if hasattr(field, "file") else str(field or "").encode("utf-8")
-        else:
-            data = await request.read()
-        return await self._recordings_call(
-            request, lambda r: {"cues": r.save_corrected(recording_id, data)}
-        )
-
-    async def _generate_draft(self, request: web.Request) -> web.Response:
-        recording_id = request.match_info["id"]
-        return await self._recordings_call(request, lambda r: r.request_draft(recording_id, force=True))
-
-    async def _use_as_reference(self, request: web.Request) -> web.Response:
-        recording_id = request.match_info["id"]
-        return await self._recordings_call(request, lambda r: r.use_as_reference(recording_id))
-
-    async def _delete_recording(self, request: web.Request) -> web.Response:
-        recording_id = request.match_info["id"]
-        return await self._recordings_call(request, lambda r: r.delete(recording_id))
-
-    async def _delete_all_recordings(self, request: web.Request) -> web.Response:
-        try:
-            params = await self._params(request)
-        except actions.ActionError as exc:
-            return _error(str(exc), 400)
-        if params.get("confirm") not in (True, "true", "yes", "1", 1):
-            return _error('deleting every recording needs {"confirm": true}', 400)
-        return await self._recordings_call(request, lambda r: {"deleted": r.delete_all()})
 
     # ------------------------------------------------------------- config API
 
@@ -663,7 +688,6 @@ class WebServer:
         denied = self._require(request)
         if denied is not None:
             return denied
-        from narrator.captions.transcript import default_transcript_directory
         from narrator.config import choices
 
         config = self._controller.config
@@ -680,7 +704,6 @@ class WebServer:
                 "languages": choices.language_options(),
                 "presets": choices.preset_options(),
                 "vocabulary_lists": list_vocabulary_lists(choices.vocabulary_dir(self._controller.config_path)),
-                "transcript_default_dir": str(default_transcript_directory()),
             }
 
         return web.json_response(await asyncio.get_running_loop().run_in_executor(None, gather))
@@ -839,6 +862,10 @@ class WebServer:
         if kind == "preview":
             client.preview_enabled = bool(message.get("enabled", True))
             client.last_frame_key = None  # resend on resume
+        elif kind == "sample":
+            text = message.get("text")
+            client.sample_text = text.strip()[:500] if isinstance(text, str) else ""
+            client.draft_version += 1  # re-render even when the frame object is reused
         elif kind == "draft":
             # Unsaved display settings to preview; null = show the live config.
             draft = message.get("display")
@@ -869,7 +896,7 @@ class WebServer:
         )
         if client.preview_sync is None:
             client.preview_sync = PreviewSync(canvas, layout, style)
-        frame = client.preview_sync.refresh(canvas, layout, style, renderer)
+        frame = client.preview_sync.refresh(canvas, layout, style, renderer, sample_text=client.sample_text)
         key = (id(frame), client.draft_version)
         if frame is client.last_frame and key == client.last_frame_key:
             return None

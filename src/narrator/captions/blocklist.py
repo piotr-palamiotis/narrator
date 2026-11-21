@@ -11,8 +11,8 @@ letters/digits: hyphens and apostrophes separate them.
 The filter is a standalone function of text, applied by the StreamingDecoder
 to each hypothesis (next to text_filters, before agreement) and by
 AppController to manual captions. The backend's raw output never passes
-through it, so a recording path that needs the true transcript (draft.srt)
-simply doesn't apply it.
+through it, so an offline evaluation that needs the true transcript simply
+doesn't apply it.
 """
 from __future__ import annotations
 

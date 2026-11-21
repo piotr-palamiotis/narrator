@@ -168,11 +168,11 @@ class HypothesisText:
     (case-insensitive regex find-and-replace), vocabulary snapping, the
     caption blocklist, then repetition collapse -- in that order, and
     before any agreement/commit decision, so a filtered word can't block
-    commits and captions/transcript match what airs.
+    commits.
 
     Snapping and the blocklist are hot-reloadable (set_text_settings).
     Without explicit settings: the inline vocabulary and no blocklist --
-    the raw text an offline evaluation or a draft.srt recording wants."""
+    the raw text an offline evaluation wants."""
 
     def __init__(self, config, text_settings: TextSettings | None = None) -> None:
         self._filters = [(re.compile(rule.pattern, re.IGNORECASE), rule.replacement) for rule in config.text_filters]

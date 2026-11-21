@@ -15,7 +15,7 @@ asr:
   # step_ms and agreement_passes. `narrator --pick-preset` (make setup)
   # benchmarks this machine and sets it; "custom" = no preset. Setting any
   # of those three here overrides the preset for that field. quality =
-  # large-v3, step 500, 2 agreement passes.
+  # large-v3, step 500, 2 agreement passes (see presets.yaml).
   preset: quality
   # The language control. Empty = auto-detect any language, per utterance.
   # With entries, each utterance is decoded in the best-matching listed
@@ -39,8 +39,10 @@ asr:
   max_utterance_ms: 20000
   max_context_seconds: 20
   # Audio from just before the VAD fires, prepended to each utterance so
-  # the first syllable isn't clipped (0 = off).
-  vad_preroll_ms: 0
+  # the first syllable isn't clipped (0 = off). 300 measured 2026-11-17 on
+  # the reference library (large-v3): 87 errors saved on 30 excerpts, mostly
+  # fewer dropped words, no added delay.
+  vad_preroll_ms: 300
   # Characters of earlier captions given to whisper as context for the next
   # utterance (0 = off: every utterance starts from a blank context).
   prompt_carryover_chars: 0
@@ -81,7 +83,7 @@ asr:
   vocabulary_snap: false
   # whisper.cpp flash attention. Can crash the worker on some GPU drivers.
   flash_attn: false
-  # Transcript/recording word times from whisper's DTW alignment (more exact,
+  # Caption-event word times from whisper's DTW alignment (more exact,
   # ~20% more decode time; ignored while flash_attn is on).
   dtw_word_timestamps: false
   # Streaming strategy. local_agreement: re-decode a growing window every
@@ -147,16 +149,7 @@ ndi:
   source_name: "LiveCaption"
   fps: 30
 
-# Optional transcript file of every finalized caption, one file per session.
-transcript:
-  enabled: false
-  # Empty = <repo>/var/transcripts (platform user data dir outside a checkout).
-  directory: ""
-  # srt (timed cues) or txt (one line per cue).
-  format: srt
-
-# Words that must never reach the screen (live captions and the transcript;
-# manual captions too). Whole-word, case- and diacritics-insensitive; a
+# Words that must never reach the screen (live and manual captions). Whole-word, case- and diacritics-insensitive; a
 # trailing * is a stem matching every word starting with it ("kurw*").
 captions:
   blocklist: []
@@ -166,15 +159,12 @@ captions:
   blocklist_action: mask
   blocklist_replacement: "***"
 
-# Browser admin UI (replaces the old Tk GUI). Loopback only by default --
-# reach it remotely through an SSH tunnel or Tailscale, never a LAN bind.
-# `narrator --open-ui` opens it with this run's login token.
+# Browser admin UI (replaces the old Tk GUI). Reachable from other computers
+# (login password: `narrator --set-password`); start narrator with
+# --local-only to allow this computer only. `narrator --open-ui` opens it.
 web:
   enabled: true
-  bind: "127.0.0.1"
   port: 8765
-  # Extra Host names accepted besides localhost/127.0.0.1 (e.g. Tailscale).
-  allowed_hosts: []
   preview_fps: 5
   # Page-level shortcuts ("" = unbound). Browser-reserved combos such as
   # Ctrl+N/T/W are refused, since a page cannot intercept them.
@@ -184,7 +174,6 @@ web:
     focus_entry: "F4"
     submit: "Enter"
     pause_toggle: "F8"
-    recording_toggle: "F9"
     help: "?"
   # Per-integration tokens for the control API (Bitfocus Companion, scripts):
   #   - name: companion
@@ -197,29 +186,3 @@ web:
     enabled: false
     bind: "127.0.0.1"
     port: 9000
-
-# Session recording (todo C3): audio.flac (exactly what the ASR received),
-# live.srt (what went on air) and later draft.srt per session, under
-# <repo>/var/recordings/<timestamp>/. Recording is switched live from the web
-# UI, the recording shortcut (F9), POST /api/recording or OSC; this records
-# people speaking, so get consent first (README: Privacy). Recordings never
-# leave this machine unless someone downloads them.
-recording:
-  # Start recording when the app starts.
-  record_on_start: false
-  # Empty = <repo>/var/recordings (platform user data dir outside a checkout).
-  directory: ""
-  # Delete sessions older than this many days automatically (0 = never).
-  retention_days: 0
-  # Refuse to start / stop recording below this much free disk space.
-  min_free_disk_mb: 2048
-  # Small red dot in the corner of the NDI output while recording.
-  on_air_dot: false
-  # Offline best-effort draft.srt after each session (low priority, in the
-  # background; waits while live ASR on the same device is busy).
-  draft_enabled: true
-  draft_model: "large-v3"
-  draft_device: auto
-  # Run a draft next to live ASR only while its busy fraction is <= this
-  # (0 = only while ASR is stopped). "Generate draft now" ignores it.
-  draft_max_asr_busy: 0.3

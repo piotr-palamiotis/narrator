@@ -203,3 +203,70 @@ def test_renderer_clear_drops_paced_backlog():
     r.clear()
     clock.now += 5
     assert r.visible_lines() == ()
+
+
+def _reveal_times(p, until, fps=30.0, start=0.0):
+    """Frame times at which each queued unit became visible (no pushes
+    happen meanwhile, so the backlog only shrinks)."""
+    times, before, t = [], p.backlog(), start
+    while t <= until:
+        p.advance(t)
+        after = p.backlog()
+        times += [t] * (before - after)
+        before = after
+        t = round(t + 1.0 / fps, 6)
+    return times
+
+
+def test_smooth_types_bursts_at_the_speakers_steady_rate():
+    import narrator.captions.pacer as pacer_module
+
+    p = CaptionPacer("smooth")
+    # a speaker producing 15 characters/s, committed in bursts of 30 every 2 s
+    times, t, before = [], 0.0, 0
+    for k in range(8):
+        p.push_final("abcdefghij" * 3)
+        before += 30
+        while t < 2.0 * (k + 1):
+            p.advance(t)
+            revealed = before - p.backlog()
+            times += [t] * (revealed - len(times))
+            t = round(t + 1 / 30, 6)
+    # after the first seconds the typing never stalls: every 0.5 s window
+    # shows characters, at about the speaker's rate (not 30 at once)
+    steady = [x for x in times if x >= 4.0]
+    counts = [sum(1 for x in steady if w <= x < w + 0.5) for w in [4.0 + 0.5 * i for i in range(23)]]
+    assert min(counts) >= 4 and max(counts) <= 13
+    assert p.backlog() <= 15 * pacer_module.SMOOTH_LAG * 2  # the queue stays near the target lag
+
+
+def test_smooth_rate_follows_the_backlog_within_bounds():
+    import narrator.captions.pacer as pacer_module
+
+    low, high = pacer_module.SMOOTH_RATE_BOUNDS
+    p = CaptionPacer("smooth")
+    p.push_final("x" * 400)
+    p.advance(0.0)
+    assert p.smooth_rate() == pytest.approx(high)  # a big backlog: fastest, capped
+    q = CaptionPacer("smooth")
+    q.push_final("ab")
+    q.advance(0.0)
+    assert q.smooth_rate() == pytest.approx(low)  # a lone short caption: slowest bound
+    r = CaptionPacer("smooth")
+    r.push_final("y" * 60)  # 60 chars in the rate window
+    r.advance(10.0)
+    speaker = 60 / pacer_module.SMOOTH_RATE_WINDOW
+    expected = speaker + (r.backlog() - speaker * pacer_module.SMOOTH_LAG) / pacer_module.SMOOTH_CATCHUP
+    assert r.smooth_rate() == pytest.approx(expected)
+
+
+def test_smooth_keeps_text_and_commits_whole_words():
+    renderer("smooth")  # the schema and renderer accept the mode
+    p = CaptionPacer("smooth")
+    p.push_final("Ala ma kota")
+    out, t = [], 0.0
+    while t < 3.0:
+        commits, tail = p.advance(t)
+        out += commits
+        t += 1 / 30
+    assert out == ["Ala", "ma", "kota"] and p.backlog() == 0

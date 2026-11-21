@@ -11,16 +11,17 @@
 <body class="login-page">
 <main class="login">
   <h1>Narrator</h1>
-  <p>Run <code>narrator --open-ui</code> on this machine to open the admin UI logged in, or paste this
-    run's login token. It is printed to the log at startup
-    (<code>journalctl --user -u narrator | grep "login token"</code>) and stored in
-    <code>var/web-token.json</code>.</p>
-  <p id="login-error" class="err" hidden>That token was not accepted (tokens change on every start).</p>
-  <form method="post" action="/auth">
-    <label for="token">Login token</label>
-    <input id="token" name="token" type="password" autocomplete="off" required autofocus>
+  <p id="login-error" class="err" hidden>Wrong password.</p>
+  <div id="no-password" hidden>
+    <p class="err">No password is set yet, so nobody can log in.</p>
+    <p>On the narrator machine run <code>narrator --set-password</code>, then reload this page.</p>
+  </div>
+  <form id="login-form" method="post" action="/auth">
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
     <button type="submit" class="primary">Log in</button>
   </form>
+  <p class="small muted">Forgot it? Set a new one with <code>narrator --set-password</code> on the narrator machine.</p>
 </main>
 </body>
 </html>

@@ -31,13 +31,17 @@ source .venv/bin/activate
 pip install -e .
 make asr-backend            # only if ASR wasn't built with a GPU backend
 make asr-backend ASR_GPU=cuda   # CUDA instead of Vulkan (needs nvcc); default auto = cuda if nvcc+nvidia-smi work
+                                # (this box: .venv has the CUDA build since 2026-11-16, auto = CUDA;
+                                # back to Vulkan: ASR_GPU=vulkan FORCE=1 + asr.unit vulkan:0)
 
 # run
 narrator --list-devices     # sanity-check microphone enumeration
-narrator                    # default config; web UI on 127.0.0.1:8765, opens a browser if there is a display
+narrator                    # default config; web UI on port 8765 (all addresses), opens a browser if there is a display
+narrator --local-only       # web UI for this computer only (127.0.0.1); a startup flag, never a config/UI setting
 narrator --headless         # never opens a browser (the service); the web UI still runs (web.enabled)
 narrator --no-web           # no web UI / OSC at all (--no-gui is the old alias)
-narrator --open-ui          # open the RUNNING instance's web UI, logged in (reads var/web-token.json)
+narrator --set-password     # web UI login password (scrypt hash in web-password.json beside config.yaml)
+narrator --open-ui          # open the RUNNING instance's web UI (URL from var/web-ui.json)
 narrator --config config/config.yaml   # created from defaults.yaml if missing
 narrator --headless --log-file         # also rotating var/log/narrator.log (+ narrator-asr.log)
 
@@ -134,7 +138,32 @@ alignment-head attention) plus a binding; an approximation is possible
 today from `t_dtw` (hold back tokens whose aligned time is near the window
 end).
 
-NVIDIA notes (RTX 3070, driver 615, no CUDA toolkit): the Intel HD 610
+CUDA build, verified 2026-11-16 on the RTX 3070 (CUDA toolkit 12.0 at
+`/usr/bin/nvcc`, Ubuntu's `nvidia-cuda-toolkit`): `ASR_GPU=cuda
+CMAKE_CUDA_ARCHITECTURES=86` built pywhispercpp 1.5.1 + whisper.cpp 1.9.5
+with `libggml-cuda.so` in ~25 min on the Pentium (built into a scratch
+venv, `~/.cache/narrator-cuda-test/venv`). **Since 2026-11-16 the repo's
+`.venv` runs that CUDA wheel** (installed from
+`~/.cache/narrator-cuda-test/src/dist/`, RUNPATH `$ORIGIN`, libggml-vulkan
+removed; the user config has `asr.unit: cuda:0`, previous file kept as
+`config.yaml.before-cuda`). Vulkan rollback wheel:
+`~/.cache/narrator-vulkan-rollback/` (or `third_party/pywhispercpp-src/dist/`
+until the next build): `pip install --force-reinstall --no-deps` it, run the
+same patchelf `$ORIGIN` loop, set `asr.unit: vulkan:0`. Run through the real `WhisperBackend` with `asr.unit:
+cuda:0`: "ASR backend: CUDA (NVIDIA GeForce RTX 3070)", model in VRAM, no
+CPU fallback. large-v3 vs the Vulkan build, same process shape (median of
+4 after a warm-up, test.mp3): load 8.7 vs 8.0 s; detection 0.25 vs 0.19 s;
+2/5/10/20 s windows 0.08/0.16/0.36/0.70 vs 0.11/0.19/0.39/0.80 s (CUDA
+7–23% faster decodes); text word-for-word identical. tiny on CUDA:
+0.02/0.04/0.07/0.41 s. The first detection of the very first CUDA run
+after the build took 12 s (one-off; later processes 0.17 s). Live app path
+verified 2026-11-16: switching `asr.unit` to cuda:0 on a running app
+restarted the worker onto CUDA0 (model 3094 MB in VRAM), captions flowed
+from the virtual mic. Known script quirk: in a
+fresh venv without numpy the build's final clean-environment import check
+fails (the wheel is installed `--no-deps`); the build itself is fine.
+
+NVIDIA notes (RTX 3070, driver 615): the Intel HD 610
 iGPU enumerates as Vulkan device 1 (`vulkan:1`, PCI 0000:00:02.0) and
 `asr.unit: auto` picks the discrete card (`vulkan:0`, PCI 0000:01:00.0);
 ggml-vulkan's own list has the same order (verified 2026-10-17). The driver prints a harmless `NVVM compilation
@@ -154,13 +183,20 @@ This environment has no microphone, display, or NDI receiver. It *does* have
 a working NVIDIA GPU (RTX 3070, 8 GB, driver 615, Vulkan device 0; the
 Intel HD 610 iGPU is Vulkan device 1 — never select it by accident). The
 AMD RX 6700 XT used for earlier measurements is gone; numbers labeled RX
-6700 XT below are historical.
+6700 XT below are historical. The CUDA toolkit 12.0 (`nvcc`) is installed
+too. Cached models (2026-11-16): `small` and `large-v3` (re-downloaded,
+SHA-1 ad82bf6a…, ~19 MB/s from Hugging Face) in
+`~/.local/share/pywhispercpp/models/`; `tiny` only in
+`~/.cache/narrator-cuda-test/`; the repo's `models/` is empty.
 `pytest tests/` and `scripts/render_preview.py` work fully here. Live mic
 capture (`sounddevice`/PortAudio) cannot be exercised end-to-end — say so
 rather than claiming it was tested. The **web UI can** be tested here: run
 `narrator --headless --config <scratch>/config.yaml` (a cached `small` model
-starts in seconds) and drive it with curl (login: `GET /auth?token=<token
-from var/web-token.json>` sets the cookie; send `Origin:` on POSTs) or a
+starts in seconds) and drive it with curl (put a known password in the
+scratch dir first: `python -c "from pathlib import Path; from narrator.web.security import
+write_password_file as w; w(Path('<scratch>/web-password.json'), 'password1')"`;
+login: `POST /auth` form `password=...` with `Origin:` sets the cookie; send
+`Origin:` on every POST) or a
 headless browser (Playwright/Chromium in a scratch venv works; the system
 Firefox is a snap and is awkward to automate).
 
@@ -258,7 +294,8 @@ understands the full concurrency picture:
   `cpu`, `vulkan:<n>` (ggml's Vulkan index), `cuda:<n>` (nvidia-smi index =
   PCI order; usable with the CUDA build, `make asr-backend ASR_GPU=cuda`,
   which `WhisperBackend._init_cuda` loads with gpu_device = that index and
-  `CUDA_DEVICE_ORDER=PCI_BUS_ID`; NOT yet run on real hardware), or `auto` = the recommended unit resolved at each worker start:
+  `CUDA_DEVICE_ORDER=PCI_BUS_ID`; verified on the RTX 3070 2026-11-16 through
+  `WhisperBackend` and in the live app — see "CUDA build" above), or `auto` = the recommended unit resolved at each worker start:
   CUDA > discrete Vulkan GPU > CPU > integrated GPU (an iGPU only when
   nothing else runs the model — a change from the old auto, which took an
   iGPU over the CPU). `asr.unit_identity` = "name @ PCI bus id" of the GPU
@@ -277,7 +314,8 @@ understands the full concurrency picture:
   (a second driver for the same GPU is dropped, as ggml does — ggml may
   keep the other driver's entry, listed last) and the largest device-local
   heap as VRAM; a 1.0-only loader falls back to name/type only. On this box:
-  cpu, cuda:0 (RTX 3070, no backend), vulkan:0 (RTX 3070, 8 GB),
+  cpu, cuda:0 (RTX 3070; `.venv` has the CUDA build, so the vulkan:* units
+  are listed but not usable there), vulkan:0 (RTX 3070, 8 GB),
   vulkan:1 (HD 610, integrated). NVIDIA and Vulkan units of one card are
   matched by PCI bus id (`same_card`). A future CUDA+Vulkan build counts
   whisper.cpp's `gpu_device` over every compiled-in GPU backend, which is
@@ -319,9 +357,7 @@ understands the full concurrency picture:
 - **Elsewhere**: bench / `--pick-preset` / preset_probe pass `unit` (+
   `unit_identity`) instead of device/gpu_device (bench still accepts the old
   payload keys); narrator-tune passes the unit as its `device` string and
-  presets.yaml's `tune.unit` (`tune.device` still read) sets a tier's unit;
-  recording drafts use `recording.draft_device` cpu → cpu, else the live GPU
-  unit (+ identity) or auto; session.json records `asr_unit`.
+  presets.yaml's `tune.unit` (`tune.device` still read) sets a tier's unit.
 
 ### Config: single source of truth, hot-reloadable
 
@@ -379,7 +415,20 @@ plain values). `save_config` omits covered fields whose value **equals** the
 preset's (`config_to_yaml_data`) — by value, not provenance, because the
 GUI/web Save rebuilds AsrConfig from a dump + form and would otherwise freeze
 preset values into explicit overrides. defaults.yaml ships `preset: quality`
-(= the old large-v3/500/2). All rows are `measured: false` (provisional,
+= large-v3, step 500, 2 agreement passes, plus `vad_preroll_ms: 300` in
+defaults.yaml. History (2026-11-17): an accuracy-first quality tier (step
+1000 × 3 passes, dev WER 31.7% → 27.0%) was shipped and reverted the same
+day — live, the user saw captions ~14 s behind speech and asked for ≤ ~5 s.
+**Judge settings by ON-SCREEN delay, not FINAL delay**: `layout.pacing`
+adds to it (replay of cached FINALs through `CaptionPacer` at 30 fps, p50 /
+p90 on 91 dev excerpts): step 500/2 passes: off 1.9/4.1 s, char 3.7/5.6,
+word 2.2/4.7, sentence 2.5/4.4; step 1000/3 passes: off 3.7/7.4, char
+5.6/9.2. `char` pacing reveals 10 chars/s below 20 queued chars, slower than
+Polish speech (~15/s), so it always queues. Screen-set singles (30 excerpts,
+saved ± SE vs 500/2): preroll 300 +87 ± 72 (WER 26.8 → 24.8%, no delay),
+step 1000 +36 ± 14, passes 3 +36 ± 12, prompt_carryover 200 −27 ± 51,
+segmenter +46 ± 75 (p90 11 s), min_mean_token_p 0.85 vs 0 identical.
+Reports: `var/tune/reports/accuracy-variants-r{1,2}.{json,log}`. All rows are `measured: false` (provisional,
 from today's defaults and the stress-harness baselines) until
 `narrator-tune presets` runs. `narrator --pick-preset`
 (`narrator.asr.preset_picker` + `preset_probe` subprocess): bench.py screen,
@@ -502,7 +551,8 @@ length (~3x faster on short windows). `initial_prompt` is set on EVERY call
 (pywhispercpp keeps decode params between calls, so a prompt would leak into
 later decodes otherwise).
 
-Two optional decode aids, off by default and measured by autoconfigure:
+Two optional decode aids, measured by autoconfigure (pre-roll ships at 300
+since 2026-11-17, carry-over stays off — it measured worse):
 `asr.vad_preroll_ms` prepends the audio from just before the VAD fired
 (Silero needs a window or two to cross its threshold, clipping first
 syllables), and `asr.prompt_carryover_chars` passes the tail of the
@@ -579,20 +629,24 @@ a WIPE and by a language change).
   blocklist → repetition collapse, all before agreement. The blocklist is
   also applied to manual captions (`submit_manual_text`). The backend's
   raw output is never filtered, and a decoder built without `text_settings`
-  has no blocklist — that is the bypass for draft.srt / offline eval.
+  has no blocklist — that is the bypass for offline eval.
 - Tuning keys cached results on `vocabulary`/`vocabulary_snap` and never
   writes them. It sees the inline vocabulary only (not `vocabulary_list`).
 - Editing a list FILE is not watched: it is re-read when config.yaml changes.
 
-**Transcript file** (`narrator.captions.transcript`, the `transcript`
-config section, web UI Transcript tab):
+**Removed 2026-11-16 (user decision): the transcript file and session
+recording.** `narrator.captions.transcript`, `narrator.recording`, the
+`transcript:` / `recording:` config sections, the recording shortcut,
+`/api/recording*`, the OSC `/narrator/recording` address, the NDI REC dot,
+the recordings disk check and the `soundfile` dependency are gone; old
+configs with those keys load with a log line
+(`RootConfig._drop_removed_features`). `asr/offline.py` keeps only
+`speech_spans` (scripts/eval_transcript.py). Kept on purpose: the decoder's
+word times below (CaptionEvent.start/end, `asr.dtw_word_timestamps`) — they
+have no consumer in the app now, but removing them would change backend.py
+and the decoders, i.e. invalidate narrator-tune's cached decodes.
 
-- Off by default; one SRT or TXT file per session.
-- It records every ASR FINAL, in either caption mode, from the event-drain
-  thread.
-- FINAL fragments are grouped into cues: at a sentence end with ≥20
-  characters, at 84 characters, or at a pause over 1.5s.
-- Cue times come from `CaptionEvent.start/end`. The local-agreement
+**Caption-event word times** (`CaptionEvent.start/end`): the local-agreement
   decoder stamps a FINAL with **whisper's word times** of the decode that
   committed it: `WhisperBackend` decodes with `token_timestamps=True`
   (whisper's timestamp heuristic; free — 0.380 vs 0.381 s median over 30
@@ -616,7 +670,6 @@ config section, web UI Transcript tab):
   time (large-v3 +0.15–0.36 s per 11–15 s window, small +0.06–0.11 s), hence
   off by default. The segmenter stamps whole segments from its own VAD
   bookkeeping and is unchanged.
-- A write failure disables the transcript and never touches captions.
 
 ### Segmenter decode (`narrator.asr.segmenter.Segmenter`, `asr.decoder: segmenter`)
 
@@ -670,7 +723,7 @@ never committed. Partials off = no peek decodes at all (saves GPU).
   are whisper's prompt (after the vocabulary); reset by WIPE and on a
   language change. Replaces `prompt_carryover_chars` for this decoder.
 - **Times**: FINAL `start/end` = segment start (incl. pre-roll) / end minus
-  the trailing silence, on the feed clock (transcript cues).
+  the trailing silence, on the feed clock.
 - **Peek cost** (todo B §5): the interval grows 0.1 s per held second, and
   a peek waits until 2× the previous peek's cost has passed since it
   started (cost measured at the next tick — live the peek ran inside the
@@ -680,10 +733,19 @@ never committed. Partials off = no peek decodes at all (saves GPU).
 - **Display**: a PARTIAL replaces the whole in-progress text
   (`CaptionRenderer.set_partial_preview`), a FINAL replaces it under the
   renderer lock (no frame shows both). `layout.pacing` (off|char|word|
-  sentence, `captions/pacer.py`, port of LocalVocal's TokenBufferThread)
+  sentence|smooth, `captions/pacer.py`, port of LocalVocal's TokenBufferThread)
   types text out between the event drain and the buffer; speed adapts to
   the backlog; a new partial pops the previous one's unshared units; no
   `maxTime` clear (retention rules win). Works with either decoder.
+  `smooth` (narrator's own, 2026-11-17, user request "continuous rather
+  than bigger chunks"): characters at a steady rate = the speaker's chars/s
+  over the last `SMOOTH_RATE_WINDOW` (6 s) + (backlog − rate ×
+  `SMOOTH_LAG` 0.8 s) / `SMOOTH_CATCHUP` 1.5 s, clamped 8–80 chars/s.
+  Replay of cached FINALs (91 dev excerpts, step 500/2 passes; on-screen
+  delay p50/p90, CV of chars per 0.5 s while typing, empty 0.5 s windows):
+  word 2.2/4.7 s, 0.89, 28% stalled; char 3.7/5.6 s, 0.43, 4%; smooth
+  3.0/5.2 s, 0.56, 6%; off 1.9/4.1 s, 1.28, 39%. Steadier settings (bigger
+  lag) cost delay roughly 1:1.
 - **Config** (`AsrConfig`): `decoder`, `segmentation_mode`,
   `partial_latency_ms` (1100), `segment_duration_ms` (7000),
   `max_segment_ms` (15000), `context_sentences` (1). Local-agreement-only
@@ -707,25 +769,6 @@ never committed. Partials off = no peek decodes at all (saves GPU).
   FINAL p50 (4-6 s) lose to local agreement on WER (cap 6000: 28.9%); hybrid is worse than vad at
   any length. Hence the default stays `local_agreement` (Phase 8 rule: WER within noise AND FINAL
   p50 <= 3 s); C5 decides.
-
-### Session recording (`narrator.recording`, `recording` config section)
-
-Off by default (consent: README "Session recording and privacy"). `RecordingManager`
-(owned by `AppController`) writes `var/recordings/<ts>/`: `audio.flac` (the feed
-thread hands it the exact frames queued for whisper, after channel select;
-non-blocking), `live.srt` (every on-air FINAL / manual text), `session.json`,
-then `draft.srt` and `corrected.srt`. One maintenance thread stops a session
-below `min_free_disk_mb`, purges by `retention_days`, and runs at most one
-draft: a low-priority subprocess (`python -m narrator.recording.draft`,
-`--draft-recording` when frozen) doing the offline large-v3 pass
-(`asr/offline.py`, unfiltered by blocklist), started only with headroom next to
-live ASR (`draft_max_asr_busy`) and SIGSTOPped when it is lost. Web: `/api/recordings*`
-(list, download, PUT corrected SRT, draft, reference, delete, delete-all with
-`{"confirm": true}`); "Use as reference" copies audio + corrected SRT as
-`Title (Polish_corrected).srt` into `scripts/test_audio/`, which
-`narrator_tune.real_fixtures` treats as an objective reference (preferred over
-other SRTs for the same title). `recording.on_air_dot` draws a dot in the NDI
-frame (`CaptionRenderer.set_recording_indicator`).
 
 ### Rendering pipeline
 
@@ -753,7 +796,7 @@ ignored like any other ASR output.
 ### Setup checks + problems panel (`narrator.health`, todo C8)
 
 - `problems.Problem`: id (stable, dotted), severity error/warning/info,
-  subsystem asr/audio/ndi/web/recording/setup, message, `fixes` (action id +
+  subsystem asr/audio/ndi/web/setup, message, `fixes` (action id +
   label). Server fixes: `asr.retry`, `asr.use_cpu`, `asr.pin_unit` (record
   the identity of the device at the configured index), `asr.unit:<unit id>`
   (switch to that unit + record its identity), `audio.retry`, `ndi.retry`,
@@ -773,8 +816,8 @@ ignored like any other ASR output.
   CPU/iGPU = warning saying why, nothing usable = error. Model (`paths.find_model_file`, else
   downloadable per `pywhispercpp.constants.AVAILABLE_MODELS` and disk space
   for it), mic name + channels (only while capture is down: PortAudio does
-  not rescan while open), NDI runtime (`import cyndilib`), disk (recordings
-  vs `min_free_disk_mb`, tune cache). Runtime: ASR halted / restarting,
+  not rescan while open), NDI runtime (`import cyndilib`), disk (tune
+  cache). Runtime: ASR halted / restarting,
   audio capture failed, NDI audio source status (`NdiAudioCapture.status`:
   runtime_unavailable / searching > 5 s / channel_error), NDI output failed.
   "Use CPU instead" is offered only when the CPU backend runs here, the
@@ -827,22 +870,59 @@ aiohttp app on its own thread/loop (`server.py`), plain HTML/JS/CSS in
 `web.enabled`, `--no-web`; the old `gui:` section is migrated to
 `web.enabled` by a `RootConfig` before-validator.
 
-- **Security** (`security.py`): binds `web.bind` = 127.0.0.1 by default
-  (remote access = SSH tunnel/Tailscale, never a LAN bind). Every request's
-  Host must be localhost/127.0.0.1/[::1] (+ `web.allowed_hosts`) *with the
-  served port* (DNS rebinding); Origin, when present, must be the same
-  origin on non-GET requests and the WebSocket (CSRF). Auth: a per-run
-  random startup token (logged, and in `var/web-token.json`, mode 0600,
-  removed on stop) exchanged at `/auth` for an HttpOnly SameSite=Strict
-  session cookie; `Authorization: Bearer <startup token>` also = full access.
-  `web.api_tokens` (named, revocable by deletion) reach only the control API.
+- **Security** (`security.py`): listens on 0.0.0.0 by default, so other
+  computers can reach it (user decision 2026-11-16, replacing the old
+  loopback-only default); `narrator --local-only` (`WebServer(local_only=)`)
+  binds 127.0.0.1 and then every request's Host must be localhost/127.x/
+  [::1] *with the served port* (DNS rebinding). This is deliberately a
+  startup flag: `web.bind` / `web.allowed_hosts` were removed from the
+  schema (a before-validator drops them from old configs with a log line).
+  Origin, when present, must equal the request's Host (scheme http, same
+  host:port) on non-GET requests and the WebSocket (CSRF). Auth (user decision
+  2026-11-16: password only, no token): the operator's password, scrypt hash
+  in `web-password.json` beside config.yaml (0600, `narrator
+  --set-password` or `POST /api/password` {current, new} from the Web &
+  remote tab, which also ends every other session), checked at `POST /auth`
+  (one check at a time, 1 s pause after a miss, file re-read each time) for
+  an HttpOnly SameSite=Strict session cookie. Sessions are in memory: a
+  restart logs everyone out (also the user's choice). No password set =
+  a browser on this computer (loopback client AND loopback Host, so a
+  rebinding page is excluded) gets admin without a login and can set the
+  first password on the Web & remote tab (no current password asked; that
+  browser gets a session); other computers cannot log in until a password
+  exists (`/api/login-info` {password_set, login_required} tells the login
+  page; startup warnings say so). No startup token, no Bearer admin access, no `GET /auth`; a stale
+  `var/web-token.json` is deleted at start; `var/web-ui.json` (url + pid)
+  serves `--open-ui`. `web.api_tokens` (named, revocable by deletion) reach
+  only the control API. Static files are served `Cache-Control: no-cache`
+  (a heuristically cached old app.js with a new index.html broke the UI).
 - **Config**: Save POSTs the whole form; `RootConfig.model_validate` →
   422 with `[{loc, msg}]` shown next to the fields (no JS validation) →
   `loader.save_config` (keeps preset semantics) → the watcher applies it
   like a hand edit. The form is generated from `RootConfig.model_json_schema()`
   plus a HINTS table in `app.js`, so a new schema field shows up without UI
-  work; give it a label/widget hint there. `web.*` changes restart the
+  work; give it a label/widget hint there. Widgets (user request 2026-11-16, "more
+  welcoming"): `choice` (common values + "Other…" free input; used for
+  channels, fps, lines, wipe timer, ...), `slider` (range + number),
+  `segmented` (small enums), `enum` with friendly `labels`, `model` (grouped
+  "On this computer" / "Downloaded on first use", from `/api/choices`
+  `catalog`), `device`/`font`/`vocablist` (dropdown + "Other…"),
+  `resolution` (sets canvas width + height), booleans as switches. `adv:
+  true` puts a field under its section's "Advanced settings" fold;
+  `FIELD_ORDER` reorders a section; `SECTION_INTROS` adds a line under a
+  section title. Text effects (`style.overrides`, widget `effects`): quick
+  looks (set only the `enabled` flags) + one card per effect with its
+  `enabled` switch in the title (HINTS `toggle`) and the other fields shown
+  only while on. "Sample text" (WebSocket `{"type": "sample"}`,
+  `PreviewSync.refresh(sample_text=)`) previews a sample caption in that
+  browser only — never on air; turned on the first time the Look & layout
+  tab is opened. `web.*` changes restart the
   listener via `WebServer.on_config_changed` (called by the controller).
+- **Page layout** (user request 2026-11-16): one column — the full-width
+  NDI preview with the live controls (Auto/Manual, Clear, Pause, manual
+  entry), the settings tabs under it. The "On air" and "What ASR hears" text
+  boxes were removed (the preview shows what is on air); the server still
+  sends `on_air` and caption events, the page ignores them.
 - **Live**: WebSocket `/ws` streams state at 10 Hz (mic level re-read from
   `controller._mic` every tick — `_restart_audio_capture` swaps it; ASR
   Active = `_asr_process.is_alive()`, not the STATUS string), caption events,
@@ -855,27 +935,29 @@ aiohttp app on its own thread/loop (`server.py`), plain HTML/JS/CSS in
   `status_snapshot()` carries `units` (every unit + its live `usage`,
   `recommended`, `selected`), `unit_recommended`, `unit_resolved` (what
   `asr.unit` means now, e.g. auto → vulkan:0), from
-  `health.usage.UnitUsageMonitor`. The picker lists auto + every unit
-  (name, backend, VRAM; unusable ones and ones the chosen model can't run on
-  are disabled, with the reason), sets `asr.unit_identity` with the pick
-  (hidden field), and shows a usage table refreshed with each state message;
-  the model datalist offers only models that run on the chosen unit's kind
-  (`/api/choices` `catalog`). Verified with curl/aiohttp only, not in a real
-  browser.
+  `health.usage.UnitUsageMonitor`. The picker is a compact list (user
+  request 2026-11-16: small windows, no usage figures): "Auto (<resolved>)"
+  + one "<backend> — <short device name>" per unit (e.g. "Vulkan — NVIDIA
+  GeForce RTX 3070", "CPU — Intel Pentium G4560"; `#<index>` only for two
+  same-named devices of one backend; "(integrated)" / "(not available)" /
+  "(not for this model)" tags, the reason in the tooltip). The usage table
+  was removed from the page; the snapshot still carries `usage`. It sets
+  `asr.unit_identity` with the pick (hidden field); the model datalist offers
+  only models that run on the chosen unit's kind (`/api/choices`
+  `catalog`). Checked in headless Chromium.
 - **Problems panel** (`#problems` above the page, `renderProblems` in
   app.js, re-rendered only when the list changes): `status_snapshot()`
   carries `problems` (plus `asr_halted`, `audio_running`, `ndi_running`), so
   both `/api/state` and the WebSocket state have them. Fix buttons POST
-  `/api/fix` `{"action": ...}` — admin session/startup token only (not
+  `/api/fix` `{"action": ...}` — admin session only (not
   `web.api_tokens`: `asr.use_cpu` writes config), Origin-checked like every
   POST, run in the executor; `ui:` fixes switch tabs client-side.
 - **Control API** (`actions.py`, shared with OSC): `GET /api/state`,
-  `POST /api/clear|mode|manual-text|pause|recording`. Pause
+  `POST /api/clear|mode|manual-text|pause`. Pause
   (`AppController.set_captions_paused`) works like manual mode: the worker
-  keeps running, its output is ignored (the transcript still records).
-  Recording is `AppController.set_recording` (`RecordingError` -> 409/400 on low disk).
+  keeps running, its output is ignored.
 - **OSC** (`osc.py`, `web.osc`, off by default, UDP on loopback): minimal
-  built-in OSC 1.0 parser, `/narrator/clear|mode|manual-text|pause|recording`.
+  built-in OSC 1.0 parser, `/narrator/clear|mode|manual-text|pause`.
 - **Shortcuts** (`web.shortcuts`, `config/shortcuts.py` mirrored by
   `comboFromEvent` in app.js — keep them in step): document-level, work while
   typing (plain single keys don't fire in text fields; plain `submit` fires
@@ -997,7 +1079,7 @@ aiohttp app on its own thread/loop (`server.py`), plain HTML/JS/CSS in
   with `RestartSteps` backoff + `StartLimit*`, SIGTERM stop, journald. Windows service is out of scope.
 - **Self-contained layout** (`narrator.paths`, shared by `narrator_tune.paths`; all gitignored): `config/config.yaml`
   (used only when `--config` is passed; bare `narrator` keeps the platformdirs path), `models/`, `var/`
-  (`log/`, `transcripts/`, `tune/`), `third_party/` (pywhispercpp source + build tree of
+  (`log/`, `web-ui.json`, `tune/`), `third_party/` (pywhispercpp source + build tree of
   `build_vulkan_linux.sh`; `wheels/` keeps the 1.8.5 rollback wheel). `REPO_ROOT` is detected from the checkout (`pyproject.toml` beside
   `src/narrator`; `NARRATOR_HOME` overrides; None when frozen/site-packages, where every helper falls
   back to platformdirs). Models: `paths.model_load_args` passes a found file's full path to

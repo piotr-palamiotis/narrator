@@ -25,7 +25,6 @@ class Subsystem(str, Enum):
     AUDIO = "audio"
     NDI = "ndi"
     WEB = "web"
-    RECORDING = "recording"
     SETUP = "setup"
 
 
@@ -52,7 +51,6 @@ def is_server_fix(action: str) -> bool:
 FIX_UI_ASR = "ui:asr"
 FIX_UI_AUDIO = "ui:audio"
 FIX_UI_NDI = "ui:ndi"
-FIX_UI_RECORDINGS = "ui:recordings"
 
 
 @dataclass(frozen=True)

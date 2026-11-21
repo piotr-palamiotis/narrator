@@ -299,12 +299,17 @@ def test_quality_gates_default_off_and_validate_ranges():
         AsrConfig(max_timestamp_ratio=-1)
 
 
-def test_transcript_section_defaults_off_and_rejects_unknown_format():
+def test_removed_transcript_and_recording_sections_are_dropped():
     from narrator.config.schema import RootConfig
 
-    assert RootConfig().transcript.enabled is False
-    with pytest.raises(ValidationError):
-        RootConfig.model_validate({"transcript": {"format": "docx"}})
+    config = RootConfig.model_validate({
+        "transcript": {"enabled": True, "format": "docx"},
+        "recording": {"record_on_start": True},
+        "web": {"shortcuts": {"recording_toggle": "F9", "clear": "F7"}},
+    })
+    assert not hasattr(config, "transcript") and not hasattr(config, "recording")
+    assert config.web.shortcuts.clear == "F7"
+    assert "recording_toggle" not in config.web.shortcuts.model_dump()
 
 
 def test_layout_pacing_accepts_yaml_bool_false_as_off():

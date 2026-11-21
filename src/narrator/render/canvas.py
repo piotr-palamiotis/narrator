@@ -17,7 +17,7 @@ from __future__ import annotations
 import threading
 import time
 
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from narrator.captions.buffer import CaptionBuffer
 from narrator.captions.layout import compute_line_geometry, line_y_positions
@@ -25,12 +25,6 @@ from narrator.captions.pacer import CaptionPacer
 from narrator.config.schema import CanvasConfig, LayoutConfig, StyleConfig, parse_rgba
 from narrator.render.fonts import PillowFontMetrics, PillowTextWidth, load_font
 from narrator.render.style import composite_line
-
-# The optional recording dot (recording.on_air_dot): top-right corner, sized
-# from the canvas height like everything else here.
-_REC_DOT_COLOR = (230, 30, 30, 230)
-_REC_DOT_DIAMETER_PCT = 1.6
-_REC_DOT_MARGIN_PCT = 1.5
 
 _metrics = PillowFontMetrics()
 _text_width = PillowTextWidth()
@@ -46,7 +40,6 @@ class CaptionRenderer:
         self._cached_frame: Image.Image | None = None
         self._cached_lines: tuple[str, ...] | None = None
         self._partial_preview: str = ""
-        self._recording_indicator = False
         self._lock = threading.RLock()
         self._clock = time.monotonic
         self._pacer: CaptionPacer | None = None
@@ -124,15 +117,6 @@ class CaptionRenderer:
             else:
                 self._partial_preview = text
 
-    def set_recording_indicator(self, on: bool) -> None:
-        """Show/hide the small recording dot (off unless recording with
-        recording.on_air_dot enabled -- the controller decides)."""
-        self._recording_indicator = bool(on)
-
-    @property
-    def recording_indicator(self) -> bool:
-        return self._recording_indicator
-
     @property
     def resolved_font_size_px(self) -> int:
         return self._geometry.font_size_px
@@ -169,8 +153,7 @@ class CaptionRenderer:
         caption lines (including any partial preview) changed since the last call.
         """
         lines = self._visible_lines_with_preview()
-        key = (lines, self._recording_indicator)
-        if self._cached_frame is not None and key == self._cached_lines:
+        if self._cached_frame is not None and lines == self._cached_lines:
             return self._cached_frame
 
         canvas_cfg, layout_cfg, style_cfg, geometry = (
@@ -200,15 +183,6 @@ class CaptionRenderer:
                 text_align=layout_cfg.text_align,
             )
 
-        if self._recording_indicator:
-            height = canvas_cfg.height_px
-            diameter = max(4, round(height * _REC_DOT_DIAMETER_PCT / 100))
-            margin = round(height * _REC_DOT_MARGIN_PCT / 100)
-            right = canvas_cfg.width_px - margin
-            ImageDraw.Draw(image).ellipse(
-                (right - diameter, margin, right, margin + diameter), fill=_REC_DOT_COLOR
-            )
-
         self._cached_frame = image
-        self._cached_lines = key
+        self._cached_lines = lines
         return image

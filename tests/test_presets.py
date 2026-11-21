@@ -95,6 +95,7 @@ def test_defaults_keep_todays_values():
     asr = load_config(DEFAULTS_PATH).asr
     assert asr.preset != CUSTOM
     assert (asr.model, asr.step_ms, asr.agreement_passes) == ("large-v3", 500, 2)
+    assert asr.vad_preroll_ms == 300
     raw = yaml.safe_load(DEFAULTS_PATH.read_text(encoding="utf-8"))["asr"]
     assert not set(PRESET_FIELDS) & set(raw)  # follows the preset, nothing frozen
 
